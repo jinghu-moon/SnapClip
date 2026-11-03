@@ -24,6 +24,7 @@ members = [
     "crates/snapclip-ui",
     "crates/snapclip-capture",
     "crates/snapclip-history",
+    "crates/snapclip-clipboard",
     "crates/snapclip-pin",
     "apps/snapclip",
     "tools/icon-bake",
@@ -36,6 +37,7 @@ exclude = ["crates/rapid-ocr-rs"]
 [patch.crates-io]
 gpui-base = { path = "../GPUI-Yue-Component/vendor/gpui-base" }
 gpui-pre = { path = "../GPUI-Yue-Component/vendor/gpui-pre" }
+gpui-pre-windows = { path = "../GPUI-Yue-Component/vendor/gpui-pre-windows" }
 
 # Tauri 的体积/优化配置原本在 `src-tauri/Cargo.toml`。workspace 化之后成员里的
 # `[profile.*]` 会被 cargo 忽略（并打印警告），所以搬到根上，语义不变。

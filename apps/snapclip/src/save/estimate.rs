@@ -184,7 +184,11 @@ mod tests {
         })
         .expect("something fits");
         assert!(found.1 <= 400_000);
-        assert_eq!(weighed.first(), Some(&source), "the source size is tried first");
+        assert_eq!(
+            weighed.first(),
+            Some(&source),
+            "the source size is tried first"
+        );
         assert!(weighed.len() > 1, "it had to shrink at least once");
         assert_eq!(weighed.last(), Some(&found.0));
     }

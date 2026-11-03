@@ -147,14 +147,14 @@ pub fn commit_bytes(request: &SaveRequest, bytes: &[u8]) -> Result<SaveOutcome, 
     let (stem, warnings) = prepare(request)?;
     // Bytes arrive already encoded, so there is no long write to interrupt yet; the bands path
     // gets its own cancel signal when it grows one (`docs/41` S1 remaining).
-    commit(request, &stem, &mut NoCancel, |sink| sink.write_all(bytes)).map(
-        |(path, written)| SaveOutcome {
+    commit(request, &stem, &mut NoCancel, |sink| sink.write_all(bytes)).map(|(path, written)| {
+        SaveOutcome {
             path,
             bytes: written,
             format: request.format,
             warnings,
-        },
-    )
+        }
+    })
 }
 
 /// Validates the request and returns the stem the files should be named after, plus the warnings
@@ -250,7 +250,9 @@ fn is_reserved(stem: &str) -> bool {
     let (Some(prefix), Some(digit), None) = (chars.next(), chars.next(), chars.next()) else {
         return false;
     };
-    matches!(prefix, 'C' | 'L') && matches!(digit, '1'..='9') && base.len() == 4
+    matches!(prefix, 'C' | 'L')
+        && matches!(digit, '1'..='9')
+        && base.len() == 4
         && (base.starts_with("COM") || base.starts_with("LPT"))
 }
 
@@ -399,7 +401,9 @@ fn io_error(error: std::io::Error) -> SaveError {
     match error.raw_os_error() {
         // ERROR_DISK_FULL / ENOSPC.
         Some(112) | Some(39) => SaveError::NotEnoughSpace(error.to_string()),
-        _ if error.kind() == std::io::ErrorKind::Interrupted && error.to_string() == "cancelled" => {
+        _ if error.kind() == std::io::ErrorKind::Interrupted
+            && error.to_string() == "cancelled" =>
+        {
             SaveError::Cancelled
         }
         _ => SaveError::Io(error.to_string()),
@@ -419,14 +423,15 @@ mod tests {
     /// the rename test look like it did not rename). So removal is checked rather than hoped for,
     /// and a directory that will not go away fails loudly instead of skewing the assertions.
     fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "snapclip-save-{}-{label}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("snapclip-save-{}-{label}", std::process::id()));
         match fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => panic!("the scratch directory {} cannot be cleared: {error}", dir.display()),
+            Err(error) => panic!(
+                "the scratch directory {} cannot be cleared: {error}",
+                dir.display()
+            ),
         }
         fs::create_dir_all(&dir).expect("scratch directory");
         dir
@@ -512,7 +517,11 @@ mod tests {
         let outcome = save(&master, &request(&out, ConflictPolicy::AutoRename))
             .expect("a PNG request should succeed");
 
-        assert_eq!(outcome.path, out.join("shot.png"), "the name comes from the request");
+        assert_eq!(
+            outcome.path,
+            out.join("shot.png"),
+            "the name comes from the request"
+        );
         assert_eq!(outcome.format, SaveFormat::Png);
         assert_eq!(
             outcome.bytes,
@@ -534,10 +543,15 @@ mod tests {
         let out = dir.join("out");
 
         let first = save(&master, &request(&out, ConflictPolicy::AutoRename)).expect("first save");
-        let second = save(&master, &request(&out, ConflictPolicy::AutoRename)).expect("second save");
+        let second =
+            save(&master, &request(&out, ConflictPolicy::AutoRename)).expect("second save");
 
         assert_eq!(first.path, out.join("shot.png"));
-        assert_eq!(second.path, out.join("shot_2.png"), "the second save steps to _2");
+        assert_eq!(
+            second.path,
+            out.join("shot_2.png"),
+            "the second save steps to _2"
+        );
         assert!(first.path.exists(), "the first file is still there");
         assert_eq!(
             fs::read(&first.path).expect("first"),
@@ -618,10 +632,15 @@ mod tests {
         let error = save(&master, &request_with_stem(&out, "  ")).expect_err("an empty name");
         assert!(matches!(
             error,
-            SaveError::Validation { copy: super::super::copy::ValidationCopy::StemEmpty, .. }
+            SaveError::Validation {
+                copy: super::super::copy::ValidationCopy::StemEmpty,
+                ..
+            }
         ));
         assert!(
-            fs::read_dir(&out).map(|mut d| d.next().is_none()).unwrap_or(true),
+            fs::read_dir(&out)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
             "nothing was written for a refused name"
         );
     }
@@ -667,8 +686,13 @@ mod tests {
         let dir = scratch("trailing-dot");
         let master = master(&dir);
         let out = dir.join("out");
-        let outcome = save(&master, &request_with_stem(&out, "shot.")).expect("a trailing dot saves");
-        assert_eq!(outcome.path, out.join("shot.png"), "the dot does not survive");
+        let outcome =
+            save(&master, &request_with_stem(&out, "shot.")).expect("a trailing dot saves");
+        assert_eq!(
+            outcome.path,
+            out.join("shot.png"),
+            "the dot does not survive"
+        );
         assert_eq!(
             outcome.warnings,
             vec![super::super::copy::ValidationCopy::StemTrailingDotOrSpace]
@@ -686,7 +710,10 @@ mod tests {
         let error = save(&master, &request_with_stem(&out, &stem)).expect_err("too long");
         assert!(matches!(
             error,
-            SaveError::Validation { copy: super::super::copy::ValidationCopy::PathTooLong, .. }
+            SaveError::Validation {
+                copy: super::super::copy::ValidationCopy::PathTooLong,
+                ..
+            }
         ));
         assert!(!out.exists(), "a refused path creates nothing");
         assert!(
@@ -718,11 +745,17 @@ mod tests {
         let master = master(&dir);
         let out = dir.join("out");
         let mut cancel = CancelAt { asked: 0, at: 0 };
-        let error = save_with(&master, &request(&out, ConflictPolicy::AutoRename), &mut cancel)
-            .expect_err("a cancel is not a save");
+        let error = save_with(
+            &master,
+            &request(&out, ConflictPolicy::AutoRename),
+            &mut cancel,
+        )
+        .expect_err("a cancel is not a save");
         assert!(matches!(error, SaveError::Cancelled), "{error:?}");
         assert!(
-            fs::read_dir(&out).map(|mut d| d.next().is_none()).unwrap_or(true),
+            fs::read_dir(&out)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
             "a cancel before the first byte creates nothing"
         );
     }
@@ -741,8 +774,12 @@ mod tests {
 
         // Question 0 happens before the `.partial` exists; question 1 after the body is written.
         let mut cancel = CancelAt { asked: 0, at: 1 };
-        let error = save_with(&master, &request(&out, ConflictPolicy::Overwrite), &mut cancel)
-            .expect_err("a cancel is not a save");
+        let error = save_with(
+            &master,
+            &request(&out, ConflictPolicy::Overwrite),
+            &mut cancel,
+        )
+        .expect_err("a cancel is not a save");
         assert!(matches!(error, SaveError::Cancelled), "{error:?}");
         assert_eq!(
             fs::read(&old).expect("the old file survives"),
@@ -764,8 +801,12 @@ mod tests {
         let master = master(&dir);
         let out = dir.join("out");
         let mut cancel = CancelAt { asked: 0, at: 0 };
-        let error = save_with(&master, &request(&out, ConflictPolicy::AutoRename), &mut cancel)
-            .expect_err("a cancel is not a save");
+        let error = save_with(
+            &master,
+            &request(&out, ConflictPolicy::AutoRename),
+            &mut cancel,
+        )
+        .expect_err("a cancel is not a save");
         assert!(
             !matches!(error, SaveError::Io(_)),
             "a cancel is not an i/o failure: {error:?}"

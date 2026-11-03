@@ -19,11 +19,11 @@
 //! directly: its panel is content-sized, so the shell reserves the height of the mock's default
 //! content block and records the arithmetic.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::service;
-use super::{save_panel, ConflictPolicy, PanelValues, Remembered};
+use super::{ConflictPolicy, PanelValues, Remembered, save_panel};
 use snapclip_capture::save_format::SaveFormat;
 
 // -------------------------------------------------------------------------------------------------
@@ -506,13 +506,17 @@ impl ShellHandle {
             // whatever window inherited it — in practice the panel that was just opened, which is
             // how a second `Ctrl+S` produced neither a panel nor an error. Ask whether the window
             // still exists first, and skip the post when it does not.
-            let alive = unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(self.hwnd as _)
-            } != 0;
+            let alive =
+                unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(self.hwnd as _) }
+                    != 0;
             eprintln!(
                 "[save-panel] request_close hwnd={:#x} alive={alive} -> {}",
                 self.hwnd,
-                if alive { "posting WM_CLOSE" } else { "skipping (stale handle)" }
+                if alive {
+                    "posting WM_CLOSE"
+                } else {
+                    "skipping (stale handle)"
+                }
             );
             if alive {
                 unsafe {
@@ -557,7 +561,9 @@ pub fn open(options: ShellOptions) -> Result<ShellHandle, ShellError> {
     let thread = std::thread::Builder::new()
         .name("snapclip-save-panel".to_owned())
         .spawn(move || open_and_pump(options, ready))
-        .map_err(|error| ShellError::Create(format!("could not start the panel thread: {error}")))?;
+        .map_err(|error| {
+            ShellError::Create(format!("could not start the panel thread: {error}"))
+        })?;
 
     match created.recv() {
         Ok(Ok(hwnd)) => Ok(ShellHandle {
@@ -578,7 +584,10 @@ pub fn open(options: ShellOptions) -> Result<ShellHandle, ShellError> {
 }
 
 #[cfg(not(windows))]
-fn open_and_pump(_options: ShellOptions, ready: std::sync::mpsc::Sender<Result<isize, ShellError>>) {
+fn open_and_pump(
+    _options: ShellOptions,
+    ready: std::sync::mpsc::Sender<Result<isize, ShellError>>,
+) {
     let _ = ready.send(Err(ShellError::Create(
         "the save panel is a Win32 window".to_owned(),
     )));
@@ -586,19 +595,22 @@ fn open_and_pump(_options: ShellOptions, ready: std::sync::mpsc::Sender<Result<i
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Result<isize, ShellError>>) {
+fn open_and_pump(
+    mut options: ShellOptions,
+    ready: std::sync::mpsc::Sender<Result<isize, ShellError>>,
+) {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DispatchMessageW, GetClassNameW, GetMessageW, GetWindow, GetWindowLongW,
-        GetWindowRect, IsDialogMessageW, LoadCursorW, RegisterClassW, SetWindowLongPtrW,
-        SetWindowPos, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GWL_EXSTYLE,
-        GWLP_USERDATA, GW_HWNDPREV, IDC_ARROW, MSG, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-        WNDCLASSW, WS_EX_TOPMOST,
+        CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DispatchMessageW, GW_HWNDPREV, GWL_EXSTYLE,
+        GWLP_USERDATA, GetClassNameW, GetMessageW, GetWindow, GetWindowLongW, GetWindowRect,
+        IDC_ARROW, IsDialogMessageW, LoadCursorW, MSG, RegisterClassW, SW_SHOW, SWP_NOACTIVATE,
+        SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WNDCLASSW,
+        WS_EX_TOPMOST,
     };
 
     let class_name: Vec<u16> = "SnapClipSavePanel\0".encode_utf16().collect();
@@ -704,11 +716,11 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // handler tests the chips the paint drew, and three words of different lengths make three
         // chips of different widths.
         let path_chips = measure_path_chips(hwnd, renderer.as_ref());
-    let after_chips = measure_after_chips(hwnd, renderer.as_ref());
+        let after_chips = measure_after_chips(hwnd, renderer.as_ref());
         // The size row's four shortcuts, measured here for the same reason: a click on `50%` has to
         // land on the chip the paint drew, and each chip is as wide as its own word.
         let size_presets = measure_size_presets(hwnd, renderer.as_ref());
-    let size_mode_widths = measure_size_mode(hwnd, renderer.as_ref());
+        let size_mode_widths = measure_size_mode(hwnd, renderer.as_ref());
         // The size limit's four words, measured here for the same reason: the switch's right edge is
         // where the label line ends, so its click target is as wide as `限制体积`.
         let limit_words = measure_limit_words(hwnd, renderer.as_ref());
@@ -720,17 +732,17 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
         // once here. One brush per state rather than one brush: the same call that decides what to
         // paint the background with also returns the brush to paint it with, and a single brush
         // built from the idle fill silently ignored the focused and warning fills.
-        let fill_brushes: [windows_sys::Win32::Graphics::Gdi::HBRUSH; snapclip_ui::panel::FieldState::ALL.len()] =
-            std::array::from_fn(|index| {
-                let fill = snapclip_ui::panel::field_colours(
-                    snapclip_ui::panel::FieldState::ALL[index],
-                    SURFACE_RGBA,
-                )
-                .fill;
-                let colour =
-                    u32::from(fill[0]) | (u32::from(fill[1]) << 8) | (u32::from(fill[2]) << 16);
-                windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(colour)
-            });
+        let fill_brushes: [windows_sys::Win32::Graphics::Gdi::HBRUSH;
+            snapclip_ui::panel::FieldState::ALL.len()] = std::array::from_fn(|index| {
+            let fill = snapclip_ui::panel::field_colours(
+                snapclip_ui::panel::FieldState::ALL[index],
+                SURFACE_RGBA,
+            )
+            .fill;
+            let colour =
+                u32::from(fill[0]) | (u32::from(fill[1]) << 8) | (u32::from(fill[2]) << 16);
+            windows_sys::Win32::Graphics::Gdi::CreateSolidBrush(colour)
+        });
         // The quality control starts on the first option, at this window's scale. It is built here
         // rather than lazily so the first paint has a real choice to mark.
         let scale = dpi_scale(hwnd);
@@ -758,17 +770,17 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             // Both menus start closed: the panel opens on the form, not on a popup.
             var_open: false,
             path_chips,
-        after_chips,
-        // Read from the shell's record, not reset here: the switches describe the next save, so a
-        // panel that started them off would turn them off again after every capture.
-        after: options
-            .remembered
-            .lock()
-            .map(|remembered| remembered.after)
-            .unwrap_or([false; 2]),
+            after_chips,
+            // Read from the shell's record, not reset here: the switches describe the next save, so a
+            // panel that started them off would turn them off again after every capture.
+            after: options
+                .remembered
+                .lock()
+                .map(|remembered| remembered.after)
+                .unwrap_or([false; 2]),
             size_presets,
-        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
-        size_mode_widths,
+            size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+            size_mode_widths,
             // The limit starts switched off, with no measurement behind it: the switch is the only
             // thing that asks for one, and a number measured for a limit nobody asked about would be
             // work the panel does on every open for nothing.
@@ -886,8 +898,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             let visible = windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd);
             let mut screen: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
             let screen_ok = GetWindowRect(hwnd, &mut screen);
-            let own_topmost =
-                GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
+            let own_topmost = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
             eprintln!(
                 "[save-panel] shown hwnd={hwnd:p} visible={visible} client={}x{} (GetClientRect={got}) \
                  rect=({},{})-({},{}) (GetWindowRect={screen_ok}) topmost={own_topmost}",
@@ -919,7 +930,7 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
             // `RDW_UPDATENOW` paints the window and its children before returning.
             {
                 use windows_sys::Win32::Graphics::Gdi::{
-                    RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW,
+                    RDW_ALLCHILDREN, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow,
                 };
                 // SAFETY: a window handle and flags; no borrowed data crosses the call. The whole
                 // `shown` body is already inside an `unsafe` block, so this one would be redundant
@@ -939,15 +950,16 @@ fn open_and_pump(mut options: ShellOptions, ready: std::sync::mpsc::Sender<Resul
                     let screen = GetDC(std::ptr::null_mut());
                     if !screen.is_null() {
                         let x = box_rect.right - 12;
-                        let outside = GetPixel(screen, box_rect.left - 2, (box_rect.top + box_rect.bottom) / 2);
+                        let outside = GetPixel(
+                            screen,
+                            box_rect.left - 2,
+                            (box_rect.top + box_rect.bottom) / 2,
+                        );
                         let top_edge = GetPixel(screen, x, box_rect.top + 2);
                         let middle = GetPixel(screen, x, (box_rect.top + box_rect.bottom) / 2);
                         eprintln!(
                             "[save-panel] screen: outside={outside:#08x} top_edge={top_edge:#08x} middle={middle:#08x} box=({},{})-({},{}) (COLORREF is 0x00BBGGRR)",
-                            box_rect.left,
-                            box_rect.top,
-                            box_rect.right,
-                            box_rect.bottom,
+                            box_rect.left, box_rect.top, box_rect.right, box_rect.bottom,
                         );
                         ReleaseDC(std::ptr::null_mut(), screen);
                     }
@@ -1067,7 +1079,8 @@ struct WindowState {
     /// which of these is returned: with a single brush built from the idle fill, a focused or
     /// warning field was told one background colour and then painted in another, which is the lit
     /// band that showed through inside those fields.
-    fill_brushes: [windows_sys::Win32::Graphics::Gdi::HBRUSH; snapclip_ui::panel::FieldState::ALL.len()],
+    fill_brushes:
+        [windows_sys::Win32::Graphics::Gdi::HBRUSH; snapclip_ui::panel::FieldState::ALL.len()],
     /// The colour a transparent pixel becomes when the format cannot carry alpha (`S.fill`, `:724`).
     ///
     /// Straight order in the buffer's channels, which is what `PanelValues::fill` and the fill row's
@@ -1284,9 +1297,15 @@ fn measure_after_chips(
         Some(Ok(chips)) => chips,
         Some(Err(error)) => {
             eprintln!("[save-panel] could not measure the after-save switches: {error:?}");
-            snapclip_ui::panel::AfterChips { label: 0, widths: [0; 2] }
+            snapclip_ui::panel::AfterChips {
+                label: 0,
+                widths: [0; 2],
+            }
         }
-        None => snapclip_ui::panel::AfterChips { label: 0, widths: [0; 2] },
+        None => snapclip_ui::panel::AfterChips {
+            label: 0,
+            widths: [0; 2],
+        },
     }
 }
 /// The four size shortcuts' widths, measured once like the buttons above.
@@ -1364,11 +1383,7 @@ fn switch_size_mode(
         &state.number_text(snapclip_ui::panel::FieldId::SizeHeight),
         source,
     );
-    let text = super::scale::display_text(
-        super::scale::SizeMode::from_index(index),
-        size,
-        source,
-    );
+    let text = super::scale::display_text(super::scale::SizeMode::from_index(index), size, source);
     state.set_size_text(&text.0, &text.1);
     state.size_mode = index;
     unsafe {
@@ -1437,17 +1452,9 @@ fn set_control_text_and_caret(
     let mut terminated = wide.clone();
     terminated.push(0);
     unsafe {
-        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
-            hwnd,
-            terminated.as_ptr(),
-        );
+        windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, terminated.as_ptr());
         let _ = text_ptr;
-        SendMessageW(
-            hwnd,
-            EM_SETSEL,
-            caret as usize,
-            caret as isize,
-        );
+        SendMessageW(hwnd, EM_SETSEL, caret as usize, caret as isize);
     }
 }
 
@@ -1593,9 +1600,8 @@ fn choose_fill(hwnd: windows_sys::Win32::Foundation::HWND, index: usize) -> bool
         _ => {
             use windows_sys::Win32::UI::Controls::Dialogs::{CHOOSECOLORW, ChooseColorW};
             let current = s.fill;
-            let start = u32::from(current[0])
-                | u32::from(current[1]) << 8
-                | u32::from(current[2]) << 16;
+            let start =
+                u32::from(current[0]) | u32::from(current[1]) << 8 | u32::from(current[2]) << 16;
             let mut custom: [u32; 16] = [0; 16];
             let mut picker = CHOOSECOLORW {
                 lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
@@ -1732,7 +1738,7 @@ fn wide(text: &str) -> Vec<u16> {
 /// already open keeps the list it enumerated, and a select request against a name that list does not
 /// contain leaves nothing selected. This is the notification that puts the name there.
 fn notify_shell(path: &std::path::Path) {
-    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_CREATE, SHCNF_PATHW};
+    use windows_sys::Win32::UI::Shell::{SHCNE_CREATE, SHCNF_PATHW, SHChangeNotify};
     let wide_path = wide(&path.display().to_string());
     // SAFETY: the path is NUL terminated and outlives the call; the second identifier is unused for
     // this event, which is why it is null.
@@ -1744,7 +1750,10 @@ fn notify_shell(path: &std::path::Path) {
             std::ptr::null(),
         );
     }
-    eprintln!("[save-panel] told the shell the file exists: {}", path.display());
+    eprintln!(
+        "[save-panel] told the shell the file exists: {}",
+        path.display()
+    );
 }
 
 /// What revealing a saved file means: select it in its folder when it is there, and open the folder
@@ -1811,7 +1820,7 @@ fn reveal(path: &std::path::Path) {
         }
         Reveal::Select(file) => {
             use windows_sys::Win32::System::Com::{
-                CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
+                COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
             };
             use windows_sys::Win32::UI::Shell::{
                 ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName,
@@ -1825,7 +1834,8 @@ fn reveal(path: &std::path::Path) {
             // Every successful `CoInitializeEx` is balanced by one `CoUninitialize`, including the
             // one that answers `S_FALSE` because the thread was already initialised: the call
             // increments the count either way.
-            let apartment = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+            let apartment =
+                unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
             let owned_apartment = apartment >= 0;
             if !owned_apartment {
                 eprintln!("[save-panel] no COM apartment for the reveal: hresult={apartment:#x}");
@@ -1864,7 +1874,8 @@ fn reveal(path: &std::path::Path) {
                 let children = [file_pidl as *const _];
                 // SAFETY: both identifiers are valid for the duration of the call and the array
                 // holds exactly the count given.
-                let result = unsafe { SHOpenFolderAndSelectItems(folder_pidl, 1, children.as_ptr(), 0) };
+                let result =
+                    unsafe { SHOpenFolderAndSelectItems(folder_pidl, 1, children.as_ptr(), 0) };
                 eprintln!("[save-panel] reveal: select={result:#x}");
                 if result >= 0 {
                     revealed = Some(result as u64);
@@ -2040,11 +2051,7 @@ fn save_from_panel(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<service
 /// for one, and the weighing has no use for it.
 fn with_panel_request<T>(
     hwnd: windows_sys::Win32::Foundation::HWND,
-    f: impl FnOnce(
-        &super::assemble::PanelValues<'_>,
-        &super::scale::Frame<'_>,
-        &str,
-    ) -> T,
+    f: impl FnOnce(&super::assemble::PanelValues<'_>, &super::scale::Frame<'_>, &str) -> T,
 ) -> Option<T> {
     let s = state(hwnd)?;
     let (bgra, width, height) = s.preview.as_ref()?;
@@ -2207,13 +2214,13 @@ fn refresh_estimate(hwnd: windows_sys::Win32::Foundation::HWND) {
         }
         return;
     }
-    let measured =
-        with_panel_request(hwnd, |values, frame, _| super::assemble::weigh(values, frame));
+    let measured = with_panel_request(hwnd, |values, frame, _| {
+        super::assemble::weigh(values, frame)
+    });
     let limit = limit_bytes(hwnd);
     if let Some(s) = state_mut(hwnd) {
         s.estimate = measured.and_then(|outcome| outcome.ok());
-        s.over_limit =
-            matches!((s.estimate, limit), (Some(bytes), Some(limit)) if bytes > limit);
+        s.over_limit = matches!((s.estimate, limit), (Some(bytes), Some(limit)) if bytes > limit);
     }
     unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
@@ -2367,15 +2374,11 @@ unsafe extern "system" fn browse_initial(
 
 fn choose_folder(hwnd: windows_sys::Win32::Foundation::HWND) {
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{
-        BROWSEINFOW, SHBrowseForFolderW, SHGetPathFromIDListW,
-    };
+    use windows_sys::Win32::UI::Shell::{BROWSEINFOW, SHBrowseForFolderW, SHGetPathFromIDListW};
     let title: Vec<u16> = "选择保存位置\0".encode_utf16().collect();
     // :1133 the dialog opens where the field already points, so correcting a folder that is nearly
     // right does not mean walking back from the shell's default every time.
-    let current = state(hwnd)
-        .map(|s| s.directory.clone())
-        .unwrap_or_default();
+    let current = state(hwnd).map(|s| s.directory.clone()).unwrap_or_default();
     let initial = browse_initial_path(&current);
     let mut display = [0u16; 260];
     let mut info = BROWSEINFOW {
@@ -2405,7 +2408,10 @@ fn choose_folder(hwnd: windows_sys::Win32::Foundation::HWND) {
         eprintln!("[save-panel] the chosen folder has no file system path");
         return;
     }
-    let len = path.iter().position(|unit| *unit == 0).unwrap_or(path.len());
+    let len = path
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(path.len());
     let chosen = String::from_utf16_lossy(&path[..len]);
     set_directory(hwnd, &chosen);
 }
@@ -2423,7 +2429,10 @@ fn open_directory(path: &str) {
     }
     let probe = std::path::Path::new(path);
     if !probe.is_dir() {
-        eprintln!("[save-panel] cannot open {}: not a directory", probe.display());
+        eprintln!(
+            "[save-panel] cannot open {}: not a directory",
+            probe.display()
+        );
         return;
     }
     let verb: Vec<u16> = "open\0".encode_utf16().collect();
@@ -2441,7 +2450,11 @@ fn open_directory(path: &str) {
     // `ShellExecuteW` returns a value greater than 32 on success; the cast keeps the comparison in
     // one type, which is what the API's own documentation asks for.
     if result as isize <= 32 {
-        eprintln!("[save-panel] could not open {}: {}", probe.display(), result as isize);
+        eprintln!(
+            "[save-panel] could not open {}: {}",
+            probe.display(),
+            result as isize
+        );
     }
 }
 
@@ -2542,11 +2555,7 @@ fn selection_is_empty(control: windows_sys::Win32::Foundation::HWND) -> bool {
 /// after typing and after a click that placed the caret, that is where the caret already is, and
 /// jumping to zero would send it to the front of the field for someone who clicked mid-way.
 fn collapse_position(start: usize, end: usize) -> Option<usize> {
-    if start == end {
-        None
-    } else {
-        Some(end)
-    }
+    if start == end { None } else { Some(end) }
 }
 
 /// Collapse whatever a native text box has selected into a caret at the selection's end.
@@ -2655,7 +2664,7 @@ fn run_context_command(hwnd: windows_sys::Win32::Foundation::HWND, index: usize)
 /// hidden and the rest are left alone, so the fields not under the menu keep their caret and their
 /// focus ring. When no menu is open every box is shown again.
 fn apply_menu_occlusion(hwnd: windows_sys::Win32::Foundation::HWND) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOWNA};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA, ShowWindow};
     let Some(state) = state(hwnd) else {
         return;
     };
@@ -2871,7 +2880,8 @@ impl WindowState {
         point: snapclip_model::geometry::Point,
     ) -> bool {
         let before = self.chosen_quality();
-        let chosen = snapclip_ui::panel::quality_pointer(self.segment_at_scale(scale), event, point);
+        let chosen =
+            snapclip_ui::panel::quality_pointer(self.segment_at_scale(scale), event, point);
         chosen.is_some() && self.chosen_quality() != before
     }
 }
@@ -2897,7 +2907,10 @@ impl NumericFields {
         }
     }
 
-    fn get_mut(&mut self, id: snapclip_ui::panel::FieldId) -> Option<&mut snapclip_ui::panel::TextField> {
+    fn get_mut(
+        &mut self,
+        id: snapclip_ui::panel::FieldId,
+    ) -> Option<&mut snapclip_ui::panel::TextField> {
         match id {
             snapclip_ui::panel::FieldId::SizeWidth => Some(&mut self.width),
             snapclip_ui::panel::FieldId::SizeHeight => Some(&mut self.height),
@@ -2923,13 +2936,10 @@ impl NumericFields {
 /// behaviour can be asserted there without a window.
 ///
 /// Returns whether the field changed, so the caller knows to repaint.
-fn number_key(
-    state: &mut WindowState,
-    message: u32,
-    wparam: usize,
-) -> bool {
+fn number_key(state: &mut WindowState, message: u32, wparam: usize) -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT, VK_UP,
+        GetKeyState, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_SHIFT,
+        VK_UP,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
 
@@ -3013,7 +3023,9 @@ fn set_clipboard_text(text: &str) -> bool {
     use windows_sys::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows_sys::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+    };
     const CF_UNICODETEXT: u32 = 13;
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes = wide.len() * std::mem::size_of::<u16>();
@@ -3162,13 +3174,13 @@ fn create_field_edit(
     face: snapclip_ui::panel::FieldFace,
 ) -> windows_sys::Win32::Foundation::HWND {
     use windows_sys::Win32::Graphics::Gdi::{
-        AddFontMemResourceEx, CreateFontW, CLEARTYPE_QUALITY, DEFAULT_CHARSET, FF_DONTCARE,
+        AddFontMemResourceEx, CLEARTYPE_QUALITY, CreateFontW, DEFAULT_CHARSET, FF_DONTCARE,
         FW_NORMAL,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, GetClientRect, ES_AUTOHSCROLL, ES_RIGHT, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
+        CreateWindowExW, ES_AUTOHSCROLL, ES_RIGHT, GetClientRect, WS_CHILD, WS_TABSTOP, WS_VISIBLE,
     };
 
     unsafe {
@@ -3245,7 +3257,11 @@ fn create_field_edit(
                 | WS_VISIBLE
                 | WS_TABSTOP
                 | ES_AUTOHSCROLL as u32
-                | if face.right_aligned() { ES_RIGHT as u32 } else { 0 },
+                | if face.right_aligned() {
+                    ES_RIGHT as u32
+                } else {
+                    0
+                },
             control.left,
             control.top,
             (control.right - control.left).max(1),
@@ -3319,55 +3335,55 @@ pub const BACKDROP_TYPE: u32 = 1;
 #[allow(unsafe_code)]
 fn apply_dwm_chrome(hwnd: windows_sys::Win32::Foundation::HWND) {
     unsafe {
-    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+        use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 
-    // Documented attribute ids. Spelled out rather than imported so that a missing constant in the
-    // bindings cannot silently change what we ask for.
-    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
-    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
-    const DWMWA_BORDER_COLOR: u32 = 34;
-    const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
-    const DWMWCP_ROUND: u32 = 2;
-    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+        // Documented attribute ids. Spelled out rather than imported so that a missing constant in the
+        // bindings cannot silently change what we ask for.
+        const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+        const DWMWA_BORDER_COLOR: u32 = 34;
+        const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+        const DWMWCP_ROUND: u32 = 2;
+        const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
 
-    let dark: i32 = 1;
-    let corner: u32 = DWMWCP_ROUND;
-    let border: u32 = DWMWA_COLOR_NONE;
-    let size = std::mem::size_of::<u32>() as u32;
+        let dark: i32 = 1;
+        let corner: u32 = DWMWCP_ROUND;
+        let border: u32 = DWMWA_COLOR_NONE;
+        let size = std::mem::size_of::<u32>() as u32;
 
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_USE_IMMERSIVE_DARK_MODE,
-        &dark as *const i32 as *const _,
-        std::mem::size_of::<i32>() as u32,
-    );
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_WINDOW_CORNER_PREFERENCE,
-        &corner as *const u32 as *const _,
-        size,
-    );
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_BORDER_COLOR,
-        &border as *const u32 as *const _,
-        size,
-    );
-    // A build older than Windows 11 22H2 has no such attribute and refuses it; that is the same
-    // outcome the panel wants, so the refusal is reported and not treated as a failure.
-    let no_material = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_SYSTEMBACKDROP_TYPE,
-        &BACKDROP_TYPE as *const u32 as *const _,
-        size,
-    );
-    if no_material == 0 {
-        eprintln!("[save-panel] dwm chrome: no material requested (DWMSBT_NONE)");
-    } else {
-        eprintln!(
-            "[save-panel] dwm chrome: this system has no backdrop attribute (hresult={no_material})"
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
         );
-    }
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const u32 as *const _,
+            size,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border as *const u32 as *const _,
+            size,
+        );
+        // A build older than Windows 11 22H2 has no such attribute and refuses it; that is the same
+        // outcome the panel wants, so the refusal is reported and not treated as a failure.
+        let no_material = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &BACKDROP_TYPE as *const u32 as *const _,
+            size,
+        );
+        if no_material == 0 {
+            eprintln!("[save-panel] dwm chrome: no material requested (DWMSBT_NONE)");
+        } else {
+            eprintln!(
+                "[save-panel] dwm chrome: this system has no backdrop attribute (hresult={no_material})"
+            );
+        }
     }
 }
 
@@ -3383,285 +3399,226 @@ extern "system" fn window_proc(
     // system passed us, and splitting them would spread `unsafe` over forty lines without making
     // any of them more checkable.
     unsafe {
-    use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, PAINTSTRUCT,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, DestroyWindow, GetWindowLongPtrW, PostQuitMessage, SetWindowPos,
-        GWLP_USERDATA, HTCLIENT, HTCAPTION, SWP_NOACTIVATE, SWP_NOZORDER, WA_INACTIVE, WM_ACTIVATE,
-        WM_CLOSE, WM_DESTROY,
-        DLGC_WANTARROWS, DLGC_WANTCHARS, WM_CHAR, WM_DPICHANGED, WM_ERASEBKGND, WM_GETDLGCODE,
-        WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCCALCSIZE,
-        WM_NCHITTEST, WM_PAINT,
-    };
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Gdi::{
+            BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+            PAINTSTRUCT,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DLGC_WANTARROWS, DLGC_WANTCHARS, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
+            GetWindowLongPtrW, HTCAPTION, HTCLIENT, PostQuitMessage, SWP_NOACTIVATE, SWP_NOZORDER,
+            SetWindowPos, WA_INACTIVE, WM_ACTIVATE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+            WM_ERASEBKGND, WM_GETDLGCODE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+            WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT,
+        };
 
-    match message {
-        // The mock has its own title bar, so the frame's caption is taken away by claiming the whole
-        // window as client area. The window still has `WS_CAPTION`, which is what keeps DWM's
-        // rounded corners, shadow and backdrop working.
-        WM_NCCALCSIZE if wparam != 0 => 0,
-        // The mock's header is the drag area.
-        WM_NCHITTEST => {
-            let y = (lparam >> 16) as i16 as i32;
-            let header = (HEADER_HEIGHT_DIP * dpi_scale(hwnd)).round() as i32;
-            if y < header {
-                HTCAPTION as isize
-            } else {
-                HTCLIENT as isize
-            }
-        }
-        // A menu is a popup inside this window, not an owned popup window, so clicking anything
-        // outside the panel takes the activation away and no mouse message ever arrives here. The
-        // menu would then stay open for as long as the panel lives, which is why the deactivation
-        // is what closes it.
-        WM_ACTIVATE => {
-            let active = (wparam & 0xFFFF) as u32;
-            if active == WA_INACTIVE {
-                close_menus(hwnd, "the panel lost activation");
-            } else if let Some(panel) = state(hwnd) {
-                // Coming back to the panel is another activation, so the box may have been given
-                // its contents selected again; this is the third place that removes it.
-                collapse_native_selection(panel.control(snapclip_ui::panel::FieldId::Name));
-            }
-            0
-        }
-        WM_ERASEBKGND => {
-            // Reported as "not erased" so the paint below is what owns every pixel, including the
-            // first frame. A window that let the system erase its background would paint the class
-            // brush under the frame and show through wherever the frame's own fill is translucent.
-            0
-        }
-        WM_PAINT => {
-            let mut paint: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(hwnd, &mut paint);
-            let mut client: RECT = std::mem::zeroed();
-            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
-            let mut painted = false;
-            if let Some(s) = state(hwnd) {
-                if let Some(renderer) = s.renderer.as_ref() {
-                    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32;
-                    let area = snapclip_model::geometry::Rect::new(
-                        client.left,
-                        client.top,
-                        client.right,
-                        client.bottom,
-                    );
-                    // The estimate row's two strings live here rather than in the state: they are
-                    // formatted from the measurement and read by one paint, and a stored copy would
-                    // be a second place that has to be kept in step with the number it came from.
-                    let limit_note = limit_note(
-                        s.estimate,
-                        s.over_limit,
-                        format_of_index(s.format) == SaveFormat::Png,
-                    );
-                    let estimate_text = s.estimate.map(crate::save::estimate::format_bytes);
-                    // The over-resolution hint and the token menu's values, read here for the same
-                    // reason the save reads them there: the width and height the sentence warns
-                    // about are the size fields' own answer, and a menu promising a date the file
-                    // name would not get is worse than no menu.
-                    let (date_text, time_text) = local_date_and_time();
-                    let source_size = s
-                        .preview
-                        .as_ref()
-                        .map(|(_, width, height)| super::scale::Size::new(*width, *height))
-                        .unwrap_or(super::scale::Size::new(0, 0));
-                    let output_size = super::scale::output_size(
-                        super::scale::SizeMode::from_index(s.size_mode),
-                        &s.number_text(snapclip_ui::panel::FieldId::SizeWidth),
-                        &s.number_text(snapclip_ui::panel::FieldId::SizeHeight),
-                        source_size,
-                    );
-                    let warn_hint = snapclip_ui::panel::warn_hint_shown(
-                        (output_size.width, output_size.height),
-                        (source_size.width, source_size.height),
-                    );
-                    let sequence_text = s
-                        .remembered
-                        .lock()
-                        .map(|remembered| remembered.sequence.next())
-                        .unwrap_or(1)
-                        .to_string();
-                    let resolution_text =
-                        format!("{}x{}", output_size.width, output_size.height);
-                    // The window is the surface: with no material behind it, every pixel has to come
-                    // from this paint. `docs/42` D13 fourth deviation is why there is no material.
-                    painted = renderer
-                        .paint_with_preview(
-                            hdc as *mut _,
-                            area,
-                            &snapclip_ui::panel::PaintInput {
-                                dpi,
-                                fill_surface: true,
-                                // A window keeps its pixels between frames, so it erases first;
-                                // see `PaintInput::clear_first` for what the residue did.
-                                clear_first: true,
-                                fields: s.fields,
-                                numbers: s.numbers.views(),
-                                // The row is drawn, not typed into: the value comes from the one
-                                // copy the save reads, and too long for its box means shortened in
-                                // the middle by the painter.
-                                path_text: Some(s.directory.as_str()),
-                                preview: s
-                                    .preview
-                                    .as_ref()
-                                    .map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
-                                quality: s.chosen_quality(),
-                                format: s.format,
-                                format_open: s.format_open,
-                                fill: s.fill,
-                                footer_widths: Some(s.footer_widths),
-                                path_change: s.path_change,
-                                conflict: s.conflict_shown.then(|| conflict_link(s.conflict)),
-                                conflict_widths: Some(s.conflict_widths),
-                                var_open: s.var_open,
-                                context: s.context,
-                                path_chips: Some(s.path_chips),
-        after_chips: Some(s.after_chips),
-        after: s.after,
-                                size_presets: Some(s.size_presets),
-                                size_mode: s.size_mode,
-                                size_mode_widths: Some(s.size_mode_widths),
-                                warn_hint,
-                                variable_values: Some([
-                                    date_text.as_str(),
-                                    time_text.as_str(),
-                                    sequence_text.as_str(),
-                                    resolution_text.as_str(),
-                                    APP_NAME,
-                                ]),
-                                // The switch is always drawn — turning it on is the whole point of
-                                // it — while the note and the escape hatch exist only when a
-                                // measurement has something to say (`:234`, `:235`).
-                                limit: Some(snapclip_ui::panel::LimitView {
-                                    on: s.limit_on,
-                                    switch_word_px: s.limit_words.switch_word_px,
-                                    note: limit_note.as_deref(),
-                                    note_warn: s.over_limit,
-                                    auto_shrink_px: if s.limit_on && s.over_limit {
-                                        s.limit_words.auto_shrink_px
-                                    } else {
-                                        0
-                                    },
-                                    estimate: estimate_text.as_deref(),
-                                    // A synchronous encode cannot show the state while it runs, so
-                                    // the finished word is the only one this panel can honestly
-                                    // draw; `docs/41` records why `编码中` would be theatre here.
-                                    encode_state: if s.estimate.is_some() {
-                                        Some(snapclip_ui::panel::ENCODE_STATE_DONE)
-                                    } else {
-                                        None
-                                    },
-                                    encode_done: s.estimate.is_some(),
-                                    encode_state_px: s.limit_words.measured_px,
-                                }),
-                                status: s
-                                    .status
-                                    .as_ref()
-                                    .map(|(level, text)| (*level, text.as_str())),
-                            },
-                        )
-                        .is_ok();
+        match message {
+            // The mock has its own title bar, so the frame's caption is taken away by claiming the whole
+            // window as client area. The window still has `WS_CAPTION`, which is what keeps DWM's
+            // rounded corners, shadow and backdrop working.
+            WM_NCCALCSIZE if wparam != 0 => 0,
+            // The mock's header is the drag area.
+            WM_NCHITTEST => {
+                let y = (lparam >> 16) as i16 as i32;
+                let header = (HEADER_HEIGHT_DIP * dpi_scale(hwnd)).round() as i32;
+                if y < header {
+                    HTCAPTION as isize
+                } else {
+                    HTCLIENT as isize
                 }
             }
-            if !painted {
-                // The mock's surface, as the fallback for a window whose painter could not start.
-                let [r, g, b, _a] = SURFACE_RGBA;
-                let colour = u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16);
-                let brush = CreateSolidBrush(colour);
+            // A menu is a popup inside this window, not an owned popup window, so clicking anything
+            // outside the panel takes the activation away and no mouse message ever arrives here. The
+            // menu would then stay open for as long as the panel lives, which is why the deactivation
+            // is what closes it.
+            WM_ACTIVATE => {
+                let active = (wparam & 0xFFFF) as u32;
+                if active == WA_INACTIVE {
+                    close_menus(hwnd, "the panel lost activation");
+                } else if let Some(panel) = state(hwnd) {
+                    // Coming back to the panel is another activation, so the box may have been given
+                    // its contents selected again; this is the third place that removes it.
+                    collapse_native_selection(panel.control(snapclip_ui::panel::FieldId::Name));
+                }
+                0
+            }
+            WM_ERASEBKGND => {
+                // Reported as "not erased" so the paint below is what owns every pixel, including the
+                // first frame. A window that let the system erase its background would paint the class
+                // brush under the frame and show through wherever the frame's own fill is translucent.
+                0
+            }
+            WM_PAINT => {
+                let mut paint: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut paint);
                 let mut client: RECT = std::mem::zeroed();
                 windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
-                FillRect(hdc, &client, brush);
-                DeleteObject(brush);
-            }
-            EndPaint(hwnd, &paint);
-            0
-        }
-        // The quality control is drawn by the frame rather than being a child window, so its clicks
-        // arrive here. The coordinates in `lParam` are client pixels, and the segment's rectangles
-        // are pixels too — `rects(scale)` has already converted every dip — so the point is used as
-        // it arrives and no conversion happens twice.
-        WM_LBUTTONDOWN | WM_LBUTTONUP => {
-            let point = snapclip_model::geometry::Point::new(
-                (lparam & 0xffff) as i16 as i32,
-                ((lparam >> 16) & 0xffff) as i16 as i32,
-            );
-            let event = if message == WM_LBUTTONDOWN {
-                snapclip_ui::panel::PointerEvent::Down
-            } else {
-                snapclip_ui::panel::PointerEvent::Up
-            };
-            // A click while the right-click menu is open belongs to it: a command runs and the menu
-            // closes, and a click anywhere else dismisses the menu and does nothing else — the first
-            // click after a menu opens is the menu's, the rule the format menu already follows.
-            if event == snapclip_ui::panel::PointerEvent::Down {
-                if let Some(context) = state(hwnd).and_then(|s| s.context) {
-                    let hit = context.item_at((point.x, point.y));
-                    if let Some(index) = hit {
-                        run_context_command(hwnd, index);
-                        close_menus(hwnd, "a command was chosen");
-                    } else {
-                        close_menus(hwnd, "a click landed outside the context menu");
+                let mut painted = false;
+                if let Some(s) = state(hwnd) {
+                    if let Some(renderer) = s.renderer.as_ref() {
+                        let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32;
+                        let area = snapclip_model::geometry::Rect::new(
+                            client.left,
+                            client.top,
+                            client.right,
+                            client.bottom,
+                        );
+                        // The estimate row's two strings live here rather than in the state: they are
+                        // formatted from the measurement and read by one paint, and a stored copy would
+                        // be a second place that has to be kept in step with the number it came from.
+                        let limit_note = limit_note(
+                            s.estimate,
+                            s.over_limit,
+                            format_of_index(s.format) == SaveFormat::Png,
+                        );
+                        let estimate_text = s.estimate.map(crate::save::estimate::format_bytes);
+                        // The over-resolution hint and the token menu's values, read here for the same
+                        // reason the save reads them there: the width and height the sentence warns
+                        // about are the size fields' own answer, and a menu promising a date the file
+                        // name would not get is worse than no menu.
+                        let (date_text, time_text) = local_date_and_time();
+                        let source_size = s
+                            .preview
+                            .as_ref()
+                            .map(|(_, width, height)| super::scale::Size::new(*width, *height))
+                            .unwrap_or(super::scale::Size::new(0, 0));
+                        let output_size = super::scale::output_size(
+                            super::scale::SizeMode::from_index(s.size_mode),
+                            &s.number_text(snapclip_ui::panel::FieldId::SizeWidth),
+                            &s.number_text(snapclip_ui::panel::FieldId::SizeHeight),
+                            source_size,
+                        );
+                        let warn_hint = snapclip_ui::panel::warn_hint_shown(
+                            (output_size.width, output_size.height),
+                            (source_size.width, source_size.height),
+                        );
+                        let sequence_text = s
+                            .remembered
+                            .lock()
+                            .map(|remembered| remembered.sequence.next())
+                            .unwrap_or(1)
+                            .to_string();
+                        let resolution_text =
+                            format!("{}x{}", output_size.width, output_size.height);
+                        // The window is the surface: with no material behind it, every pixel has to come
+                        // from this paint. `docs/42` D13 fourth deviation is why there is no material.
+                        painted = renderer
+                            .paint_with_preview(
+                                hdc as *mut _,
+                                area,
+                                &snapclip_ui::panel::PaintInput {
+                                    dpi,
+                                    fill_surface: true,
+                                    // A window keeps its pixels between frames, so it erases first;
+                                    // see `PaintInput::clear_first` for what the residue did.
+                                    clear_first: true,
+                                    fields: s.fields,
+                                    numbers: s.numbers.views(),
+                                    // The row is drawn, not typed into: the value comes from the one
+                                    // copy the save reads, and too long for its box means shortened in
+                                    // the middle by the painter.
+                                    path_text: Some(s.directory.as_str()),
+                                    preview: s
+                                        .preview
+                                        .as_ref()
+                                        .map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
+                                    quality: s.chosen_quality(),
+                                    format: s.format,
+                                    format_open: s.format_open,
+                                    fill: s.fill,
+                                    footer_widths: Some(s.footer_widths),
+                                    path_change: s.path_change,
+                                    conflict: s.conflict_shown.then(|| conflict_link(s.conflict)),
+                                    conflict_widths: Some(s.conflict_widths),
+                                    var_open: s.var_open,
+                                    context: s.context,
+                                    path_chips: Some(s.path_chips),
+                                    after_chips: Some(s.after_chips),
+                                    after: s.after,
+                                    size_presets: Some(s.size_presets),
+                                    size_mode: s.size_mode,
+                                    size_mode_widths: Some(s.size_mode_widths),
+                                    warn_hint,
+                                    variable_values: Some([
+                                        date_text.as_str(),
+                                        time_text.as_str(),
+                                        sequence_text.as_str(),
+                                        resolution_text.as_str(),
+                                        APP_NAME,
+                                    ]),
+                                    // The switch is always drawn — turning it on is the whole point of
+                                    // it — while the note and the escape hatch exist only when a
+                                    // measurement has something to say (`:234`, `:235`).
+                                    limit: Some(snapclip_ui::panel::LimitView {
+                                        on: s.limit_on,
+                                        switch_word_px: s.limit_words.switch_word_px,
+                                        note: limit_note.as_deref(),
+                                        note_warn: s.over_limit,
+                                        auto_shrink_px: if s.limit_on && s.over_limit {
+                                            s.limit_words.auto_shrink_px
+                                        } else {
+                                            0
+                                        },
+                                        estimate: estimate_text.as_deref(),
+                                        // A synchronous encode cannot show the state while it runs, so
+                                        // the finished word is the only one this panel can honestly
+                                        // draw; `docs/41` records why `编码中` would be theatre here.
+                                        encode_state: if s.estimate.is_some() {
+                                            Some(snapclip_ui::panel::ENCODE_STATE_DONE)
+                                        } else {
+                                            None
+                                        },
+                                        encode_done: s.estimate.is_some(),
+                                        encode_state_px: s.limit_words.measured_px,
+                                    }),
+                                    status: s
+                                        .status
+                                        .as_ref()
+                                        .map(|(level, text)| (*level, text.as_str())),
+                                },
+                            )
+                            .is_ok();
                     }
-                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(
-                        hwnd,
-                        std::ptr::null(),
-                        0,
-                    );
-                    return 0;
                 }
+                if !painted {
+                    // The mock's surface, as the fallback for a window whose painter could not start.
+                    let [r, g, b, _a] = SURFACE_RGBA;
+                    let colour = u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16);
+                    let brush = CreateSolidBrush(colour);
+                    let mut client: RECT = std::mem::zeroed();
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+                    FillRect(hdc, &client, brush);
+                    DeleteObject(brush);
+                }
+                EndPaint(hwnd, &paint);
+                0
             }
-            // The close button is drawn by the frame, so its clicks arrive here too. The button is
-            // hit tested, not the 14 dip glyph inside it: the mockup's button is 26 dip (`:96`) and
-            // its svg is 14 (`:98`), and a corner target should be the size of the thing that looks
-            // clickable. Closing goes through the same message `Esc` posts, and the window posts it
-            // to its own handle, so there is no stale number to aim at.
-            if event == snapclip_ui::panel::PointerEvent::Down {
-                let metrics = snapclip_ui::panel::DEMO;
-                let rects = metrics.rects(dpi_scale(hwnd));
-                if snapclip_ui::panel::close_button_contains(&rects, dpi_scale(hwnd), (point.x, point.y))
-                {
-                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
-                    return 0;
-                }
-                // The minimize button, one header gap to the close's left, drawn the same way and
-                // hit tested on the same 26 dip rectangle rather than on its glyph. The mockup has
-                // no such button (`:472`); the panel is a window that can be minimized, and its own
-                // header is where that belongs, since the frame no longer lets the system draw one.
-                if snapclip_ui::panel::minimize_button_contains(&rects, dpi_scale(hwnd), (point.x, point.y))
-                {
-                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
-                        hwnd,
-                        windows_sys::Win32::UI::WindowsAndMessaging::SW_MINIMIZE,
-                    );
-                    return 0;
-                }
-                // A drawn number takes the focus from a click anywhere in its box, and the panel
-                // takes the keyboard focus on its behalf. The box tested is the frame's own rectangle,
-                // so the target is the shape on screen. A click that lands anywhere else gives the
-                // focus up: a caret in a field the user just clicked away from would be a lie.
-                if let Some(s) = state_mut(hwnd) {
-                    let limit_shown = snapclip_ui::panel::quality_line(s.format, s.limit_on)
-                        == snapclip_ui::panel::QualityLine::Limit;
-                    let scale_now = dpi_scale(hwnd);
-                    let mut hit = None;
-                    for id in [
-                        snapclip_ui::panel::FieldId::SizeWidth,
-                        snapclip_ui::panel::FieldId::SizeHeight,
-                        snapclip_ui::panel::FieldId::Limit,
-                    ] {
-                        if id == snapclip_ui::panel::FieldId::Limit && !limit_shown {
-                            continue;
+            // The quality control is drawn by the frame rather than being a child window, so its clicks
+            // arrive here. The coordinates in `lParam` are client pixels, and the segment's rectangles
+            // are pixels too — `rects(scale)` has already converted every dip — so the point is used as
+            // it arrives and no conversion happens twice.
+            WM_LBUTTONDOWN | WM_LBUTTONUP => {
+                let point = snapclip_model::geometry::Point::new(
+                    (lparam & 0xffff) as i16 as i32,
+                    ((lparam >> 16) & 0xffff) as i16 as i32,
+                );
+                let event = if message == WM_LBUTTONDOWN {
+                    snapclip_ui::panel::PointerEvent::Down
+                } else {
+                    snapclip_ui::panel::PointerEvent::Up
+                };
+                // A click while the right-click menu is open belongs to it: a command runs and the menu
+                // closes, and a click anywhere else dismisses the menu and does nothing else — the first
+                // click after a menu opens is the menu's, the rule the format menu already follows.
+                if event == snapclip_ui::panel::PointerEvent::Down {
+                    if let Some(context) = state(hwnd).and_then(|s| s.context) {
+                        let hit = context.item_at((point.x, point.y));
+                        if let Some(index) = hit {
+                            run_context_command(hwnd, index);
+                            close_menus(hwnd, "a command was chosen");
+                        } else {
+                            close_menus(hwnd, "a click landed outside the context menu");
                         }
-                        let rect = id.frame_rect(&metrics, &rects, scale_now, s.path_change);
-                        if snapclip_ui::panel::rect_contains(rect, (point.x, point.y)) {
-                            hit = Some(id);
-                            break;
-                        }
-                    }
-                    if let Some(id) = hit {
-                        s.focus_number(id);
-                        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
                         windows_sys::Win32::Graphics::Gdi::InvalidateRect(
                             hwnd,
                             std::ptr::null(),
@@ -3669,6 +3626,566 @@ extern "system" fn window_proc(
                         );
                         return 0;
                     }
+                }
+                // The close button is drawn by the frame, so its clicks arrive here too. The button is
+                // hit tested, not the 14 dip glyph inside it: the mockup's button is 26 dip (`:96`) and
+                // its svg is 14 (`:98`), and a corner target should be the size of the thing that looks
+                // clickable. Closing goes through the same message `Esc` posts, and the window posts it
+                // to its own handle, so there is no stale number to aim at.
+                if event == snapclip_ui::panel::PointerEvent::Down {
+                    let metrics = snapclip_ui::panel::DEMO;
+                    let rects = metrics.rects(dpi_scale(hwnd));
+                    if snapclip_ui::panel::close_button_contains(
+                        &rects,
+                        dpi_scale(hwnd),
+                        (point.x, point.y),
+                    ) {
+                        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            hwnd, WM_CLOSE, 0, 0,
+                        );
+                        return 0;
+                    }
+                    // The minimize button, one header gap to the close's left, drawn the same way and
+                    // hit tested on the same 26 dip rectangle rather than on its glyph. The mockup has
+                    // no such button (`:472`); the panel is a window that can be minimized, and its own
+                    // header is where that belongs, since the frame no longer lets the system draw one.
+                    if snapclip_ui::panel::minimize_button_contains(
+                        &rects,
+                        dpi_scale(hwnd),
+                        (point.x, point.y),
+                    ) {
+                        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                            hwnd,
+                            windows_sys::Win32::UI::WindowsAndMessaging::SW_MINIMIZE,
+                        );
+                        return 0;
+                    }
+                    // A drawn number takes the focus from a click anywhere in its box, and the panel
+                    // takes the keyboard focus on its behalf. The box tested is the frame's own rectangle,
+                    // so the target is the shape on screen. A click that lands anywhere else gives the
+                    // focus up: a caret in a field the user just clicked away from would be a lie.
+                    if let Some(s) = state_mut(hwnd) {
+                        let limit_shown = snapclip_ui::panel::quality_line(s.format, s.limit_on)
+                            == snapclip_ui::panel::QualityLine::Limit;
+                        let scale_now = dpi_scale(hwnd);
+                        let mut hit = None;
+                        for id in [
+                            snapclip_ui::panel::FieldId::SizeWidth,
+                            snapclip_ui::panel::FieldId::SizeHeight,
+                            snapclip_ui::panel::FieldId::Limit,
+                        ] {
+                            if id == snapclip_ui::panel::FieldId::Limit && !limit_shown {
+                                continue;
+                            }
+                            let rect = id.frame_rect(&metrics, &rects, scale_now, s.path_change);
+                            if snapclip_ui::panel::rect_contains(rect, (point.x, point.y)) {
+                                hit = Some(id);
+                                break;
+                            }
+                        }
+                        if let Some(id) = hit {
+                            s.focus_number(id);
+                            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
+                            windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                                hwnd,
+                                std::ptr::null(),
+                                0,
+                            );
+                            return 0;
+                        }
+                        if s.focused_number.is_some() {
+                            s.blur_number();
+                            windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                                hwnd,
+                                std::ptr::null(),
+                                0,
+                            );
+                        }
+                    }
+                    // The conflict link (:989): a press flips the policy for the next save. Its word is
+                    // the action, so the rectangle to test is the one for the word being drawn.
+                    let link = state(hwnd).and_then(|s| {
+                        s.conflict_shown.then(|| {
+                            let word = conflict_link(s.conflict);
+                            (s.conflict_widths[word.index()], s.footer_widths)
+                        })
+                    });
+                    if let Some((width, widths)) = link {
+                        let metrics = snapclip_ui::panel::DEMO;
+                        let scale = dpi_scale(hwnd);
+                        if snapclip_ui::panel::conflict_link_contains(
+                            &metrics,
+                            scale,
+                            widths,
+                            width,
+                            (point.x, point.y),
+                        ) {
+                            if let Some(s) = state_mut(hwnd) {
+                                s.conflict = match s.conflict {
+                                    ConflictPolicy::AutoRename => ConflictPolicy::Overwrite,
+                                    ConflictPolicy::Overwrite => ConflictPolicy::AutoRename,
+                                };
+                            }
+                            windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                                hwnd,
+                                std::ptr::null(),
+                                0,
+                            );
+                            return 0;
+                        }
+                    }
+                }
+                // The token menu is the topmost thing the frame draws, so it is answered before
+                // anything it covers: a click on a token must insert that token rather than fall
+                // through to a row underneath, and a click anywhere else first closes the menu.
+                if event == snapclip_ui::panel::PointerEvent::Down {
+                    let metrics = snapclip_ui::panel::DEMO;
+                    let scale = dpi_scale(hwnd);
+                    let rects = metrics.rects(scale);
+                    let point = (point.x, point.y);
+                    let open = state(hwnd).map(|s| s.var_open).unwrap_or(false);
+                    if open {
+                        if let Some(index) =
+                            snapclip_ui::panel::var_item_at(&metrics, &rects, scale, point)
+                        {
+                            let token = snapclip_ui::panel::VARIABLE_TOKENS[index];
+                            if let Some(s) = state_mut(hwnd) {
+                                s.var_open = false;
+                            }
+                            insert_token(hwnd, token);
+                            apply_menu_occlusion(hwnd);
+                            return 0;
+                        }
+                        let on_wand =
+                            snapclip_ui::panel::name_wand_contains(&metrics, &rects, scale, point);
+                        let inside =
+                            snapclip_ui::panel::var_menu_contains(&metrics, &rects, scale, point)
+                                || on_wand;
+                        if inside {
+                            // The button again closes the menu, which is what a button that opened it
+                            // should do; its padding is swallowed so a near miss does not dismiss it.
+                            if on_wand {
+                                if let Some(s) = state_mut(hwnd) {
+                                    s.var_open = false;
+                                }
+                                apply_menu_occlusion(hwnd);
+                                InvalidateRect(hwnd, std::ptr::null(), 0);
+                            }
+                            return 0;
+                        }
+                        if let Some(s) = state_mut(hwnd) {
+                            s.var_open = false;
+                        }
+                        apply_menu_occlusion(hwnd);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                    // The variable button itself, which is inside the name field and therefore above
+                    // the field's text: only the strip the control gave up can be clicked, and that is
+                    // the strip this tests.
+                    if snapclip_ui::panel::name_wand_contains(&metrics, &rects, scale, point) {
+                        // One menu at a time: opening this one closes the format's, so a click cannot
+                        // leave two popups over the same form.
+                        if let Some(s) = state_mut(hwnd) {
+                            s.var_open = true;
+                            s.format_open = false;
+                        }
+                        apply_menu_occlusion(hwnd);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
+                // The path row's controls, before the footer and after the menus. The row itself is
+                // drawn by the frame and is read-only, so the whole row is one target for the same
+                // chooser the `更改` button opens: there is nothing else a press on it could mean.
+                if event == snapclip_ui::panel::PointerEvent::Down {
+                    let metrics = snapclip_ui::panel::DEMO;
+                    let scale = dpi_scale(hwnd);
+                    let rects = metrics.rects(scale);
+                    let point = (point.x, point.y);
+                    let (change, chips) = state(hwnd)
+                        .map(|s| (s.path_change, s.path_chips))
+                        .unwrap_or((0, [0; 3]));
+                    let row = snapclip_ui::panel::path_field_rect(&metrics, &rects, scale, change);
+                    if snapclip_ui::panel::rect_contains(row, point)
+                        || snapclip_ui::panel::path_change_contains(
+                            &metrics, &rects, scale, change, point,
+                        )
+                    {
+                        choose_folder(hwnd);
+                        return 0;
+                    }
+                    if snapclip_ui::panel::path_open_contains(&metrics, &rects, scale, point) {
+                        let directory =
+                            state(hwnd).map(|s| s.directory.clone()).unwrap_or_default();
+                        open_directory(&directory);
+                        return 0;
+                    }
+                    if let Some(index) =
+                        snapclip_ui::panel::path_chip_at(&metrics, &rects, scale, &chips, point)
+                    {
+                        // The shortcut is the shell's answer for that folder, not a literal in the
+                        // panel: the mockup's three paths name one person's home (`:739`–`:741`).
+                        if let Some(directory) = shortcut_directory(index) {
+                            set_directory(hwnd, &directory);
+                        }
+                        return 0;
+                    }
+                    // The two after-save switches. They are switches (`:573`, `:574`), so a click
+                    // turns one on or off, and the work it stands for runs when a save succeeds.
+                    if let Some(index) = state(hwnd)
+                        .map(|s| s.after_chips.at(&metrics, &rects, scale, point))
+                        .unwrap_or(None)
+                    {
+                        if let Some(s) = state_mut(hwnd) {
+                            s.after[index] = !s.after[index];
+                            // The switch is a setting that outlives this panel, so it is handed to the
+                            // shell in the same click that changes it; the panel keeps no copy of it
+                            // beyond the one the next paint reads.
+                            let chosen = s.after;
+                            if let Ok(mut remembered) = s.remembered.lock() {
+                                remembered.remember_after(chosen);
+                            }
+                        }
+                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                            hwnd,
+                            std::ptr::null(),
+                            0,
+                        );
+                        return 0;
+                    }
+                }
+                // The format control's menu hangs over everything below it, so it is answered before
+                // the footer: a click on an option must choose a format rather than fall through to a
+                // button that happens to be underneath. The rectangles come from the same producers the
+                // painter uses, and the window's height is the panel's own, which is what the menu's
+                // flip rule is written against.
+                if event == snapclip_ui::panel::PointerEvent::Down {
+                    let metrics = snapclip_ui::panel::DEMO;
+                    let scale = dpi_scale(hwnd);
+                    let rects = metrics.rects(scale);
+                    let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
+                    let point = (point.x, point.y);
+                    let open = state(hwnd).map(|s| s.format_open).unwrap_or(false);
+                    if open {
+                        if let Some(index) = snapclip_ui::panel::fmt_item_at(
+                            &metrics,
+                            &rects,
+                            scale,
+                            window_height,
+                            true,
+                            point,
+                        ) {
+                            if let Some(s) = state_mut(hwnd) {
+                                s.format = index;
+                            }
+                            // The one way to close a menu, so the boxes it covered come back: see
+                            // `close_menus`.
+                            close_menus(hwnd, "a format was chosen");
+                            // The file's format decides what it weighs, so a measurement taken under the
+                            // old one describes a file that no longer exists. Only a limit that is on
+                            // needs the new number, which is why the refresh itself checks the switch.
+                            refresh_estimate(hwnd);
+                            // The extension is part of the target, so a different format asks about a
+                            // different file: shot.png may be free while shot.jpg is not.
+                            refresh_conflict(hwnd);
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                            return 0;
+                        }
+                        let inside = snapclip_ui::panel::fmt_menu_contains(
+                            &metrics,
+                            &rects,
+                            scale,
+                            window_height,
+                            point,
+                        ) || snapclip_ui::panel::fmt_button_contains(
+                            &metrics, &rects, scale, point,
+                        );
+                        if !inside {
+                            // A click anywhere else dismisses the menu and does nothing else: the first
+                            // click after opening a menu belongs to the menu, which is how menus behave.
+                            close_menus(hwnd, "a click landed outside the format menu");
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                            return 0;
+                        }
+                    }
+                    if snapclip_ui::panel::fmt_button_contains(&metrics, &rects, scale, point) {
+                        let still_open = !open;
+                        if let Some(s) = state_mut(hwnd) {
+                            s.format_open = still_open;
+                            // One menu at a time, in this direction too.
+                            s.var_open = false;
+                        }
+                        apply_menu_occlusion(hwnd);
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        return 0;
+                    }
+                }
+                // The footer's buttons are drawn by the frame as well, and their widths are the ones the
+                // paint used, so the rectangle tested here is the rectangle on screen.
+                if event == snapclip_ui::panel::PointerEvent::Down {
+                    let metrics = snapclip_ui::panel::DEMO;
+                    let scale = dpi_scale(hwnd);
+                    let widths = state(hwnd).map(|s| s.footer_widths).unwrap_or([0; 3]);
+                    for button in snapclip_ui::panel::FOOTER_BUTTONS {
+                        if !snapclip_ui::panel::footer_button_contains(
+                            &metrics,
+                            scale,
+                            widths,
+                            button,
+                            (point.x, point.y),
+                        ) {
+                            continue;
+                        }
+                        match button {
+                            // The picture goes to the clipboard at the size the two cells say, through
+                            // the same rule the save uses. A failure is logged and leaves the panel
+                            // open: the clipboard can be held by another process for a moment, and that
+                            // is not a reason to close the window or to invent a message about it.
+                            snapclip_ui::panel::FooterButton::Copy => {
+                                if let Some(state) = state(hwnd) {
+                                    match copy_picture(hwnd, state) {
+                                        Some(Ok(())) => {
+                                            eprintln!("[save-panel] copied the picture")
+                                        }
+                                        Some(Err(error)) => {
+                                            eprintln!("[save-panel] could not copy: {error}")
+                                        }
+                                        // No capture, so there is no picture: the development entry's
+                                        // empty panel has nothing to copy and says so only in the log.
+                                        None => eprintln!("[save-panel] nothing to copy"),
+                                    }
+                                }
+                            }
+                            snapclip_ui::panel::FooterButton::Cancel => {
+                                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                                    hwnd, WM_CLOSE, 0, 0,
+                                );
+                            }
+                            snapclip_ui::panel::FooterButton::Save => {
+                                attempt_save(hwnd);
+                            }
+                        }
+                        return 0;
+                    }
+
+                    // The four size shortcuts under the cells (`:614`, `:258`). A shortcut sets both
+                    // numbers through the same rule the save applies, so what the panel shows and what
+                    // the file gets cannot disagree.
+                    let presets = state(hwnd).map(|s| s.size_presets).unwrap_or([0; 4]);
+                    let rects = metrics.rects(scale);
+                    if let Some(index) = snapclip_ui::panel::size_preset_contains(
+                        &metrics,
+                        &rects,
+                        scale,
+                        presets,
+                        (point.x, point.y),
+                    ) {
+                        if let Some(s) = state_mut(hwnd) {
+                            // The captured size is copied out before the fields are written: the preview
+                            // and the models are both the state's, and holding a borrow of one across a
+                            // change to the other is what the borrow checker is there to refuse.
+                            let captured = s
+                                .preview
+                                .as_ref()
+                                .map(|(_, width, height)| (*width, *height));
+                            if let Some((width, height)) = captured {
+                                let source = super::scale::Size::new(width, height);
+                                let (width, height) = snapclip_ui::panel::size_preset_size(
+                                    snapclip_ui::panel::SIZE_PRESET_PCT[index],
+                                    (width, height),
+                                );
+                                // The shortcut names a share of the capture; the fields then say it in
+                                // whichever unit the mode is in, so a shortcut in percent mode shows the
+                                // percentage it was asked for rather than a pixel count.
+                                let text = super::scale::display_text(
+                                    super::scale::SizeMode::from_index(s.size_mode),
+                                    super::scale::Size::new(width, height),
+                                    source,
+                                );
+                                s.set_size_text(&text.0, &text.1);
+                                InvalidateRect(hwnd, std::ptr::null(), 0);
+                            }
+                        }
+                        return 0;
+                    }
+
+                    // The two mode buttons (`数值`, `百分比`, `:585`, `:586`). Switching the unit does not
+                    // change the size; it rewrites the two fields from the size that is already there
+                    // (`:1072`), which is why they are read with the old unit and written with the new.
+                    let mode_widths = state(hwnd).map(|s| s.size_mode_widths).unwrap_or([0; 2]);
+                    if let Some(index) = snapclip_ui::panel::size_mode_contains(
+                        &metrics,
+                        &rects,
+                        scale,
+                        mode_widths,
+                        (point.x, point.y),
+                    ) {
+                        if let Some(s) = state_mut(hwnd) {
+                            switch_size_mode(hwnd, s, index);
+                        }
+                        return 0;
+                    }
+
+                    // The reset (`:589`, `:1213`): both numbers back to the capture's own size, in
+                    // whichever unit the mode is in — one hundred percent, when it is percentages. The
+                    // mode itself is left alone, because the mockup leaves it alone.
+                    if snapclip_ui::panel::size_reset_contains(
+                        &metrics,
+                        &rects,
+                        scale,
+                        (point.x, point.y),
+                    ) {
+                        if let Some(s) = state_mut(hwnd) {
+                            reset_size(hwnd, s);
+                        }
+                        return 0;
+                    }
+                }
+                // The size limit's switch (`:231`) and the escape hatch it offers (`:235`). Both are
+                // drawn by the frame from the same rectangles this tests, and the link answers only
+                // while the note says the limit was missed — a link that shrank the picture when it
+                // already fit would be a button with nothing to do.
+                if event == snapclip_ui::panel::PointerEvent::Down {
+                    let metrics = snapclip_ui::panel::DEMO;
+                    let scale = dpi_scale(hwnd);
+                    let rects = metrics.rects(scale);
+                    let point = (point.x, point.y);
+                    let (over, words) = state(hwnd)
+                        .map(|s| (s.limit_on && s.over_limit, s.limit_words))
+                        .unwrap_or((false, snapclip_ui::panel::LimitWidths::default()));
+                    let switch = snapclip_ui::panel::limit_switch_rect(
+                        &metrics,
+                        &rects,
+                        scale,
+                        words.switch_word_px,
+                    );
+                    if snapclip_ui::panel::rect_contains(switch, point) {
+                        toggle_limit(hwnd);
+                        return 0;
+                    }
+                    if over {
+                        let link = snapclip_ui::panel::auto_shrink_rect(
+                            &metrics,
+                            &rects,
+                            scale,
+                            words.auto_shrink_px,
+                        );
+                        if snapclip_ui::panel::rect_contains(link, point) {
+                            shrink_to_fit(hwnd);
+                            return 0;
+                        }
+                    }
+                }
+                // The fill row's swatches answer only while the row is drawn: `:1102` shows it for JPG
+                // alone, and the same predicate gates this, so a swatch that is not on screen cannot
+                // change the colour the encoder will composite with.
+                if event == snapclip_ui::panel::PointerEvent::Down {
+                    let metrics = snapclip_ui::panel::DEMO;
+                    let scale = dpi_scale(hwnd);
+                    let rects = metrics.rects(scale);
+                    let shown = state(hwnd)
+                        .map(|s| snapclip_ui::panel::fill_row_shown(s.format))
+                        .unwrap_or(false);
+                    if shown {
+                        if let Some(index) = snapclip_ui::panel::fill_swatch_at(
+                            &metrics,
+                            &rects,
+                            scale,
+                            (point.x, point.y),
+                        ) {
+                            if choose_fill(hwnd, index) {
+                                InvalidateRect(hwnd, std::ptr::null(), 0);
+                            }
+                            return 0;
+                        }
+                    }
+                }
+                // The quality control only answers while it is drawn. PNG has no tier to pick, so the row
+                // shows the hint instead (`:639`, `:1096`), and a click on that space has to do nothing
+                // rather than change a setting nothing on screen refers to.
+                let chosen = state_mut(hwnd)
+                    .filter(|s| snapclip_ui::panel::quality_segment_shown(s.format))
+                    .map(|s| s.quality_pointer(dpi_scale(hwnd), event, point))
+                    .unwrap_or(false);
+                if chosen {
+                    // The tier decides the encoder's quality, so the estimate belongs to the old one
+                    // until it is taken again for the new one.
+                    refresh_estimate(hwnd);
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                0
+            }
+            WM_DPICHANGED => {
+                // lParam is the suggested rect at the new DPI; follow it so the mock's dip stay dip.
+                let suggested = &*(lparam as *const RECT);
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                // The footer's widths are pixels, so a new scale makes the old ones stale. They are
+                // measured from the same renderer the paint uses, so re-measuring here keeps the click
+                // targets on the buttons as they are now drawn.
+                if let Some(s) = state_mut(hwnd) {
+                    s.footer_widths = measure_footer_widths(hwnd, s.renderer.as_ref());
+                    // The chips' widths are pixels too, and so is the `更改` button's, so a new scale
+                    // makes all three stale for the same reason.
+                    s.path_chips = measure_path_chips(hwnd, s.renderer.as_ref());
+                    s.path_change = measure_path_change(hwnd, s.renderer.as_ref());
+                    // The size shortcuts are words too, so their widths are pixels and go stale the same
+                    // way.
+                    s.size_presets = measure_size_presets(hwnd, s.renderer.as_ref());
+                    // The two mode buttons are words as well, measured in two weights.
+                    s.size_mode_widths = measure_size_mode(hwnd, s.renderer.as_ref());
+                    // The limit's words are pixels too, so they go stale the same way: the switch would
+                    // otherwise be tested against the previous monitor's word width.
+                    s.limit_words = measure_limit_words(hwnd, s.renderer.as_ref());
+                    // The link's words are pixels too, so they go stale on a dpi change as well.
+                    s.conflict_widths = measure_conflict_link(hwnd, s.renderer.as_ref());
+                }
+                apply_menu_occlusion(hwnd);
+                0
+            }
+            // `Esc` is a cancel, and at this layer cancelling the panel *is* closing it: the shell's
+            // state machine owns what that means (`Shell::close`), and the window only has to stop
+            // being a window. The close button arrives with the controls.
+            // A drawn number takes its characters here: the panel holds the keyboard focus on the
+            // field's behalf, because a drawn field has no child window to send them to.
+            WM_CHAR => {
+                if let Some(s) = state_mut(hwnd) {
+                    if number_key(s, message, wparam) {
+                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                            hwnd,
+                            std::ptr::null(),
+                            0,
+                        );
+                    }
+                }
+                0
+            }
+            // While a drawn number has the focus the panel answers the arrows and the characters itself,
+            // so the dialog rules have to hand them over rather than turn them into navigation. `Tab` is
+            // deliberately not asked for: it still has to walk between the native fields.
+            WM_GETDLGCODE => {
+                let wanted = match state(hwnd).and_then(|s| s.focused_number) {
+                    Some(_) => (DLGC_WANTARROWS | DLGC_WANTCHARS) as isize,
+                    None => 0,
+                };
+                if wanted == 0 {
+                    DefWindowProcW(hwnd, message, wparam, lparam)
+                } else {
+                    wanted
+                }
+            }
+            // The drawn number's caret leaves with the keyboard: a caret in a field that cannot take a
+            // keystroke would be a lie about where typing goes.
+            WM_KILLFOCUS => {
+                if let Some(s) = state_mut(hwnd) {
                     if s.focused_number.is_some() {
                         s.blur_number();
                         windows_sys::Win32::Graphics::Gdi::InvalidateRect(
@@ -3678,722 +4195,263 @@ extern "system" fn window_proc(
                         );
                     }
                 }
-                // The conflict link (:989): a press flips the policy for the next save. Its word is
-                // the action, so the rectangle to test is the one for the word being drawn.
-                let link = state(hwnd).and_then(|s| {
-                    s.conflict_shown.then(|| {
-                        let word = conflict_link(s.conflict);
-                        (s.conflict_widths[word.index()], s.footer_widths)
-                    })
-                });
-                if let Some((width, widths)) = link {
-                    let metrics = snapclip_ui::panel::DEMO;
-                    let scale = dpi_scale(hwnd);
-                    if snapclip_ui::panel::conflict_link_contains(
-                        &metrics,
-                        scale,
-                        widths,
-                        width,
-                        (point.x, point.y),
-                    ) {
-                        if let Some(s) = state_mut(hwnd) {
-                            s.conflict = match s.conflict {
-                                ConflictPolicy::AutoRename => ConflictPolicy::Overwrite,
-                                ConflictPolicy::Overwrite => ConflictPolicy::AutoRename,
-                            };
-                        }
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            }
+            WM_KEYDOWN => {
+                use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+                // The number's own keys come first, and they do not take `Enter` or `Esc`: those still
+                // save and close, whatever has the focus.
+                if let Some(s) = state_mut(hwnd) {
+                    if s.focused_number.is_some() && number_key(s, message, wparam) {
                         windows_sys::Win32::Graphics::Gdi::InvalidateRect(
                             hwnd,
                             std::ptr::null(),
                             0,
                         );
-                        return 0;
                     }
                 }
+                if wparam == VK_ESCAPE as usize {
+                    windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+                } else if wparam == VK_RETURN as usize {
+                    // The panel itself can hold the focus — a click on empty space leaves it there — and
+                    // then no control is there to translate the key, so the panel answers it directly.
+                    // The same key pressed inside a field arrives through `shortcut_command` instead.
+                    attempt_save(hwnd);
+                }
+                0
             }
-            // The token menu is the topmost thing the frame draws, so it is answered before
-            // anything it covers: a click on a token must insert that token rather than fall
-            // through to a row underneath, and a click anywhere else first closes the menu.
-            if event == snapclip_ui::panel::PointerEvent::Down {
-                let metrics = snapclip_ui::panel::DEMO;
+            // The child's colours. An `EDIT` paints its own background from the system colours, which on
+            // a dark panel is a lit white rectangle, so the field's resolved fill and its text colour are
+            // handed over here instead.
+            //
+            // Which field is asking comes from the table, not from a state the window happens to track:
+            // `lparam` is the child's handle, and the answer is that child's own entry. Reading one shared
+            // state here is what made a focused path row paint the name row's colours, and it would have
+            // gone on being wrong for every field added afterwards.
+            // A right click in the name box asks for that box's commands. The system's menu is light and
+            // the panel cannot recolour it, so the panel draws its own (`paint_context`); this only
+            // decides which box asked and where the menu goes.
+            WM_CONTEXTMENU => {
+                let child = wparam as windows_sys::Win32::Foundation::HWND;
+                let is_name = state(hwnd)
+                    .and_then(|s| s.field_of(child))
+                    .is_some_and(|id| id == snapclip_ui::panel::FieldId::Name);
+                // The box that owns the text answers this message itself, so a line here says the
+                // subclass forwarded it; silence says the panel is still being bypassed. One real
+                // right click settles which.
+                eprintln!(
+                    "[save-panel] context menu asked: child={child:?} is_name={is_name} point={:#x}",
+                    lparam as usize
+                );
+                if !is_name {
+                    return DefWindowProcW(hwnd, message, wparam, lparam);
+                }
+                // `lParam` is a screen point; the panel draws and hit-tests in its own client pixels.
+                let mut point = windows_sys::Win32::Foundation::POINT {
+                    x: (lparam & 0xffff) as i16 as i32,
+                    y: ((lparam >> 16) & 0xffff) as i16 as i32,
+                };
+                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
                 let scale = dpi_scale(hwnd);
-                let rects = metrics.rects(scale);
-                let point = (point.x, point.y);
-                let open = state(hwnd).map(|s| s.var_open).unwrap_or(false);
-                if open {
-                    if let Some(index) = snapclip_ui::panel::var_item_at(&metrics, &rects, scale, point)
-                    {
-                        let token = snapclip_ui::panel::VARIABLE_TOKENS[index];
-                        if let Some(s) = state_mut(hwnd) {
-                            s.var_open = false;
-                        }
-                        insert_token(hwnd, token);
-                        apply_menu_occlusion(hwnd);
-                        return 0;                    }
-                    let on_wand =
-                        snapclip_ui::panel::name_wand_contains(&metrics, &rects, scale, point);
-                    let inside = snapclip_ui::panel::var_menu_contains(&metrics, &rects, scale, point)
-                        || on_wand;
-                    if inside {
-                        // The button again closes the menu, which is what a button that opened it
-                        // should do; its padding is swallowed so a near miss does not dismiss it.
-                        if on_wand {
-                            if let Some(s) = state_mut(hwnd) {
-                                s.var_open = false;
-                            }
-                            apply_menu_occlusion(hwnd);
-                            InvalidateRect(hwnd, std::ptr::null(), 0);
-                        }
-                        return 0;
-                    }
-                    if let Some(s) = state_mut(hwnd) {
-                        s.var_open = false;
-                    }
-                    apply_menu_occlusion(hwnd);
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
+                let mut client = windows_sys::Win32::Foundation::RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+                // The width is measured, and measured before the state is borrowed mutably: the menu's
+                // rows are the ones the painter draws, because both come from this one number.
+                let width = match state(hwnd) {
+                    Some(s) => measure_context_menu(hwnd, s.renderer.as_ref()),
+                    None => 0,
+                };
+                let control = state(hwnd)
+                    .map(|s| s.control(snapclip_ui::panel::FieldId::Name))
+                    .unwrap_or(std::ptr::null_mut());
+                let menu = snapclip_ui::panel::context_menu_rect(
+                    (point.x, point.y),
+                    scale,
+                    width,
+                    client.bottom,
+                    client.right,
+                );
+                let items = snapclip_ui::panel::context_item_rects(menu, scale);
+                // Pasting is offered whether or not the clipboard has text: asking the shell would mean a
+                // feature the panel does not otherwise use, and a paste with nothing to paste is the one
+                // no-op Windows itself allows. Cutting and copying are gated, because they act on the
+                // box's own selection, which the panel can see.
+                let enabled =
+                    snapclip_ui::panel::context_enabled(!selection_is_empty(control), true);
+                if let Some(s) = state_mut(hwnd) {
+                    s.context = Some(snapclip_ui::panel::ContextMenuView {
+                        menu,
+                        items,
+                        enabled,
+                    });
+                    // One menu at a time: opening this one closes the other two.
+                    s.format_open = false;
+                    s.var_open = false;
                 }
-                // The variable button itself, which is inside the name field and therefore above
-                // the field's text: only the strip the control gave up can be clicked, and that is
-                // the strip this tests.
-                if snapclip_ui::panel::name_wand_contains(&metrics, &rects, scale, point) {
-                    // One menu at a time: opening this one closes the format's, so a click cannot
-                    // leave two popups over the same form.
-                    if let Some(s) = state_mut(hwnd) {
-                        s.var_open = true;
-                        s.format_open = false;
-                    }
-                    apply_menu_occlusion(hwnd);
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
-                }
+                apply_menu_occlusion(hwnd);
+                windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+                0
             }
-            // The path row's controls, before the footer and after the menus. The row itself is
-            // drawn by the frame and is read-only, so the whole row is one target for the same
-            // chooser the `更改` button opens: there is nothing else a press on it could mean.
-            if event == snapclip_ui::panel::PointerEvent::Down {
-                let metrics = snapclip_ui::panel::DEMO;
-                let scale = dpi_scale(hwnd);
-                let rects = metrics.rects(scale);
-                let point = (point.x, point.y);
-                let (change, chips) = state(hwnd)
-                    .map(|s| (s.path_change, s.path_chips))
-                    .unwrap_or((0, [0; 3]));
-                let row = snapclip_ui::panel::path_field_rect(&metrics, &rects, scale, change);
-                if snapclip_ui::panel::rect_contains(row, point)
-                    || snapclip_ui::panel::path_change_contains(&metrics, &rects, scale, change, point)
-                {
-                    choose_folder(hwnd);
-                    return 0;
+            WM_CTLCOLOREDIT => {
+                if let Some(s) = state(hwnd) {
+                    let state_of_field = s
+                        .field_of(lparam as windows_sys::Win32::Foundation::HWND)
+                        .map(|id| s.fields.state_of(id))
+                        .unwrap_or(snapclip_ui::panel::FieldState::Idle);
+                    let colours = snapclip_ui::panel::field_colours(state_of_field, SURFACE_RGBA);
+                    let child = wparam as windows_sys::Win32::Graphics::Gdi::HDC;
+                    // A control that looks like a patch inside its box is a question about a colour,
+                    // and the answer is one line: what the control is told to fill with, which state
+                    // that came from, and which box it belongs to. It prints once per paint rather
+                    // than per click, so a run's console says whether the control was ever asked at
+                    // all — a control nobody asked is a control whose fill is not ours to read.
+                    let brush = s.fill_brushes[state_of_field.index()];
+                    // Which brush the control is handed, and whether it is a real one. A null handle
+                    // returned here looks on screen exactly like a wrong colour, because the control
+                    // then falls back to its own default and paints a patch inside the frame.
+                    eprintln!(
+                        "[save-panel] fill child={:?} field={:?} state={:?} rgba={:?} brush={:?}",
+                        lparam as windows_sys::Win32::Foundation::HWND,
+                        s.field_of(lparam as windows_sys::Win32::Foundation::HWND),
+                        state_of_field,
+                        colours.fill,
+                        brush
+                    );
+                    // The two backgrounds a text box has are given the same value here, from the same
+                    // index: the brush fills its client area, and the colour set below fills behind the
+                    // glyphs. Opaque mode is what makes the second of them use it rather than leave
+                    // whatever was underneath.
+                    windows_sys::Win32::Graphics::Gdi::SetBkMode(
+                        child,
+                        windows_sys::Win32::Graphics::Gdi::OPAQUE as i32,
+                    );
+                    windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
+                    windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
+                    // The brush comes from the same colour the background was just set to, by way of the
+                    // same index, so the two cannot disagree about which fill this state has.
+                    return brush as isize;
                 }
-                if snapclip_ui::panel::path_open_contains(&metrics, &rects, scale, point) {
-                    let directory = state(hwnd)
-                        .map(|s| s.directory.clone())
-                        .unwrap_or_default();
-                    open_directory(&directory);
-                    return 0;
-                }
-                if let Some(index) =
-                    snapclip_ui::panel::path_chip_at(&metrics, &rects, scale, &chips, point)
-                {
-                    // The shortcut is the shell's answer for that folder, not a literal in the
-                    // panel: the mockup's three paths name one person's home (`:739`–`:741`).
-                    if let Some(directory) = shortcut_directory(index) {
-                        set_directory(hwnd, &directory);
-                    }
-                    return 0;
-                }
-                // The two after-save switches. They are switches (`:573`, `:574`), so a click
-                // turns one on or off, and the work it stands for runs when a save succeeds.
-                if let Some(index) = state(hwnd)
-                    .map(|s| s.after_chips.at(&metrics, &rects, scale, point))
-                    .unwrap_or(None)
-                {
-                    if let Some(s) = state_mut(hwnd) {
-                        s.after[index] = !s.after[index];
-                        // The switch is a setting that outlives this panel, so it is handed to the
-                        // shell in the same click that changes it; the panel keeps no copy of it
-                        // beyond the one the next paint reads.
-                        let chosen = s.after;
-                        if let Ok(mut remembered) = s.remembered.lock() {
-                            remembered.remember_after(chosen);
-                        }
-                    }
-                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
-                }
+                DefWindowProcW(hwnd, message, wparam, lparam)
             }
-            // The format control's menu hangs over everything below it, so it is answered before
-            // the footer: a click on an option must choose a format rather than fall through to a
-            // button that happens to be underneath. The rectangles come from the same producers the
-            // painter uses, and the window's height is the panel's own, which is what the menu's
-            // flip rule is written against.
-            if event == snapclip_ui::panel::PointerEvent::Down {
-                let metrics = snapclip_ui::panel::DEMO;
-                let scale = dpi_scale(hwnd);
-                let rects = metrics.rects(scale);
-                let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
-                let point = (point.x, point.y);
-                let open = state(hwnd).map(|s| s.format_open).unwrap_or(false);
-                if open {
-                    if let Some(index) = snapclip_ui::panel::fmt_item_at(
-                        &metrics,
-                        &rects,
-                        scale,
-                        window_height,
-                        true,
-                        point,
-                    ) {
-                        if let Some(s) = state_mut(hwnd) {
-                            s.format = index;
-                        }
-                        // The one way to close a menu, so the boxes it covered come back: see
-                        // `close_menus`.
-                        close_menus(hwnd, "a format was chosen");
-                        // The file's format decides what it weighs, so a measurement taken under the
-                        // old one describes a file that no longer exists. Only a limit that is on
-                        // needs the new number, which is why the refresh itself checks the switch.
-                        refresh_estimate(hwnd);
-                        // The extension is part of the target, so a different format asks about a
-                        // different file: shot.png may be free while shot.jpg is not.
-                        refresh_conflict(hwnd);
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
-                        return 0;
-                    }
-                    let inside = snapclip_ui::panel::fmt_menu_contains(
-                        &metrics,
-                        &rects,
-                        scale,
-                        window_height,
-                        point,
-                    ) || snapclip_ui::panel::fmt_button_contains(&metrics, &rects, scale, point);
-                    if !inside {
-                        // A click anywhere else dismisses the menu and does nothing else: the first
-                        // click after opening a menu belongs to the menu, which is how menus behave.
-                        close_menus(hwnd, "a click landed outside the format menu");
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
-                        return 0;
-                    }
-                }
-                if snapclip_ui::panel::fmt_button_contains(&metrics, &rects, scale, point) {
-                    let still_open = !open;
-                    if let Some(s) = state_mut(hwnd) {
-                        s.format_open = still_open;
-                        // One menu at a time, in this direction too.
-                        s.var_open = false;
-                    }
-                    apply_menu_occlusion(hwnd);
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
-                    return 0;
-                }
-            }
-            // The footer's buttons are drawn by the frame as well, and their widths are the ones the
-            // paint used, so the rectangle tested here is the rectangle on screen.
-            if event == snapclip_ui::panel::PointerEvent::Down {
-                let metrics = snapclip_ui::panel::DEMO;
-                let scale = dpi_scale(hwnd);
-                let widths = state(hwnd).map(|s| s.footer_widths).unwrap_or([0; 3]);
-                for button in snapclip_ui::panel::FOOTER_BUTTONS {
-                    if !snapclip_ui::panel::footer_button_contains(
-                        &metrics,
-                        scale,
-                        widths,
-                        button,
-                        (point.x, point.y),
-                    ) {
-                        continue;
-                    }
-                    match button {
-                        // The picture goes to the clipboard at the size the two cells say, through
-                        // the same rule the save uses. A failure is logged and leaves the panel
-                        // open: the clipboard can be held by another process for a moment, and that
-                        // is not a reason to close the window or to invent a message about it.
-                        snapclip_ui::panel::FooterButton::Copy => {
-                            if let Some(state) = state(hwnd) {
-                                match copy_picture(hwnd, state) {
-                                    Some(Ok(())) => eprintln!("[save-panel] copied the picture"),
-                                    Some(Err(error)) => {
-                                        eprintln!("[save-panel] could not copy: {error}")
-                                    }
-                                    // No capture, so there is no picture: the development entry's
-                                    // empty panel has nothing to copy and says so only in the log.
-                                    None => eprintln!("[save-panel] nothing to copy"),
-                                }
-                            }
-                        }
-                        snapclip_ui::panel::FooterButton::Cancel => {
+            // Focus is not the child's business: the border and the ring around it belong to the frame,
+            // so the window is invalidated and the frame repainted with the new state. The field is found
+            // in the table rather than compared against each control in turn, so the next field added is
+            // wired by existing.
+            //
+            // Repainting the whole frame rather than just the field's rect is deliberate — one panel of
+            // six fields is a few hundred microseconds, and a dirty-rect scheme would be a second geometry
+            // path to keep in step with the first (`docs/41` S2).
+            WM_COMMAND => {
+                const EN_SETFOCUS: u16 = 0x0100;
+                const EN_KILLFOCUS: u16 = 0x0200;
+                const EN_CHANGE: u16 = 0x0300;
+                let notification = ((wparam >> 16) & 0xFFFF) as u16;
+                let control = lparam as windows_sys::Win32::Foundation::HWND;
+                // A command with no control behind it is the dialog manager's, not a child's:
+                // `IsDialogMessage` sends the keys a focused control will not take as `IDOK` and
+                // `IDCANCEL`. The mockup's own titles promise the two (`保存 (Enter)`, `:686`; `取消
+                // (Esc)`, `:684`).
+                if control.is_null() {
+                    match shortcut_command(wparam & 0xFFFF) {
+                        Some(Shortcut::Save) => attempt_save(hwnd),
+                        // A menu is the innermost thing on screen: `Esc` dismisses it before it dismisses
+                        // the panel, the way every menu behaves, and the panel stays open.
+                        Some(Shortcut::Cancel) if close_menus(hwnd, "escape") => {}
+                        Some(Shortcut::Cancel) => {
                             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
                                 hwnd, WM_CLOSE, 0, 0,
                             );
                         }
-                        snapclip_ui::panel::FooterButton::Save => {
-                            attempt_save(hwnd);
+                        None => {}
+                    }
+                    return 0;
+                }
+                let mut repaint = false;
+                let mut conflict_dirty = false;
+                if let Some(s) = state_mut(hwnd) {
+                    if let Some(id) = s.field_of(control) {
+                        // The name field is a template, and the spec keeps it as it is typed (`:201`), so
+                        // the shell can open the next panel with what this one was left holding. Setting
+                        // a control's text fires the same notification as typing does — the panel's own
+                        // initial text arrives here too — which is why the rule, not this handler,
+                        // decides whether anything actually changed.
+                        if notification == EN_CHANGE {
+                            let edited = control_text(control);
+                            if let Ok(mut remembered) = s.remembered.lock() {
+                                note_edit(&mut remembered, id, true, &edited);
+                            }
+                            // The name decides which file the link is about, so a change re-asks the
+                            // question; the other fields cannot move the target. The directory used to
+                            // arrive here too, but the path is no longer a control: `set_directory` asks
+                            // directly, because that is the only thing that can change it.
+                            conflict_dirty = matches!(id, snapclip_ui::panel::FieldId::Name);
                         }
-                    }
-                    return 0;
-                }
-
-                // The four size shortcuts under the cells (`:614`, `:258`). A shortcut sets both
-                // numbers through the same rule the save applies, so what the panel shows and what
-                // the file gets cannot disagree.
-                let presets = state(hwnd).map(|s| s.size_presets).unwrap_or([0; 4]);
-                let rects = metrics.rects(scale);
-                if let Some(index) = snapclip_ui::panel::size_preset_contains(
-                    &metrics,
-                    &rects,
-                    scale,
-                    presets,
-                    (point.x, point.y),
-                ) {
-                    if let Some(s) = state_mut(hwnd) {
-                        // The captured size is copied out before the fields are written: the preview
-                        // and the models are both the state's, and holding a borrow of one across a
-                        // change to the other is what the borrow checker is there to refuse.
-                        let captured = s.preview.as_ref().map(|(_, width, height)| (*width, *height));
-                        if let Some((width, height)) = captured {
-                            let source = super::scale::Size::new(width, height);
-                            let (width, height) = snapclip_ui::panel::size_preset_size(
-                                snapclip_ui::panel::SIZE_PRESET_PCT[index],
-                                (width, height),
-                            );
-                            // The shortcut names a share of the capture; the fields then say it in
-                            // whichever unit the mode is in, so a shortcut in percent mode shows the
-                            // percentage it was asked for rather than a pixel count.
-                            let text = super::scale::display_text(
-                                super::scale::SizeMode::from_index(s.size_mode),
-                                super::scale::Size::new(width, height),
-                                source,
-                            );
-                            s.set_size_text(&text.0, &text.1);
-                            InvalidateRect(hwnd, std::ptr::null(), 0);
-                        }
-                    }
-                    return 0;
-                }
-
-                // The two mode buttons (`数值`, `百分比`, `:585`, `:586`). Switching the unit does not
-                // change the size; it rewrites the two fields from the size that is already there
-                // (`:1072`), which is why they are read with the old unit and written with the new.
-                let mode_widths = state(hwnd).map(|s| s.size_mode_widths).unwrap_or([0; 2]);
-                if let Some(index) = snapclip_ui::panel::size_mode_contains(
-                    &metrics,
-                    &rects,
-                    scale,
-                    mode_widths,
-                    (point.x, point.y),
-                ) {
-                    if let Some(s) = state_mut(hwnd) {
-                        switch_size_mode(hwnd, s, index);
-                    }
-                    return 0;
-                }
-
-                // The reset (`:589`, `:1213`): both numbers back to the capture's own size, in
-                // whichever unit the mode is in — one hundred percent, when it is percentages. The
-                // mode itself is left alone, because the mockup leaves it alone.
-                if snapclip_ui::panel::size_reset_contains(&metrics, &rects, scale, (point.x, point.y))
-                {
-                    if let Some(s) = state_mut(hwnd) {
-                        reset_size(hwnd, s);
-                    }
-                    return 0;
-                }
-            }
-            // The size limit's switch (`:231`) and the escape hatch it offers (`:235`). Both are
-            // drawn by the frame from the same rectangles this tests, and the link answers only
-            // while the note says the limit was missed — a link that shrank the picture when it
-            // already fit would be a button with nothing to do.
-            if event == snapclip_ui::panel::PointerEvent::Down {
-                let metrics = snapclip_ui::panel::DEMO;
-                let scale = dpi_scale(hwnd);
-                let rects = metrics.rects(scale);
-                let point = (point.x, point.y);
-                let (over, words) = state(hwnd)
-                    .map(|s| (s.limit_on && s.over_limit, s.limit_words))
-                    .unwrap_or((false, snapclip_ui::panel::LimitWidths::default()));
-                let switch = snapclip_ui::panel::limit_switch_rect(
-                    &metrics,
-                    &rects,
-                    scale,
-                    words.switch_word_px,
-                );
-                if snapclip_ui::panel::rect_contains(switch, point) {
-                    toggle_limit(hwnd);
-                    return 0;
-                }
-                if over {
-                    let link = snapclip_ui::panel::auto_shrink_rect(
-                        &metrics,
-                        &rects,
-                        scale,
-                        words.auto_shrink_px,
-                    );
-                    if snapclip_ui::panel::rect_contains(link, point) {
-                        shrink_to_fit(hwnd);
-                        return 0;
-                    }
-                }
-            }
-            // The fill row's swatches answer only while the row is drawn: `:1102` shows it for JPG
-            // alone, and the same predicate gates this, so a swatch that is not on screen cannot
-            // change the colour the encoder will composite with.
-            if event == snapclip_ui::panel::PointerEvent::Down {
-                let metrics = snapclip_ui::panel::DEMO;
-                let scale = dpi_scale(hwnd);
-                let rects = metrics.rects(scale);
-                let shown = state(hwnd)
-                    .map(|s| snapclip_ui::panel::fill_row_shown(s.format))
-                    .unwrap_or(false);
-                if shown {
-                    if let Some(index) = snapclip_ui::panel::fill_swatch_at(
-                        &metrics,
-                        &rects,
-                        scale,
-                        (point.x, point.y),
-                    ) {
-                        if choose_fill(hwnd, index) {
-                            InvalidateRect(hwnd, std::ptr::null(), 0);
-                        }
-                        return 0;
-                    }
-                }
-            }
-            // The quality control only answers while it is drawn. PNG has no tier to pick, so the row
-            // shows the hint instead (`:639`, `:1096`), and a click on that space has to do nothing
-            // rather than change a setting nothing on screen refers to.
-            let chosen = state_mut(hwnd)
-                .filter(|s| snapclip_ui::panel::quality_segment_shown(s.format))
-                .map(|s| s.quality_pointer(dpi_scale(hwnd), event, point))
-                .unwrap_or(false);
-            if chosen {
-                // The tier decides the encoder's quality, so the estimate belongs to the old one
-                // until it is taken again for the new one.
-                refresh_estimate(hwnd);
-                InvalidateRect(hwnd, std::ptr::null(), 0);
-            }
-            0
-        }
-        WM_DPICHANGED => {
-            // lParam is the suggested rect at the new DPI; follow it so the mock's dip stay dip.
-            let suggested = &*(lparam as *const RECT);
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                suggested.left,
-                suggested.top,
-                suggested.right - suggested.left,
-                suggested.bottom - suggested.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            // The footer's widths are pixels, so a new scale makes the old ones stale. They are
-            // measured from the same renderer the paint uses, so re-measuring here keeps the click
-            // targets on the buttons as they are now drawn.
-            if let Some(s) = state_mut(hwnd) {
-                s.footer_widths = measure_footer_widths(hwnd, s.renderer.as_ref());
-                // The chips' widths are pixels too, and so is the `更改` button's, so a new scale
-                // makes all three stale for the same reason.
-                s.path_chips = measure_path_chips(hwnd, s.renderer.as_ref());
-                s.path_change = measure_path_change(hwnd, s.renderer.as_ref());
-                // The size shortcuts are words too, so their widths are pixels and go stale the same
-                // way.
-                s.size_presets = measure_size_presets(hwnd, s.renderer.as_ref());
-                // The two mode buttons are words as well, measured in two weights.
-                s.size_mode_widths = measure_size_mode(hwnd, s.renderer.as_ref());
-                // The limit's words are pixels too, so they go stale the same way: the switch would
-                // otherwise be tested against the previous monitor's word width.
-                s.limit_words = measure_limit_words(hwnd, s.renderer.as_ref());
-                // The link's words are pixels too, so they go stale on a dpi change as well.
-                s.conflict_widths = measure_conflict_link(hwnd, s.renderer.as_ref());
-            }
-            apply_menu_occlusion(hwnd);
-            0
-        }
-        // `Esc` is a cancel, and at this layer cancelling the panel *is* closing it: the shell's
-        // state machine owns what that means (`Shell::close`), and the window only has to stop
-        // being a window. The close button arrives with the controls.
-        // A drawn number takes its characters here: the panel holds the keyboard focus on the
-        // field's behalf, because a drawn field has no child window to send them to.
-        WM_CHAR => {
-            if let Some(s) = state_mut(hwnd) {
-                if number_key(s, message, wparam) {
-                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
-                }
-            }
-            0
-        }
-        // While a drawn number has the focus the panel answers the arrows and the characters itself,
-        // so the dialog rules have to hand them over rather than turn them into navigation. `Tab` is
-        // deliberately not asked for: it still has to walk between the native fields.
-        WM_GETDLGCODE => {
-            let wanted = match state(hwnd).and_then(|s| s.focused_number) {
-                Some(_) => (DLGC_WANTARROWS | DLGC_WANTCHARS) as isize,
-                None => 0,
-            };
-            if wanted == 0 {
-                DefWindowProcW(hwnd, message, wparam, lparam)
-            } else {
-                wanted
-            }
-        }
-        // The drawn number's caret leaves with the keyboard: a caret in a field that cannot take a
-        // keystroke would be a lie about where typing goes.
-        WM_KILLFOCUS => {
-            if let Some(s) = state_mut(hwnd) {
-                if s.focused_number.is_some() {
-                    s.blur_number();
-                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
-                }
-            }
-            DefWindowProcW(hwnd, message, wparam, lparam)
-        }
-        WM_KEYDOWN => {
-            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
-            // The number's own keys come first, and they do not take `Enter` or `Esc`: those still
-            // save and close, whatever has the focus.
-            if let Some(s) = state_mut(hwnd) {
-                if s.focused_number.is_some() && number_key(s, message, wparam) {
-                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
-                }
-            }
-            if wparam == VK_ESCAPE as usize {
-                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
-            } else if wparam == VK_RETURN as usize {
-                // The panel itself can hold the focus — a click on empty space leaves it there — and
-                // then no control is there to translate the key, so the panel answers it directly.
-                // The same key pressed inside a field arrives through `shortcut_command` instead.
-                attempt_save(hwnd);
-            }
-            0
-        }
-        // The child's colours. An `EDIT` paints its own background from the system colours, which on
-        // a dark panel is a lit white rectangle, so the field's resolved fill and its text colour are
-        // handed over here instead.
-        //
-        // Which field is asking comes from the table, not from a state the window happens to track:
-        // `lparam` is the child's handle, and the answer is that child's own entry. Reading one shared
-        // state here is what made a focused path row paint the name row's colours, and it would have
-        // gone on being wrong for every field added afterwards.
-        // A right click in the name box asks for that box's commands. The system's menu is light and
-        // the panel cannot recolour it, so the panel draws its own (`paint_context`); this only
-        // decides which box asked and where the menu goes.
-        WM_CONTEXTMENU => {
-            let child = wparam as windows_sys::Win32::Foundation::HWND;
-            let is_name = state(hwnd)
-                .and_then(|s| s.field_of(child))
-                .is_some_and(|id| id == snapclip_ui::panel::FieldId::Name);
-            // The box that owns the text answers this message itself, so a line here says the
-            // subclass forwarded it; silence says the panel is still being bypassed. One real
-            // right click settles which.
-            eprintln!(
-                "[save-panel] context menu asked: child={child:?} is_name={is_name} point={:#x}",
-                lparam as usize
-            );
-            if !is_name {
-                return DefWindowProcW(hwnd, message, wparam, lparam);
-            }
-            // `lParam` is a screen point; the panel draws and hit-tests in its own client pixels.
-            let mut point = windows_sys::Win32::Foundation::POINT {
-                x: (lparam & 0xffff) as i16 as i32,
-                y: ((lparam >> 16) & 0xffff) as i16 as i32,
-            };
-            windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut point);
-            let scale = dpi_scale(hwnd);
-            let mut client = windows_sys::Win32::Foundation::RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
-            // The width is measured, and measured before the state is borrowed mutably: the menu's
-            // rows are the ones the painter draws, because both come from this one number.
-            let width = match state(hwnd) {
-                Some(s) => measure_context_menu(hwnd, s.renderer.as_ref()),
-                None => 0,
-            };
-            let control = state(hwnd)
-                .map(|s| s.control(snapclip_ui::panel::FieldId::Name))
-                .unwrap_or(std::ptr::null_mut());
-            let menu = snapclip_ui::panel::context_menu_rect(
-                (point.x, point.y),
-                scale,
-                width,
-                client.bottom,
-                client.right,
-            );
-            let items = snapclip_ui::panel::context_item_rects(menu, scale);
-            // Pasting is offered whether or not the clipboard has text: asking the shell would mean a
-            // feature the panel does not otherwise use, and a paste with nothing to paste is the one
-            // no-op Windows itself allows. Cutting and copying are gated, because they act on the
-            // box's own selection, which the panel can see.
-            let enabled = snapclip_ui::panel::context_enabled(!selection_is_empty(control), true);
-            if let Some(s) = state_mut(hwnd) {
-                s.context = Some(snapclip_ui::panel::ContextMenuView {
-                    menu,
-                    items,
-                    enabled,
-                });
-                // One menu at a time: opening this one closes the other two.
-                s.format_open = false;
-                s.var_open = false;
-            }
-            apply_menu_occlusion(hwnd);
-            windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
-            0
-        }
-        WM_CTLCOLOREDIT => {
-            if let Some(s) = state(hwnd) {
-                let state_of_field = s
-                    .field_of(lparam as windows_sys::Win32::Foundation::HWND)
-                    .map(|id| s.fields.state_of(id))
-                    .unwrap_or(snapclip_ui::panel::FieldState::Idle);
-                let colours = snapclip_ui::panel::field_colours(state_of_field, SURFACE_RGBA);
-                let child = wparam as windows_sys::Win32::Graphics::Gdi::HDC;
-                // A control that looks like a patch inside its box is a question about a colour,
-                // and the answer is one line: what the control is told to fill with, which state
-                // that came from, and which box it belongs to. It prints once per paint rather
-                // than per click, so a run's console says whether the control was ever asked at
-                // all — a control nobody asked is a control whose fill is not ours to read.
-                let brush = s.fill_brushes[state_of_field.index()];
-                // Which brush the control is handed, and whether it is a real one. A null handle
-                // returned here looks on screen exactly like a wrong colour, because the control
-                // then falls back to its own default and paints a patch inside the frame.
-                eprintln!(
-                    "[save-panel] fill child={:?} field={:?} state={:?} rgba={:?} brush={:?}",
-                    lparam as windows_sys::Win32::Foundation::HWND,
-                    s.field_of(lparam as windows_sys::Win32::Foundation::HWND),
-                    state_of_field,
-                    colours.fill,
-                    brush
-                );
-                // The two backgrounds a text box has are given the same value here, from the same
-                // index: the brush fills its client area, and the colour set below fills behind the
-                // glyphs. Opaque mode is what makes the second of them use it rather than leave
-                // whatever was underneath.
-                windows_sys::Win32::Graphics::Gdi::SetBkMode(
-                    child,
-                    windows_sys::Win32::Graphics::Gdi::OPAQUE as i32,
-                );
-                windows_sys::Win32::Graphics::Gdi::SetBkColor(child, bgr(colours.fill));
-                windows_sys::Win32::Graphics::Gdi::SetTextColor(child, bgr(colours.text));
-                // The brush comes from the same colour the background was just set to, by way of the
-                // same index, so the two cannot disagree about which fill this state has.
-                return brush as isize;
-            }
-            DefWindowProcW(hwnd, message, wparam, lparam)
-        }
-        // Focus is not the child's business: the border and the ring around it belong to the frame,
-        // so the window is invalidated and the frame repainted with the new state. The field is found
-        // in the table rather than compared against each control in turn, so the next field added is
-        // wired by existing.
-        //
-        // Repainting the whole frame rather than just the field's rect is deliberate — one panel of
-        // six fields is a few hundred microseconds, and a dirty-rect scheme would be a second geometry
-        // path to keep in step with the first (`docs/41` S2).
-        WM_COMMAND => {
-            const EN_SETFOCUS: u16 = 0x0100;
-            const EN_KILLFOCUS: u16 = 0x0200;
-            const EN_CHANGE: u16 = 0x0300;
-            let notification = ((wparam >> 16) & 0xFFFF) as u16;
-            let control = lparam as windows_sys::Win32::Foundation::HWND;
-            // A command with no control behind it is the dialog manager's, not a child's:
-            // `IsDialogMessage` sends the keys a focused control will not take as `IDOK` and
-            // `IDCANCEL`. The mockup's own titles promise the two (`保存 (Enter)`, `:686`; `取消
-            // (Esc)`, `:684`).
-            if control.is_null() {
-                match shortcut_command(wparam & 0xFFFF) {
-                    Some(Shortcut::Save) => attempt_save(hwnd),
-                    // A menu is the innermost thing on screen: `Esc` dismisses it before it dismisses
-                    // the panel, the way every menu behaves, and the panel stays open.
-                    Some(Shortcut::Cancel) if close_menus(hwnd, "escape") => {}
-                    Some(Shortcut::Cancel) => {
-                        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                            hwnd, WM_CLOSE, 0, 0,
-                        );
-                    }
-                    None => {}
-                }
-                return 0;
-            }
-            let mut repaint = false;
-            let mut conflict_dirty = false;
-            if let Some(s) = state_mut(hwnd) {
-                if let Some(id) = s.field_of(control) {
-                    // The name field is a template, and the spec keeps it as it is typed (`:201`), so
-                    // the shell can open the next panel with what this one was left holding. Setting
-                    // a control's text fires the same notification as typing does — the panel's own
-                    // initial text arrives here too — which is why the rule, not this handler,
-                    // decides whether anything actually changed.
-                    if notification == EN_CHANGE {
-                        let edited = control_text(control);
-                        if let Ok(mut remembered) = s.remembered.lock() {
-                            note_edit(&mut remembered, id, true, &edited);
-                        }
-                        // The name decides which file the link is about, so a change re-asks the
-                        // question; the other fields cannot move the target. The directory used to
-                        // arrive here too, but the path is no longer a control: `set_directory` asks
-                        // directly, because that is the only thing that can change it.
-                        conflict_dirty = matches!(id, snapclip_ui::panel::FieldId::Name);
-                    }
-                    // Focus is not allowed to overwrite a message about the value: the field would
-                    // fall silent exactly while the user is fixing what it complained about.
-                    let next = match notification {
-                        EN_SETFOCUS => Some(true),
-                        EN_KILLFOCUS => Some(false),
-                        _ => None,
-                    };
-                    if let Some(focused) = next {
-                        let before = s.fields.state_of(id);
-                        s.fields.set_focus(id, focused);
-                        repaint = s.fields.state_of(id) != before;
-                        // A focused box selects nothing by itself, but the window manager selects
-                        // the box's contents when it activates one, so the same collapse the panel
-                        // performs on its way up runs here too, and the log that follows reports
-                        // what the box holds after it rather than before.
-                        if focused {
-                            collapse_native_selection(s.control(id));
-                            match selection_log_values(s.control(id)) {
-                                Some((start, end, length)) => eprintln!(
-                                    "[save-panel] edit selection field={id:?} start={start} end={end} len={length}"
-                                ),
-                                None => {
-                                    eprintln!("[save-panel] edit selection field={id:?} control=null")
+                        // Focus is not allowed to overwrite a message about the value: the field would
+                        // fall silent exactly while the user is fixing what it complained about.
+                        let next = match notification {
+                            EN_SETFOCUS => Some(true),
+                            EN_KILLFOCUS => Some(false),
+                            _ => None,
+                        };
+                        if let Some(focused) = next {
+                            let before = s.fields.state_of(id);
+                            s.fields.set_focus(id, focused);
+                            repaint = s.fields.state_of(id) != before;
+                            // A focused box selects nothing by itself, but the window manager selects
+                            // the box's contents when it activates one, so the same collapse the panel
+                            // performs on its way up runs here too, and the log that follows reports
+                            // what the box holds after it rather than before.
+                            if focused {
+                                collapse_native_selection(s.control(id));
+                                match selection_log_values(s.control(id)) {
+                                    Some((start, end, length)) => eprintln!(
+                                        "[save-panel] edit selection field={id:?} start={start} end={end} len={length}"
+                                    ),
+                                    None => {
+                                        eprintln!(
+                                            "[save-panel] edit selection field={id:?} control=null"
+                                        )
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                if conflict_dirty {
+                    refresh_conflict(hwnd);
+                }
+                if repaint {
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                0
             }
-            if conflict_dirty {
-                refresh_conflict(hwnd);
+            WM_CLOSE => {
+                eprintln!("[save-panel] WM_CLOSE received hwnd={hwnd:p}");
+                DestroyWindow(hwnd);
+                0
             }
-            if repaint {
-                windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+            WM_DESTROY => {
+                let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+                if !pointer.is_null() {
+                    drop(Box::from_raw(pointer));
+                }
+                PostQuitMessage(0);
+                0
             }
-            0
+            _ => DefWindowProcW(hwnd, message, wparam, lparam),
         }
-        WM_CLOSE => {
-            eprintln!("[save-panel] WM_CLOSE received hwnd={hwnd:p}");
-            DestroyWindow(hwnd);
-            0
-        }
-        WM_DESTROY => {
-            let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !pointer.is_null() {
-                drop(Box::from_raw(pointer));
-            }
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(hwnd, message, wparam, lparam),
-    }
     }
 }
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn state(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<&'static WindowState> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWLP_USERDATA};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWLP_USERDATA, GetWindowLongPtrW};
     unsafe {
         let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
         pointer.as_ref()
@@ -4405,7 +4463,7 @@ fn state(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<&'static WindowSt
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn state_mut(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<&'static mut WindowState> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWLP_USERDATA};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GWLP_USERDATA, GetWindowLongPtrW};
     unsafe {
         let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
         pointer.as_mut()
@@ -4474,7 +4532,9 @@ fn subclass_action(message: u32, lparam: isize) -> SubclassAction {
 /// caller then lets the control do whatever it was going to do.
 #[cfg(windows)]
 #[allow(unsafe_code)]
-fn child_fill_brush(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<windows_sys::Win32::Graphics::Gdi::HBRUSH> {
+fn child_fill_brush(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+) -> Option<windows_sys::Win32::Graphics::Gdi::HBRUSH> {
     let parent = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(hwnd) };
     if parent.is_null() {
         return None;
@@ -4482,11 +4542,7 @@ fn child_fill_brush(hwnd: windows_sys::Win32::Foundation::HWND) -> Option<window
     let state = state(parent)?;
     let id = state.field_of(hwnd)?;
     let brush = state.fill_brushes[state.fields.state_of(id).index()];
-    if brush.is_null() {
-        None
-    } else {
-        Some(brush)
-    }
+    if brush.is_null() { None } else { Some(brush) }
 }
 
 /// `WM_CONTEXTMENU` forwarded from the name box to the panel.
@@ -4514,7 +4570,10 @@ unsafe extern "system" fn edit_context_subclass(
             if !parent.is_null() {
                 return unsafe {
                     windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
-                        parent, WM_CONTEXTMENU, wparam, lparam,
+                        parent,
+                        WM_CONTEXTMENU,
+                        wparam,
+                        lparam,
                     )
                 };
             }
@@ -4596,11 +4655,7 @@ fn read_u32(hwnd: isize, attribute: u32) -> Option<u32> {
             std::mem::size_of::<u32>() as u32,
         )
     };
-    if status == 0 {
-        Some(value)
-    } else {
-        None
-    }
+    if status == 0 { Some(value) } else { None }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -4639,7 +4694,10 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
-            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after_chips: snapclip_ui::panel::AfterChips {
+                label: 40,
+                widths: [40, 52],
+            },
             after: [false; 2],
             size_presets: [40, 36, 36, 36],
             size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
@@ -4693,7 +4751,11 @@ mod tests {
             Some("640"),
             "the painter reads the same model the save does"
         );
-        assert_eq!(views.limit.map(|view| view.text), Some(""), "the limit starts empty");
+        assert_eq!(
+            views.limit.map(|view| view.text),
+            Some(""),
+            "the limit starts empty"
+        );
     }
 
     /// A click gives a drawn number the focus and selects it, so the first keystroke replaces the
@@ -4714,17 +4776,25 @@ mod tests {
             "gaining the focus selects everything, which is what makes typing replace"
         );
         assert_eq!(
-            state.fields.state_of(snapclip_ui::panel::FieldId::SizeWidth),
+            state
+                .fields
+                .state_of(snapclip_ui::panel::FieldId::SizeWidth),
             snapclip_ui::panel::FieldState::Focused,
             "the frame's border follows the same state the native children wrote"
         );
         state.blur_number();
         assert_eq!(state.focused_number, None);
         assert_eq!(
-            state.fields.state_of(snapclip_ui::panel::FieldId::SizeWidth),
+            state
+                .fields
+                .state_of(snapclip_ui::panel::FieldId::SizeWidth),
             snapclip_ui::panel::FieldState::Idle
         );
-        assert_eq!(state.numbers.width.text(), "1341", "losing the focus changes nothing");
+        assert_eq!(
+            state.numbers.width.text(),
+            "1341",
+            "losing the focus changes nothing"
+        );
     }
 
     /// Two drawn numbers never hold the focus at once, and moving between them moves the frame's
@@ -4738,10 +4808,15 @@ mod tests {
             state.focused_number,
             Some(snapclip_ui::panel::FieldId::SizeHeight)
         );
-        assert!(!state.numbers.width.focused(), "the first number gave the focus up");
+        assert!(
+            !state.numbers.width.focused(),
+            "the first number gave the focus up"
+        );
         assert!(state.numbers.height.focused());
         assert_eq!(
-            state.fields.state_of(snapclip_ui::panel::FieldId::SizeWidth),
+            state
+                .fields
+                .state_of(snapclip_ui::panel::FieldId::SizeWidth),
             snapclip_ui::panel::FieldState::Idle,
             "and its ring went with it"
         );
@@ -4777,10 +4852,7 @@ mod tests {
         });
         assert_eq!(
             status_of(&result),
-            Some((
-                snapclip_ui::copy::Level::Error,
-                "文件名不能为空".to_owned()
-            ))
+            Some((snapclip_ui::copy::Level::Error, "文件名不能为空".to_owned()))
         );
 
         // A warning key carries the warning level, and the panel paints it differently because of
@@ -4847,7 +4919,10 @@ mod tests {
         assert_eq!(values.name, "SnapClip_[日期]");
         assert_eq!(values.date, "2026-10-24");
         assert_eq!(values.time, "0115");
-        assert_eq!(values.sequence, 7, "the number comes from the shell's counter");
+        assert_eq!(
+            values.sequence, 7,
+            "the number comes from the shell's counter"
+        );
         assert_eq!(values.app, "SnapClip");
     }
 
@@ -4878,7 +4953,9 @@ mod tests {
         assert_eq!(date.as_bytes()[7], b'-');
         assert_eq!(time.len(), 4, "HHmm: {time}");
         assert!(
-            date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit() || b == b'-'),
+            date.bytes()
+                .chain(time.bytes())
+                .all(|b| b.is_ascii_digit() || b == b'-'),
             "nothing in a file name may need escaping: {date} {time}"
         );
     }
@@ -4933,8 +5010,16 @@ mod tests {
     /// there was no `WM_KEYDOWN` for the panel to receive.
     #[test]
     fn the_two_shortcut_keys_are_enter_and_escape() {
-        assert_eq!(shortcut_command(1), Some(Shortcut::Save), "IDOK is Enter (:686)");
-        assert_eq!(shortcut_command(2), Some(Shortcut::Cancel), "IDCANCEL is Esc (:684)");
+        assert_eq!(
+            shortcut_command(1),
+            Some(Shortcut::Save),
+            "IDOK is Enter (:686)"
+        );
+        assert_eq!(
+            shortcut_command(2),
+            Some(Shortcut::Cancel),
+            "IDCANCEL is Esc (:684)"
+        );
         for other in [0usize, 3, 7] {
             assert_eq!(
                 shortcut_command(other),
@@ -5005,7 +5090,10 @@ mod tests {
 
         let remembered = std::sync::Arc::new(std::sync::Mutex::new(Remembered::default()));
         let read = |remembered: &std::sync::Arc<std::sync::Mutex<Remembered>>| {
-            remembered.lock().map(|r| r.template.clone()).unwrap_or_default()
+            remembered
+                .lock()
+                .map(|r| r.template.clone())
+                .unwrap_or_default()
         };
 
         let first = read(&remembered);
@@ -5027,7 +5115,10 @@ mod tests {
             "我的_[序号]",
             "the next panel opens with the remembered template"
         );
-        assert_ne!(first, second, "the two panels do not open with the same text");
+        assert_ne!(
+            first, second,
+            "the two panels do not open with the same text"
+        );
     }
 
     /// Where a selection is collapsed to, which is its end and never its start.
@@ -5152,15 +5243,18 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
-            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after_chips: snapclip_ui::panel::AfterChips {
+                label: 40,
+                widths: [40, 52],
+            },
             after: [false; 2],
             size_presets: [40, 36, 36, 36],
-        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
-        size_mode_widths: [56, 64],
+            size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+            size_mode_widths: [56, 64],
             limit_on: false,
-        conflict: ConflictPolicy::AutoRename,
-        conflict_shown: false,
-        conflict_widths: [0; 2],
+            conflict: ConflictPolicy::AutoRename,
+            conflict_shown: false,
+            conflict_widths: [0; 2],
             limit_words: snapclip_ui::panel::LimitWidths::default(),
             estimate: None,
             over_limit: false,
@@ -5193,10 +5287,17 @@ mod tests {
             Some(snapclip_ui::panel::FieldId::SizeHeight),
             "a control answers as the field that owns it"
         );
-        assert_eq!(state.control(snapclip_ui::panel::FieldId::SizeHeight), handle);
+        assert_eq!(
+            state.control(snapclip_ui::panel::FieldId::SizeHeight),
+            handle
+        );
         for id in snapclip_ui::panel::FieldId::ALL {
             if id != snapclip_ui::panel::FieldId::SizeHeight {
-                assert_eq!(state.control(id), std::ptr::null_mut(), "{id:?} was not registered");
+                assert_eq!(
+                    state.control(id),
+                    std::ptr::null_mut(),
+                    "{id:?} was not registered"
+                );
             }
         }
     }
@@ -5234,15 +5335,18 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
-            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after_chips: snapclip_ui::panel::AfterChips {
+                label: 40,
+                widths: [40, 52],
+            },
             after: [false; 2],
             size_presets: [40, 36, 36, 36],
-        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
-        size_mode_widths: [56, 64],
+            size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+            size_mode_widths: [56, 64],
             limit_on: false,
-        conflict: ConflictPolicy::AutoRename,
-        conflict_shown: false,
-        conflict_widths: [0; 2],
+            conflict: ConflictPolicy::AutoRename,
+            conflict_shown: false,
+            conflict_widths: [0; 2],
             limit_words: snapclip_ui::panel::LimitWidths::default(),
             estimate: None,
             over_limit: false,
@@ -5259,7 +5363,11 @@ mod tests {
             )
         };
 
-        assert_eq!(state.chosen_quality(), 0, "the panel opens on the first option");
+        assert_eq!(
+            state.chosen_quality(),
+            0,
+            "the panel opens on the first option"
+        );
 
         // A click on the second option: press and release on the same one.
         state.quality_pointer(1.0, snapclip_ui::panel::PointerEvent::Down, centre(1));
@@ -5320,15 +5428,18 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
-            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after_chips: snapclip_ui::panel::AfterChips {
+                label: 40,
+                widths: [40, 52],
+            },
             after: [false; 2],
             size_presets: [40, 36, 36, 36],
-        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
-        size_mode_widths: [56, 64],
+            size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+            size_mode_widths: [56, 64],
             limit_on: false,
-        conflict: ConflictPolicy::AutoRename,
-        conflict_shown: false,
-        conflict_widths: [0; 2],
+            conflict: ConflictPolicy::AutoRename,
+            conflict_shown: false,
+            conflict_widths: [0; 2],
             limit_words: snapclip_ui::panel::LimitWidths::default(),
             estimate: None,
             over_limit: false,
@@ -5343,7 +5454,11 @@ mod tests {
         let after = snapclip_ui::panel::quality_option_rect(&metrics, &metrics.rects(1.5), 1.5, 0);
 
         assert_eq!(state.segment_scale, 1.5, "the new scale is remembered");
-        assert_eq!(state.chosen_quality(), 2, "a DPI change must not change the choice");
+        assert_eq!(
+            state.chosen_quality(),
+            2,
+            "a DPI change must not change the choice"
+        );
         assert!(
             after.left > before.left,
             "and the rectangles really were rebuilt at the new scale"
@@ -5405,7 +5520,11 @@ mod tests {
             !shell.committed(),
             "a commit before a save is not a legal transition"
         );
-        assert_eq!(shell.phase(), Phase::Open, "an illegal event changes nothing");
+        assert_eq!(
+            shell.phase(),
+            Phase::Open,
+            "an illegal event changes nothing"
+        );
 
         assert!(shell.start_saving(), "Open -> Saving");
         assert_eq!(shell.phase(), Phase::Saving);
@@ -5575,15 +5694,18 @@ mod tests {
             status: None,
             var_open: false,
             path_chips: [40, 52, 64],
-            after_chips: snapclip_ui::panel::AfterChips { label: 40, widths: [40, 52] },
+            after_chips: snapclip_ui::panel::AfterChips {
+                label: 40,
+                widths: [40, 52],
+            },
             after: [false; 2],
             size_presets: [40, 36, 36, 36],
-        size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
-        size_mode_widths: [56, 64],
+            size_mode: snapclip_ui::panel::SIZE_MODE_CHOSEN,
+            size_mode_widths: [56, 64],
             limit_on: false,
-        conflict: ConflictPolicy::AutoRename,
-        conflict_shown: false,
-        conflict_widths: [0; 2],
+            conflict: ConflictPolicy::AutoRename,
+            conflict_shown: false,
+            conflict_widths: [0; 2],
             limit_words: snapclip_ui::panel::LimitWidths::default(),
             estimate: None,
             over_limit: false,
@@ -5615,7 +5737,8 @@ mod tests {
     /// The three shortcut chips are the shell's own folders, and a chip past the third is not a
     /// chip: it answers `None` rather than a directory nobody asked for.
     #[test]
-    fn a_shortcut_beyond_the_three_is_not_a_shortcut() {        assert_eq!(shortcut_directory(3), None);
+    fn a_shortcut_beyond_the_three_is_not_a_shortcut() {
+        assert_eq!(shortcut_directory(3), None);
         assert_eq!(shortcut_directory(99), None);
         for index in 0..3 {
             if let Some(path) = shortcut_directory(index) {
@@ -5639,12 +5762,32 @@ mod tests {
     #[test]
     fn the_limit_field_reads_as_kilobytes_or_as_the_floor() {
         assert_eq!(limit_kilobytes("500"), 500);
-        assert_eq!(limit_kilobytes(" 300 "), 300, "surrounding space is not a number");
-        assert_eq!(limit_kilobytes("5"), MIN_LIMIT_KB, "below the design's floor");
-        assert_eq!(limit_kilobytes("0"), MIN_LIMIT_KB, "zero kilobytes is not a limit");
-        assert_eq!(limit_kilobytes(""), MIN_LIMIT_KB, "an empty field is not a number");
+        assert_eq!(
+            limit_kilobytes(" 300 "),
+            300,
+            "surrounding space is not a number"
+        );
+        assert_eq!(
+            limit_kilobytes("5"),
+            MIN_LIMIT_KB,
+            "below the design's floor"
+        );
+        assert_eq!(
+            limit_kilobytes("0"),
+            MIN_LIMIT_KB,
+            "zero kilobytes is not a limit"
+        );
+        assert_eq!(
+            limit_kilobytes(""),
+            MIN_LIMIT_KB,
+            "an empty field is not a number"
+        );
         assert_eq!(limit_kilobytes("abc"), MIN_LIMIT_KB, "nor is a word");
-        assert_eq!(limit_kilobytes("-1"), MIN_LIMIT_KB, "nor is a negative count");
+        assert_eq!(
+            limit_kilobytes("-1"),
+            MIN_LIMIT_KB,
+            "nor is a negative count"
+        );
     }
 
     /// The sentence under the quality line, in its three shapes (`:234`).
@@ -5677,8 +5820,16 @@ mod tests {
                 && over_png.ends_with(snapclip_ui::panel::LIMIT_NOTE_OVER_AFTER),
             "png has no tier to lower, so its sentence says it is lossless instead: {over_png:?}"
         );
-        assert_eq!(limit_note(None, false, false), None, "nothing measured, nothing said");
-        assert_eq!(limit_note(None, true, true), None, "nothing measured, nothing claimed");
+        assert_eq!(
+            limit_note(None, false, false),
+            None,
+            "nothing measured, nothing said"
+        );
+        assert_eq!(
+            limit_note(None, true, true),
+            None,
+            "nothing measured, nothing claimed"
+        );
     }
 
     /// The limit is a promise about the **file**, which is the only place it can be checked.
@@ -5761,228 +5912,236 @@ mod tests {
     }
 }
 
-    /// The link's word is the action a press takes, so the two policies name each other.
-    #[test]
-    fn the_conflict_link_offers_the_policy_that_is_not_in_force() {
-        // Renaming is the default, so the link offers overwriting, and the words are the design's
-        // own (copy::ConflictLink). A label naming the policy in force would read as a statement
-        // of fact rather than as something to press.
-        assert_eq!(
-            conflict_link(ConflictPolicy::AutoRename),
-            snapclip_ui::copy::ConflictLink::Overwrite
-        );
-        assert_eq!(
-            conflict_link(ConflictPolicy::Overwrite),
-            snapclip_ui::copy::ConflictLink::Rename
-        );
-        assert_eq!(conflict_link(ConflictPolicy::AutoRename).text(), "改为覆盖");
-        assert_eq!(conflict_link(ConflictPolicy::Overwrite).text(), "改为重命名");
-    }
+/// The link's word is the action a press takes, so the two policies name each other.
+#[test]
+fn the_conflict_link_offers_the_policy_that_is_not_in_force() {
+    // Renaming is the default, so the link offers overwriting, and the words are the design's
+    // own (copy::ConflictLink). A label naming the policy in force would read as a statement
+    // of fact rather than as something to press.
+    assert_eq!(
+        conflict_link(ConflictPolicy::AutoRename),
+        snapclip_ui::copy::ConflictLink::Overwrite
+    );
+    assert_eq!(
+        conflict_link(ConflictPolicy::Overwrite),
+        snapclip_ui::copy::ConflictLink::Rename
+    );
+    assert_eq!(conflict_link(ConflictPolicy::AutoRename).text(), "改为覆盖");
+    assert_eq!(
+        conflict_link(ConflictPolicy::Overwrite).text(),
+        "改为重命名"
+    );
+}
 
-    /// The choice has to survive the trip from the panel to the request, or the link would flip a
-    /// flag that nothing reads and the next save would quietly rename anyway.
-    #[test]
-    fn the_panels_conflict_choice_reaches_the_values() {
-        let values = panel_values(
-            r"C:\\shots",
-            "SnapClip_[日期]",
+/// The choice has to survive the trip from the panel to the request, or the link would flip a
+/// flag that nothing reads and the next save would quietly rename anyway.
+#[test]
+fn the_panels_conflict_choice_reaches_the_values() {
+    let values = panel_values(
+        r"C:\\shots",
+        "SnapClip_[日期]",
+        "2026-10-24",
+        "0115",
+        7,
+        format_of_index(0),
+        crate::save::assemble::quality_of_tier(0),
+        snapclip_ui::panel::FILL_WHITE,
+        ConflictPolicy::Overwrite,
+    );
+    assert_eq!(values.conflict, ConflictPolicy::Overwrite);
+}
+
+/// The file system decides, and the panel's choice is what picks between replacing and keeping
+/// beside. Asserted on the files because that is where the difference is.
+#[test]
+fn a_taken_name_is_replaced_or_kept_beside_by_the_panels_choice() {
+    let directory = std::env::temp_dir().join(format!(
+        "snapclip-conflict-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&directory).expect("a scratch directory");
+    let directory_text = directory.to_string_lossy().into_owned();
+    let (width, height) = (8u32, 8u32);
+    let mut bgra = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            bgra.extend_from_slice(&[(x * 31) as u8, (y * 31) as u8, 128, 255]);
+        }
+    }
+    let size = crate::save::scale::Size::new(width, height);
+    let frame = crate::save::scale::Frame {
+        bgra: &bgra,
+        source: size,
+        output: size,
+    };
+    let values = |conflict: ConflictPolicy| {
+        panel_values(
+            &directory_text,
+            "shot",
             "2026-10-24",
-            "0115",
-            7,
-            format_of_index(0),
-            crate::save::assemble::quality_of_tier(0),
+            "1042",
+            1,
+            SaveFormat::Png,
+            92,
             snapclip_ui::panel::FILL_WHITE,
-            ConflictPolicy::Overwrite,
-        );
-        assert_eq!(values.conflict, ConflictPolicy::Overwrite);
-    }
+            conflict,
+        )
+    };
 
-    /// The file system decides, and the panel's choice is what picks between replacing and keeping
-    /// beside. Asserted on the files because that is where the difference is.
-    #[test]
-    fn a_taken_name_is_replaced_or_kept_beside_by_the_panels_choice() {
-        let directory = std::env::temp_dir().join(format!(
-            "snapclip-conflict-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&directory).expect("a scratch directory");
-        let directory_text = directory.to_string_lossy().into_owned();
-        let (width, height) = (8u32, 8u32);
-        let mut bgra = Vec::with_capacity((width * height * 4) as usize);
-        for y in 0..height {
-            for x in 0..width {
-                bgra.extend_from_slice(&[(x * 31) as u8, (y * 31) as u8, 128, 255]);
-            }
-        }
-        let size = crate::save::scale::Size::new(width, height);
-        let frame = crate::save::scale::Frame {
-            bgra: &bgra,
-            source: size,
-            output: size,
-        };
-        let values = |conflict: ConflictPolicy| {
-            panel_values(
-                &directory_text,
-                "shot",
-                "2026-10-24",
-                "1042",
-                1,
-                SaveFormat::Png,
-                92,
-                snapclip_ui::panel::FILL_WHITE,
-                conflict,
-            )
-        };
+    // Last night's screenshot, holding bytes no png encoder would ever write.
+    let plain = directory.join("shot.png");
+    std::fs::write(&plain, b"last night").expect("a sentinel file");
 
-        // Last night's screenshot, holding bytes no png encoder would ever write.
-        let plain = directory.join("shot.png");
-        std::fs::write(&plain, b"last night").expect("a sentinel file");
+    let renamed = save_panel(&values(ConflictPolicy::AutoRename), &frame).expect("the save");
+    assert_ne!(
+        renamed.path, plain,
+        "a taken name is not reused while renaming"
+    );
+    assert_eq!(
+        std::fs::read(&plain).expect("the sentinel"),
+        b"last night",
+        "renaming has to leave the existing file alone"
+    );
+    assert!(renamed.path.exists(), "the renamed file is on disk");
 
-        let renamed = save_panel(&values(ConflictPolicy::AutoRename), &frame).expect("the save");
-        assert_ne!(
-            renamed.path, plain,
-            "a taken name is not reused while renaming"
-        );
+    let overwritten = save_panel(&values(ConflictPolicy::Overwrite), &frame).expect("the save");
+    assert_eq!(overwritten.path, plain, "overwriting keeps the name");
+    assert_ne!(
+        std::fs::read(&plain).expect("the replaced file"),
+        b"last night",
+        "overwriting replaces the bytes"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// The folder dialog starts where the field points, and asks for the shell's default when the
+/// field names nothing rather than for a path that is not a path.
+#[test]
+fn the_folder_dialog_starts_where_the_path_field_points() {
+    assert!(browse_initial_path("").is_none());
+    assert!(browse_initial_path("   ").is_none());
+    let path = browse_initial_path(r"C:\shots").expect("a path asks for a start");
+    assert_eq!(
+        *path.last().expect("terminated"),
+        0,
+        "the dialog reads a c string"
+    );
+    assert_eq!(
+        String::from_utf16_lossy(&path[..path.len() - 1]),
+        r"C:\shots"
+    );
+}
+
+/// The box's subclass takes exactly one message, and only from the mouse.
+///
+/// Everything else has to reach the box's own procedure, because typing, the caret, the
+/// selection, the clipboard and the undo stack are all implemented there. A subclass that
+/// swallowed more than the context menu and the background would not fail anything else in
+/// this file: it would quietly stop the box being a text box.
+#[test]
+fn the_box_gives_up_only_the_menu_it_can_place_and_the_background_it_can_paint() {
+    assert_eq!(
+        subclass_action(WM_CONTEXTMENU, 100),
+        SubclassAction::ForwardContextMenu,
+        "a right click belongs to the panel's own menu"
+    );
+    assert_eq!(
+        subclass_action(WM_CONTEXTMENU, -1),
+        SubclassAction::PassThrough,
+        "the keyboard's context key has no caret position to place a menu at"
+    );
+    assert_eq!(
+        subclass_action(WM_ERASEBKGND, 100),
+        SubclassAction::EraseBackground,
+        "a themed box ignores the brush it is handed, so the fill is painted here"
+    );
+    for other in [
+        0x0102, // WM_CHAR
+        0x0100, // WM_KEYDOWN
+        0x0007, // WM_SETFOCUS
+        0x0201, // WM_LBUTTONDOWN
+        0x000F, // WM_PAINT
+        WM_NCDESTROY,
+    ] {
         assert_eq!(
-            std::fs::read(&plain).expect("the sentinel"),
-            b"last night",
-            "renaming has to leave the existing file alone"
-        );
-        assert!(renamed.path.exists(), "the renamed file is on disk");
-
-        let overwritten = save_panel(&values(ConflictPolicy::Overwrite), &frame).expect("the save");
-        assert_eq!(overwritten.path, plain, "overwriting keeps the name");
-        assert_ne!(
-            std::fs::read(&plain).expect("the replaced file"),
-            b"last night",
-            "overwriting replaces the bytes"
-        );
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    /// The folder dialog starts where the field points, and asks for the shell's default when the
-    /// field names nothing rather than for a path that is not a path.
-    #[test]
-    fn the_folder_dialog_starts_where_the_path_field_points() {
-        assert!(browse_initial_path("").is_none());
-        assert!(browse_initial_path("   ").is_none());
-        let path = browse_initial_path(r"C:\shots").expect("a path asks for a start");
-        assert_eq!(*path.last().expect("terminated"), 0, "the dialog reads a c string");
-        assert_eq!(
-            String::from_utf16_lossy(&path[..path.len() - 1]),
-            r"C:\shots"
-        );
-    }
-
-    /// The box's subclass takes exactly one message, and only from the mouse.
-    ///
-    /// Everything else has to reach the box's own procedure, because typing, the caret, the
-    /// selection, the clipboard and the undo stack are all implemented there. A subclass that
-    /// swallowed more than the context menu and the background would not fail anything else in
-    /// this file: it would quietly stop the box being a text box.
-    #[test]
-    fn the_box_gives_up_only_the_menu_it_can_place_and_the_background_it_can_paint() {
-        assert_eq!(
-            subclass_action(WM_CONTEXTMENU, 100),
-            SubclassAction::ForwardContextMenu,
-            "a right click belongs to the panel's own menu"
-        );
-        assert_eq!(
-            subclass_action(WM_CONTEXTMENU, -1),
+            subclass_action(other, 100),
             SubclassAction::PassThrough,
-            "the keyboard's context key has no caret position to place a menu at"
+            "message {other:#06x} has to reach the box's own procedure"
         );
-        assert_eq!(
-            subclass_action(WM_ERASEBKGND, 100),
-            SubclassAction::EraseBackground,
-            "a themed box ignores the brush it is handed, so the fill is painted here"
-        );
-        for other in [
-            0x0102, // WM_CHAR
-            0x0100, // WM_KEYDOWN
-            0x0007, // WM_SETFOCUS
-            0x0201, // WM_LBUTTONDOWN
-            0x000F, // WM_PAINT
-            WM_NCDESTROY,
-        ] {
-            assert_eq!(
-                subclass_action(other, 100),
-                SubclassAction::PassThrough,
-                "message {other:#06x} has to reach the box's own procedure"
-            );
-        }
     }
+}
 
-    /// The one patch a native control cannot avoid is its rectangle inside a rounded box, so the
-    /// colour must not be a second patch: the box and the control are given the same fill.
-    ///
-    /// `SetBkColor` has no alpha channel, so a translucent fill would be painted opaque by the
-    /// control and translucent by the frame, and the difference is visible where the control's
-    /// rectangle sits. Every state's fill therefore has to be opaque, and it has to be the colour
-    /// the frame fills the box with rather than a second guess at it.
-    #[test]
-    fn the_control_is_filled_with_the_colour_the_frame_fills_its_box() {
-        use snapclip_ui::panel::{field_colours, FieldState};
-        for state in FieldState::ALL {
-            let colours = field_colours(state, SURFACE_RGBA);
-            assert_eq!(
-                colours.fill[3], 255,
-                "{state:?}: a native control cannot paint a translucent fill, so the frame and the \
+/// The one patch a native control cannot avoid is its rectangle inside a rounded box, so the
+/// colour must not be a second patch: the box and the control are given the same fill.
+///
+/// `SetBkColor` has no alpha channel, so a translucent fill would be painted opaque by the
+/// control and translucent by the frame, and the difference is visible where the control's
+/// rectangle sits. Every state's fill therefore has to be opaque, and it has to be the colour
+/// the frame fills the box with rather than a second guess at it.
+#[test]
+fn the_control_is_filled_with_the_colour_the_frame_fills_its_box() {
+    use snapclip_ui::panel::{FieldState, field_colours};
+    for state in FieldState::ALL {
+        let colours = field_colours(state, SURFACE_RGBA);
+        assert_eq!(
+            colours.fill[3], 255,
+            "{state:?}: a native control cannot paint a translucent fill, so the frame and the \
                  control have to agree on an opaque one"
-            );
-            // The same value the frame fills the box with, read from the one rule, so a change to
-            // the rule moves both. `bgr` is how the control is told.
-            assert_eq!(
-                bgr(colours.fill),
-                (u32::from(colours.fill[2]) << 16)
-                    | (u32::from(colours.fill[1]) << 8)
-                    | u32::from(colours.fill[0]),
-                "{state:?}: the colour handed to the control is the colour of the box's fill"
-            );
-        }
+        );
+        // The same value the frame fills the box with, read from the one rule, so a change to
+        // the rule moves both. `bgr` is how the control is told.
+        assert_eq!(
+            bgr(colours.fill),
+            (u32::from(colours.fill[2]) << 16)
+                | (u32::from(colours.fill[1]) << 8)
+                | u32::from(colours.fill[0]),
+            "{state:?}: the colour handed to the control is the colour of the box's fill"
+        );
     }
+}
 
-    /// Telling the shell and asking it to select are two calls that only work in one order: the
-    /// folder window was enumerated before this file was written, so a select request against a list
-    /// that does not hold the name answers success and selects nothing. The order is data, so a swap
-    /// is a change of behaviour rather than a reordering of lines nobody can see.
-    #[test]
-    fn the_shell_is_told_about_the_file_before_it_is_asked_to_select_it() {
-        assert_eq!(
-            AFTER_SAVE_STEPS,
-            [
-                AfterSaveStep::CopyPath,
-                AfterSaveStep::TellShell,
-                AfterSaveStep::Reveal,
-            ],
-            "the notification has to come before the request it makes possible"
-        );
-    }
+/// Telling the shell and asking it to select are two calls that only work in one order: the
+/// folder window was enumerated before this file was written, so a select request against a list
+/// that does not hold the name answers success and selects nothing. The order is data, so a swap
+/// is a change of behaviour rather than a reordering of lines nobody can see.
+#[test]
+fn the_shell_is_told_about_the_file_before_it_is_asked_to_select_it() {
+    assert_eq!(
+        AFTER_SAVE_STEPS,
+        [
+            AfterSaveStep::CopyPath,
+            AfterSaveStep::TellShell,
+            AfterSaveStep::Reveal,
+        ],
+        "the notification has to come before the request it makes possible"
+    );
+}
 
-    /// A saved file is selected inside its folder; a file that is no longer there leaves nothing to
-    /// select, so the folder it was saved to is opened instead.
-    #[test]
-    fn revealing_a_saved_file_selects_it_and_a_missing_one_opens_its_folder() {        let folder = std::env::temp_dir().join("snapclip-reveal-plan");
-        std::fs::create_dir_all(&folder).expect("a scratch folder");
-        let file = folder.join("shot.png");
-        std::fs::write(&file, b"png").expect("a scratch file");
-        assert_eq!(
-            reveal_plan(&file),
-            Reveal::Select(file.clone()),
-            "a file that is there is the thing to point at"
-        );
-        std::fs::remove_file(&file).expect("the scratch file is removable");
-        assert_eq!(
-            reveal_plan(&file),
-            Reveal::Open(folder.clone()),
-            "with nothing to select, the folder is the honest answer"
-        );
-        std::fs::remove_dir_all(&folder).expect("the scratch folder is removable");
-    }
+/// A saved file is selected inside its folder; a file that is no longer there leaves nothing to
+/// select, so the folder it was saved to is opened instead.
+#[test]
+fn revealing_a_saved_file_selects_it_and_a_missing_one_opens_its_folder() {
+    let folder = std::env::temp_dir().join("snapclip-reveal-plan");
+    std::fs::create_dir_all(&folder).expect("a scratch folder");
+    let file = folder.join("shot.png");
+    std::fs::write(&file, b"png").expect("a scratch file");
+    assert_eq!(
+        reveal_plan(&file),
+        Reveal::Select(file.clone()),
+        "a file that is there is the thing to point at"
+    );
+    std::fs::remove_file(&file).expect("the scratch file is removable");
+    assert_eq!(
+        reveal_plan(&file),
+        Reveal::Open(folder.clone()),
+        "with nothing to select, the folder is the honest answer"
+    );
+    std::fs::remove_dir_all(&folder).expect("the scratch folder is removable");
+}
 
 #[test]
 fn explorer_select_keeps_the_switch_outside_quoted_paths() {

@@ -861,7 +861,7 @@ mod tests {
         assert_eq!(session.selection(), Rect::new(100, 100, 500, 367));
         let ratio_error = (i64::from(session.selection().width()) * 200
             - i64::from(session.selection().height()) * 300)
-        .abs();
+            .abs();
         assert!(ratio_error <= 300);
         session.pointer_released();
 
@@ -967,7 +967,10 @@ mod tests {
         press(&mut session, Point::new(10, 10));
         session.pointer_moved(Point::new(110, 110));
         assert!(session.shows_chrome());
-        assert!(!session.shows_handles(), "drafts must not look like edit mode");
+        assert!(
+            !session.shows_handles(),
+            "drafts must not look like edit mode"
+        );
         assert!(session.shows_size_label());
         session.pointer_released();
         assert!(session.shows_chrome());

@@ -35,9 +35,7 @@ mod windows_gallery {
     };
     use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        ReleaseCapture, SetCapture, SetFocus,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::core::{Result, w};
 
@@ -104,10 +102,7 @@ mod windows_gallery {
                 target: None,
                 dropdown: Dropdown::new(button, Rect::new(40, 160, 270, 278), items, Some(0)),
                 slider: Slider::new(Rect::new(40, 335, 270, 365), 0.0, 100.0, 42.0, 1.0),
-                tooltip: Tooltip::new(
-                    Rect::new(430, 140, 590, 180),
-                    "Button: press to fire",
-                ),
+                tooltip: Tooltip::new(Rect::new(430, 140, 590, 180), "Button: press to fire"),
                 toast: Toast::new(2200),
                 button: Button::new(Rect::new(430, 140, 590, 180)),
                 button_state: ButtonState::default(),

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "checked_on": "2026-11-03",
+  "source_repository": "https://github.com/aaron-rust/hdr-sample-images",
+  "source_directory": "different_file_formats_in_sdr_and_hdr",
+  "provenance": "Files supplied by user; hashes identify local bytes, not an upstream commit verification.",
+  "verification": "File hashes, PNG headers/color tags, AVIF ffprobe and ISO-BMFF colr boxes. No pixel-value correctness or real-window HDR validation.",
+  "files": [
+    {
+      "file": "1A_PNG_HDR.png",
+      "bytes": 205736718,
+      "sha256": "d6bb2746a7e885b5c8e7ec8bbfe59b848e2dfa266fa59afae8429ac0b188eef6",
+      "width": 8256,
+      "height": 5504,
+      "bit_depth": 16,
+      "color_model": "RGB",
+      "pixels": 45441024,
+      "rgba8_raster_bytes": 181764096,
+      "rgba16f_raster_bytes": 363528192,
+      "png_cicp": [
+        9,
+        16,
+        0,
+        1
+      ],
+      "png_icc_name": "Rec. 2020 PQ"
+    },
+    {
+      "file": "1B_PNG_SDR.png",
+      "bytes": 221975080,
+      "sha256": "0a232fbf353f118874604eaafe6816636ee4a6b0f1177c67cfd9b3b7e1fe033a",
+      "width": 8256,
+      "height": 5504,
+      "bit_depth": 16,
+      "color_model": "RGB",
+      "pixels": 45441024,
+      "rgba8_raster_bytes": 181764096,
+      "rgba16f_raster_bytes": 363528192,
+      "png_icc_name": "sRGB IEC61966-2.1"
+    },
+    {
+      "file": "2A_AVIF_HDR.avif",
+      "bytes": 6729702,
+      "sha256": "97d0dd6e29c565db6bfc21a4cdfdfd9af7b5d46c1538d15e11e715f9c4bc3522",
+      "ffprobe": {
+        "index": 0,
+        "codec_name": "av1",
+        "width": 8256,
+        "height": 5504,
+        "pix_fmt": "yuv444p12le",
+        "color_range": "pc",
+        "color_space": "smpte170m"
+      },
+      "container_color": {
+        "icc_description": "Rec. 2020 PQ",
+        "nclx": {
+          "primaries": 2,
+          "transfer": 2,
+          "matrix": 6,
+          "full_range": true
+        }
+      }
+    },
+    {
+      "file": "2B_AVIF_SDR.avif",
+      "bytes": 7722561,
+      "sha256": "541e4ff0404ae616d765734869eaecb88923fd74a0faf80e34bdc0955a0e436f",
+      "ffprobe": {
+        "index": 0,
+        "codec_name": "av1",
+        "width": 8256,
+        "height": 5504,
+        "pix_fmt": "yuv444p12le",
+        "color_range": "pc",
+        "color_space": "smpte170m"
+      },
+      "container_color": {
+        "icc_description": "sRGB IEC61966-2.1",
+        "nclx": {
+          "primaries": 2,
+          "transfer": 2,
+          "matrix": 6,
+          "full_range": true
+        }
+      }
+    }
+  ]
+}

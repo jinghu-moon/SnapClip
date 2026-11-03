@@ -9,7 +9,7 @@
 //! depend on whether an encoder exists. A request that cannot be satisfied in its format is an
 //! error about the **request**; "this build has no encoder yet" is an error about the **build**.
 
-use snapclip_capture::save_format::{FormatLimit, SaveFormat, JPEG_FRAME_BUDGET_PIXELS};
+use snapclip_capture::save_format::{FormatLimit, JPEG_FRAME_BUDGET_PIXELS, SaveFormat};
 
 /// The largest BMP file we will write.
 ///
@@ -27,8 +27,14 @@ pub fn bmp_file_bytes(width: u64, height: u64) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityError {
     /// One side past what the format can describe.
-    TooWide { width: u64, max: u64 },
-    TooHigh { height: u64, max: u64 },
+    TooWide {
+        width: u64,
+        max: u64,
+    },
+    TooHigh {
+        height: u64,
+        max: u64,
+    },
     /// Too many pixels for the path that must hold a whole frame.
     FrameBudget {
         format: SaveFormat,
@@ -36,7 +42,10 @@ pub enum CapabilityError {
         max: u64,
     },
     /// The file itself would be too large.
-    FileSize { bytes: u64, max: u64 },
+    FileSize {
+        bytes: u64,
+        max: u64,
+    },
 }
 
 /// Checks the format's own limits and the budgets the save path imposes on top of them.
@@ -45,10 +54,10 @@ pub fn check(format: SaveFormat, width: u64, height: u64) -> Result<(), Capabili
     match format.can_encode(width, height) {
         Ok(()) => {}
         Err(FormatLimit::TooWide { width, max }) => {
-            return Err(CapabilityError::TooWide { width, max })
+            return Err(CapabilityError::TooWide { width, max });
         }
         Err(FormatLimit::TooHigh { height, max }) => {
-            return Err(CapabilityError::TooHigh { height, max })
+            return Err(CapabilityError::TooHigh { height, max });
         }
     }
 
@@ -96,17 +105,26 @@ mod tests {
     #[test]
     fn webp_refuses_one_pixel_past_its_side_limit() {
         let max = SaveFormat::Webp.max_side();
-        assert!(check(SaveFormat::Webp, max, 10).is_ok(), "the limit itself is allowed");
+        assert!(
+            check(SaveFormat::Webp, max, 10).is_ok(),
+            "the limit itself is allowed"
+        );
         assert_eq!(
             check(SaveFormat::Webp, max + 1, 10),
-            Err(CapabilityError::TooWide { width: max + 1, max })
+            Err(CapabilityError::TooWide {
+                width: max + 1,
+                max
+            })
         );
     }
 
     /// The JPG path holds the frame, so its budget binds before any side limit does.
     #[test]
     fn jpeg_refuses_one_pixel_past_its_frame_budget() {
-        assert!(check(SaveFormat::Jpeg, 4_000, 4_000).is_ok(), "exactly 16 MP");
+        assert!(
+            check(SaveFormat::Jpeg, 4_000, 4_000).is_ok(),
+            "exactly 16 MP"
+        );
         assert_eq!(
             check(SaveFormat::Jpeg, 4_000, 4_001),
             Err(CapabilityError::FrameBudget {
@@ -123,7 +141,10 @@ mod tests {
         // 1024 × 524 287 × 4 + 138 = 2 147 479 690, under the guard.
         let height = 524_287;
         assert_eq!(bmp_file_bytes(1024, height), 2_147_479_690);
-        assert!(check(SaveFormat::Bmp, 1024, height).is_ok(), "at the boundary");
+        assert!(
+            check(SaveFormat::Bmp, 1024, height).is_ok(),
+            "at the boundary"
+        );
         assert!(matches!(
             check(SaveFormat::Bmp, 1024, height + 1),
             Err(CapabilityError::FileSize { max, .. }) if max == BMP_MAX_FILE_BYTES
@@ -139,7 +160,10 @@ mod tests {
             SaveFormat::Webp,
             SaveFormat::Bmp,
         ] {
-            assert!(check(format, 3_840, 2_160).is_ok(), "{format:?} can hold a 4K frame");
+            assert!(
+                check(format, 3_840, 2_160).is_ok(),
+                "{format:?} can hold a 4K frame"
+            );
         }
     }
 }

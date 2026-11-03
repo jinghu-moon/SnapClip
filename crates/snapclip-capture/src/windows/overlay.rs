@@ -25,34 +25,32 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
-    Graphics::Gdi::{
-        BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient, SetWindowRgn,
-    },
+    Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient, SetWindowRgn},
     System::LibraryLoader::GetModuleHandleW,
     System::Threading::GetCurrentThreadId,
     UI::{
         Controls::WM_MOUSELEAVE,
-        Input::Ime::{HIMC, ImmAssociateContext, ImmGetContext, ImmReleaseContext, ImmSetOpenStatus},
+        Input::Ime::{
+            HIMC, ImmAssociateContext, ImmGetContext, ImmReleaseContext, ImmSetOpenStatus,
+        },
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, GetKeyState, MAPVK_VSC_TO_VK, MapVirtualKeyW, ReleaseCapture,
-            SetCapture, SetFocus, VK_CONTROL,
-            VK_LBUTTON, VK_LSHIFT, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RSHIFT, VK_SHIFT,
+            SetCapture, SetFocus, VK_CONTROL, VK_LBUTTON, VK_LSHIFT, VK_MBUTTON, VK_MENU,
+            VK_RBUTTON, VK_RSHIFT, VK_SHIFT,
         },
         WindowsAndMessaging::{
             CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow,
             DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetSystemMetrics,
-            HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW,
-            IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW, MA_ACTIVATE, MSG,
-            PeekMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW, SM_CXDRAG, SW_HIDE,
-            SW_SHOW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer,
-            SetWindowDisplayAffinity,
-            SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW, WDA_EXCLUDEFROMCAPTURE,
-            WM_APP, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND,
-            WM_CHAR, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-            WM_MOUSEACTIVATE,
-            WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT, WM_RBUTTONDOWN, WM_SETCURSOR,
-            WM_SETFOCUS, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
-            WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+            HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL,
+            IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, KillTimer, LoadCursorW,
+            MA_ACTIVATE, MSG, PeekMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassW,
+            SM_CXDRAG, SW_HIDE, SW_SHOW, SetCursor, SetCursorPos, SetForegroundWindow, SetTimer,
+            SetWindowDisplayAffinity, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW,
+            WDA_EXCLUDEFROMCAPTURE, WM_APP, WM_CHAR, WM_DESTROY, WM_DEVICECHANGE, WM_DISPLAYCHANGE,
+            WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_PAINT,
+            WM_RBUTTONDOWN, WM_SETCURSOR, WM_SETFOCUS, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+            WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         },
     },
 };
@@ -68,9 +66,9 @@ use crate::geometry::{
     magnifier_geometry, window_rect_to_local,
 };
 use crate::keymap::{Action, Chord, Context, GuideGroup, Key, LoupeHint};
-use crate::region::Destination;
 use crate::ports::{ArtifactWriter, CaptureEventSink, ClipboardWriter, OverlayPlatform};
 use crate::preferences::OverlayPreferences;
+use crate::region::Destination;
 use crate::sampler::{ColorFormat, ColorSampler};
 use crate::session::{CaptureSession, ExportOutcome};
 use crate::window_detection::model::RequestId;
@@ -117,7 +115,6 @@ const DWELL_TIMER_ID: usize = 0x51_C0DF;
 /// Periodic timer that re-validates the hovered window on the detection worker
 /// (docs/14 §5.5). It only *enqueues*; the DWM read happens off this thread.
 const HOVER_TIMER_ID: usize = 0x51_C0E0;
-
 
 /// 光标闪烁的低频计时器（docs/23 §14.55）。id 必须与其它几个都不同：`0x51_C0E1` 已被
 /// `REGION_DELAY_TIMER_ID` 与 `REFINEMENT_TIMER_ID` 同时占用（既有缺陷，另行记录）。
@@ -363,7 +360,10 @@ impl OverlayPlatform for WindowsOverlay {
     /// The one slot both writers share: the settings file (through `set_preferences`) and the
     /// custom-region panel (which edits the session's copy and publishes it back, docs/23 §14.54).
     fn preferences(&self) -> Option<OverlayPreferences> {
-        self.shared.lock().ok().map(|shared| shared.preferences.clone())
+        self.shared
+            .lock()
+            .ok()
+            .map(|shared| shared.preferences.clone())
     }
 
     fn take_selection(&self) -> Option<Arc<SelectionPixels>> {
@@ -865,7 +865,10 @@ mod timer_id_tests {
         ];
         for (index, (name, id)) in ids.iter().enumerate() {
             for (other_name, other) in ids.iter().skip(index + 1) {
-                assert_ne!(id, other, "{name} 与 {other_name} 用了同一个计时器 id 0x{id:X}");
+                assert_ne!(
+                    id, other,
+                    "{name} 与 {other_name} 用了同一个计时器 id 0x{id:X}"
+                );
             }
         }
     }

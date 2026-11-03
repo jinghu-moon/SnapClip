@@ -1,0 +1,22 @@
+# Encoding Commands
+
+Commands to encode the different files. The base are two files exported from Adobe Lightroom:
+
+- 1A_PNG_HDR.png (BT.2020, PQ, 16bit)
+- 1B_PNG_SDR.png (BT.709, sRGB, 16bit)
+
+All further files are encoded using command line tools:
+
+- AVIF HDR: avifenc -q 90 1A_PNG_HDR.png 2A_AVIF_HDR.avif
+- AVIF SDR: avifenc -q 85 1B_PNG_SDR.png 2B_AVIF_SDR.avif
+
+- HEIC HDR: heif-enc 1A_PNG_HDR.png 3A_HEIC_HDR.heic
+- HEIC SDR: heif-enc 1B_PNG_SDR.png 3B_HEIC_SDR.heic
+
+- JPEG-XL HDR: cjxl 1A_PNG_HDR.png 4A_JPEG-XL_HDR.jxl
+- JPEG-XL SDR: cjxl 1B_PNG_SDR.png 4B_JPEG-XL_SDR.jxl
+
+- JPEG SDR: magick 1B_PNG_SDR.png 5B_JPEG_SDR.jpg
+
+- TIFF HDR: magick 1A_PNG_HDR.png 6A_TIFF_HDR.tiff
+- TIFF SDR: magick 1B_PNG_SDR.png 6B_TIFF_SDR.tiff

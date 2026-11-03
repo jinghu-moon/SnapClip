@@ -21,26 +21,25 @@ use ::windows::Win32::Graphics::Direct2D::Common::{
     D2D1_PIXEL_FORMAT,
 };
 use ::windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1GaussianBlur, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
-    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2,
-    D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_GAUSSIANBLUR_PROP_BORDER_MODE,
-    D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION, D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION,
-    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_MAP_OPTIONS_READ,
-    D2D1_PROPERTY_TYPE_UNKNOWN,
-    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, ID2D1Bitmap1, ID2D1DeviceContext,
-    ID2D1Brush, ID2D1Effect, ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush, ID2D1RenderTarget,
-    ID2D1SolidColorBrush,
+    CLSID_D2D1GaussianBlur, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+    D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
+    D2D1_BITMAP_PROPERTIES1, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
+    D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_GAUSSIANBLUR_PROP_OPTIMIZATION,
+    D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LAYER_PARAMETERS1,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_MAP_OPTIONS_READ, D2D1_PROPERTY_TYPE_UNKNOWN,
+    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, ID2D1Bitmap1, ID2D1Brush,
+    ID2D1DeviceContext, ID2D1Effect, ID2D1Geometry, ID2D1Image, ID2D1LinearGradientBrush,
+    ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use ::windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use ::windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
 use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use ::windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
@@ -57,24 +56,22 @@ use crate::geometry::{
     Handle, LabelWhere, LevelReach, MagnifierConfig, Point, Rect, SizeLabelPlacement,
     magnifier_geometry,
 };
+use crate::geometry::{
+    REGION_SEGMENT_PAD_DIP, RegionPanelLayout, RegionPanelTarget, SegmentWidths, pill_radius,
+};
 use crate::keymap::LoupeHint;
-use snapclip_ui::font as overlay_font;
+use crate::region::{Delay, Destination, PanelSlot, RATIO_FREE_LABEL, RATIOS, Ratio, RegionField};
 use crate::ring_contrast::{
     ACCENT_RGB, CAPTURE_RGB, CHAIN_RING_RGB, CHAIN_RING_SHADOW, HOVER_WASH_ALPHA, MASK_ALPHA,
     MASK_RGB, MASK_TINT_ALPHA, PREVIEW_WASH_ALPHA, PREVIEW_WASH_WALK_SCALE, Rgb, mix,
 };
 use crate::scroll::layout::Layout;
-use crate::geometry::{
-    REGION_SEGMENT_PAD_DIP, RegionPanelLayout, RegionPanelTarget, SegmentWidths, pill_radius,
-};
-use crate::region::{
-    Delay, Destination, PanelSlot, Ratio, RegionField, RATIOS, RATIO_FREE_LABEL,
-};
 use crate::units::{LabelDisplay, LabelToggle, LengthUnit};
-use snapclip_ui::panel::{Glyph, PanelTheme, Segment, SegmentState, Tag, TagState};
+pub(crate) use guide_pass::{GUIDE_AVOID_DIP, GuideView};
+use snapclip_ui::font as overlay_font;
 use snapclip_ui::panel::TagColors;
 use snapclip_ui::panel::d2d::{PanelPainter, SegmentColors};
-pub(crate) use guide_pass::{GUIDE_AVOID_DIP, GuideView};
+use snapclip_ui::panel::{Glyph, PanelTheme, Segment, SegmentState, Tag, TagState};
 
 /// The font family used for the size label, per the tasklist (§6.3) — the same two families the
 /// overlay's typeface falls back to.
@@ -154,7 +151,6 @@ impl RenderMetrics {
             label_gap: 8.0 * scale,
         }
     }
-
 }
 
 /// One ring of the level chain to paint (docs/21 §5.22), in back-buffer coordinates.
@@ -1049,7 +1045,9 @@ impl OverlayRenderer {
             self.d2d
                 .CreateBitmap(size, None, 0, &Self::dim_bitmap_properties(true))
         }
-        .map_err(|error| super::hresult("ID2D1DeviceContext::CreateBitmap(dim readback)", &error))?;
+        .map_err(|error| {
+            super::hresult("ID2D1DeviceContext::CreateBitmap(dim readback)", &error)
+        })?;
         let (Some(mask), tint) = (self.mask_brush.clone(), self.mask_tint_brush.clone()) else {
             return Err("倒计时遮罩：遮罩画刷未创建".to_owned());
         };
@@ -1164,8 +1162,12 @@ impl OverlayRenderer {
             unsafe { self.d2d.Clear(Some(&color(0.0, 0.0, 0.0, 0.0))) };
             self.draw_selection_frame(view, FrameMarks::EDITING)?;
             let text = self.require_brush(&self.countdown_brush, "countdown brush")?;
-            let format =
-                self.info_text_format_mut(false, COUNTDOWN_DIP, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+            let format = self.info_text_format_mut(
+                false,
+                COUNTDOWN_DIP,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                true,
+            )?;
             self.draw_text_in(&seconds.to_string(), &format, to_d2d(view.selection), &text)?;
             return Ok(());
         }
@@ -1201,7 +1203,9 @@ impl OverlayRenderer {
         // each arc and the corner of its rectangle undimmed (docs/23 §14.55.23). Only when the hole
         // *is* the selection — a hover preview's hole is that window's own rectangle.
         let rounded_hole = (view.corner_radius > 0 && hole == view.selection)
-            .then(|| crate::geometry::radius_cap(hole.width(), hole.height()).min(view.corner_radius))
+            .then(|| {
+                crate::geometry::radius_cap(hole.width(), hole.height()).min(view.corner_radius)
+            })
             .filter(|radius| *radius > 0);
         // The blurred mask (a setting): the frame blurred outside the hole, under the same mask
         // and tint, so the selection is the one sharp thing on screen.
@@ -1748,9 +1752,10 @@ impl OverlayRenderer {
         let border = self.require_brush(&self.border_brush, "border brush")?;
         // 圆角跟着选区走（docs/23 §14.55.21）：半径 0 就是原来的直角框，半径越大弧越明显。
         // 半径上限与手柄布局、图像遮罩共用 `geometry::radius_cap`。
-        let frame_radius = view
-            .corner_radius
-            .min(crate::geometry::radius_cap(selection.width(), selection.height()));
+        let frame_radius = view.corner_radius.min(crate::geometry::radius_cap(
+            selection.width(),
+            selection.height(),
+        ));
         if frame_radius > 0 {
             let inset = (metrics.border_width / 2.0).round() as i32;
             self.stroke_round(
@@ -1929,8 +1934,11 @@ impl OverlayRenderer {
 
         // 收起时右侧是现状摘要；展开时摘要隐去（下面的行本来就在显示它）。
         if !panel.image_open {
-            let format = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
-            let width = self.measure_text_width(&panel.image_summary, &format)?.round() as i32;
+            let format =
+                self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            let width = self
+                .measure_text_width(&panel.image_summary, &format)?
+                .round() as i32;
             let summary = Rect::new(
                 (layout.image_summary.right - width).max(layout.image_summary.left),
                 layout.image_summary.top,
@@ -1942,7 +1950,11 @@ impl OverlayRenderer {
 
         // 折叠箭头：收起指向下、展开指向上。
         let chevron = layout.image_chevron;
-        let (head_dy, tip_dy) = if panel.image_open { (2.0, -2.0) } else { (-2.0, 2.0) };
+        let (head_dy, tip_dy) = if panel.image_open {
+            (2.0, -2.0)
+        } else {
+            (-2.0, 2.0)
+        };
         let head = Point::new(chevron.left, chevron.center().y + dip(head_dy));
         let tip = Point::new(chevron.center().x, chevron.center().y + dip(tip_dy));
         let tail = Point::new(chevron.right, head.y);
@@ -2023,7 +2035,8 @@ impl OverlayRenderer {
         self.stroke_round(layout.panel, big_radius, &line, 1.0);
 
         // ── 页头：标题 / 单位 / 倍率 / 关闭 ─────────────────────────────────
-        let title_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
+        let title_format =
+            self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
         self.draw_text_in("自定义截图", &title_format, to_d2d(layout.title), &text)?;
 
         // 容器由布局给出：两块的并集曾让它与选中块等大，选中背景因此贴着外框（docs/23 §14.55）。
@@ -2056,7 +2069,8 @@ impl OverlayRenderer {
         )?;
 
         self.fill_round(layout.scale, dip(4.0), &fill);
-        let scale_format = self.info_text_format_mut(true, 10.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+        let scale_format =
+            self.info_text_format_mut(true, 10.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
         self.draw_text_in(
             &format!("{}%", (k * 100.0).round() as i32),
             &scale_format,
@@ -2102,7 +2116,8 @@ impl OverlayRenderer {
         if panel.focus == Some(PanelSlot::Ratio) {
             self.stroke_round(layout.ratio, dip(5.0), &accent, 1.5);
         }
-        let ratio_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        let ratio_format =
+            self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
         let ratio_box = Rect::new(
             layout.ratio.left + dip(7.0),
             layout.ratio.top,
@@ -2110,7 +2125,12 @@ impl OverlayRenderer {
             layout.ratio.bottom,
         );
         let ratio_brush = if panel.locked { &accent } else { &muted };
-        self.draw_text_in(&panel.ratio_label, &ratio_format, to_d2d(ratio_box), ratio_brush)?;
+        self.draw_text_in(
+            &panel.ratio_label,
+            &ratio_format,
+            to_d2d(ratio_box),
+            ratio_brush,
+        )?;
         self.draw_glyph(
             Glyph::Chevron,
             centered_square_at(
@@ -2131,13 +2151,20 @@ impl OverlayRenderer {
                 self.stroke_round(rect, dip(5.0), &accent, 2.0);
             }
             if let Some(icon) = action_icon(slot) {
-                self.draw_glyph(icon, centered_square(rect, dip(PANEL_ICON_DIP)), &muted, false)?;
+                self.draw_glyph(
+                    icon,
+                    centered_square(rect, dip(PANEL_ICON_DIP)),
+                    &muted,
+                    false,
+                )?;
             }
         }
 
         // ── 四个数字：下划线是它的边，聚焦转主色、非法转红 ────────────────
-        let number_format = self.info_text_format_mut(true, 20.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
-        let label_format = self.info_text_format_mut(false, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+        let number_format =
+            self.info_text_format_mut(true, 20.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+        let label_format =
+            self.info_text_format_mut(false, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
         for (index, (field, rect)) in layout.fields.iter().enumerate() {
             let invalid = panel.invalid[index];
             let focused = panel.focus == Some(field.slot());
@@ -2212,22 +2239,40 @@ impl OverlayRenderer {
         // ── 去向行：标签 + 复制/贴图（比例按钮已搬进尺寸卡头）+ 延时四段 ─────
         let row_label_format =
             self.info_text_format_mut(false, 10.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, false)?;
-        self.draw_text_in("去向", &row_label_format, to_d2d(layout.destination_label), &muted)?;
-        self.draw_text_in("角标", &row_label_format, to_d2d(layout.toggle_label), &muted)?;
-        self.draw_text_in("延时", &row_label_format, to_d2d(layout.delay_label), &muted)?;
+        self.draw_text_in(
+            "去向",
+            &row_label_format,
+            to_d2d(layout.destination_label),
+            &muted,
+        )?;
+        self.draw_text_in(
+            "角标",
+            &row_label_format,
+            to_d2d(layout.toggle_label),
+            &muted,
+        )?;
+        self.draw_text_in(
+            "延时",
+            &row_label_format,
+            to_d2d(layout.delay_label),
+            &muted,
+        )?;
 
         // 去向与单位、延时共用同一份分段器绘制（docs/23 §14.55.4）。
         let destination_segments: Vec<(Rect, &str, bool)> = layout
             .destination
             .iter()
-            .map(|(destination, rect)| (*rect, destination.label(), *destination == panel.destination))
+            .map(|(destination, rect)| {
+                (
+                    *rect,
+                    destination.label(),
+                    *destination == panel.destination,
+                )
+            })
             .collect();
-        let destination_hovered = layout
-            .destination
-            .iter()
-            .position(|(destination, _)| {
-                panel.hover == Some(RegionPanelTarget::Destination(*destination))
-            });
+        let destination_hovered = layout.destination.iter().position(|(destination, _)| {
+            panel.hover == Some(RegionPanelTarget::Destination(*destination))
+        });
         self.draw_segmented(
             layout.destination_track,
             &destination_segments,
@@ -2277,7 +2322,8 @@ impl OverlayRenderer {
         )?;
 
         // ── 角标行：三个可选标签 + 角标预览 ───────────────────────────────
-        let toggle_format = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+        let toggle_format =
+            self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
         for (toggle, rect) in layout.toggles {
             let on = panel
                 .toggles
@@ -2315,10 +2361,13 @@ impl OverlayRenderer {
         // 预览标签也是胶囊：与角标、方向芯片共用同一套半径算法。
 
         // ── 页脚：一句话 + 取消 / 确定 ─────────────────────────────────
-        let status_format = self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+        let status_format =
+            self.info_text_format_mut(false, 11.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
         match panel.status.as_deref() {
             // 有校验错误：红字占这个槽（读数让位）。
-            Some(status) => self.draw_text_in(status, &status_format, to_d2d(layout.status), &danger)?,
+            Some(status) => {
+                self.draw_text_in(status, &status_format, to_d2d(layout.status), &danger)?
+            }
             // 没有错误：这一张会去哪、出多大。
             None => self.draw_text_in(
                 &panel.readout,
@@ -2340,7 +2389,8 @@ impl OverlayRenderer {
         if panel.focus == Some(PanelSlot::Cancel) {
             self.stroke_round(layout.cancel, dip(6.0), &accent, 2.0);
         }
-        let button_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
+        let button_format =
+            self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, true)?;
         self.draw_image_card(panel)?;
         self.draw_text_in("取消", &button_format, to_d2d(layout.cancel), &text)?;
 
@@ -2354,7 +2404,8 @@ impl OverlayRenderer {
         if panel.focus == Some(PanelSlot::Start) {
             self.stroke_round(layout.start, dip(6.0), &accent, 2.0);
         }
-        let start_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
+        let start_format =
+            self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, true)?;
         let start_text_brush = if panel.can_start { &text } else { &muted };
         // 按钮文案随去向走（复制 / 贴图），仍是同一个 `PanelSlot::Start`。
         self.draw_text_in(
@@ -2368,7 +2419,8 @@ impl OverlayRenderer {
         if let Some(menu) = layout.menu {
             self.fill_round(menu, dip(10.0), &surface);
             self.stroke_round(menu, dip(10.0), &line, 1.0);
-            let name_format = self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
+            let name_format =
+                self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
             for (index, item) in layout.menu_items.iter().enumerate() {
                 let selected = panel.ratio_selected == index;
                 let hovered = panel.hover == Some(RegionPanelTarget::MenuItem(index));
@@ -2585,9 +2637,8 @@ impl OverlayRenderer {
         // collide, keep the loupe attached to the sampling cursor and move the label to
         // the next valid ladder rung instead of letting one cover the other.
         let avoid = loupe_obstacle(view, metrics);
-        let overlaps = |rect: Rect| {
-            avoid.is_some_and(|obstacle| !rect.intersect(obstacle).is_empty())
-        };
+        let overlaps =
+            |rect: Rect| avoid.is_some_and(|obstacle| !rect.intersect(obstacle).is_empty());
         if !overlaps(primary.rect) {
             return Some(primary);
         }
@@ -2598,7 +2649,10 @@ impl OverlayRenderer {
             let max_left = (work_area.right - width).max(work_area.left);
             let max_top = (work_area.bottom - height).max(work_area.top);
             let rect = Rect::from_origin_size(
-                Point::new(left.clamp(work_area.left, max_left), top.clamp(work_area.top, max_top)),
+                Point::new(
+                    left.clamp(work_area.left, max_left),
+                    top.clamp(work_area.top, max_top),
+                ),
                 width,
                 height,
             );
@@ -2642,7 +2696,8 @@ impl OverlayRenderer {
         let title = self.require_brush(&self.scroll_title_brush, "scroll title brush")?;
         let muted = self.require_brush(&self.scroll_muted_brush, "scroll muted brush")?;
         let button = self.require_brush(&self.scroll_button_brush, "scroll button brush")?;
-        let badge_background = self.require_brush(&self.scroll_badge_brush, "scroll badge brush")?;
+        let badge_background =
+            self.require_brush(&self.scroll_badge_brush, "scroll badge brush")?;
         let fade = self
             .scroll_fade_brush
             .clone()
@@ -2682,7 +2737,8 @@ impl OverlayRenderer {
         );
         unsafe {
             // Square corners like everything else on the panel.
-            self.d2d.FillRectangle(&to_d2d(layout.badge), &badge_background);
+            self.d2d
+                .FillRectangle(&to_d2d(layout.badge), &badge_background);
         }
         self.draw_text_in(&scroll.size, &size_format, to_d2d(badge), &title)?;
 
@@ -3160,7 +3216,8 @@ impl OverlayRenderer {
         let ratio_format =
             self.info_text_format_mut(false, 12.0, DWRITE_FONT_WEIGHT_NORMAL, false)?;
         let mut ratio_label = 0.0f32;
-        for label in std::iter::once(RATIO_FREE_LABEL).chain(RATIOS.iter().map(|ratio| ratio.name)) {
+        for label in std::iter::once(RATIO_FREE_LABEL).chain(RATIOS.iter().map(|ratio| ratio.name))
+        {
             ratio_label = ratio_label.max(self.measure_text_width(label, &ratio_format)?);
         }
         // 菜单：最宽项 + 26 的检查位 + 10 的右内边距 + 5×2 的菜单内边距（与绘制同一个算式）。
@@ -3311,7 +3368,8 @@ impl OverlayRenderer {
         self.scroll_title_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 1.0))?);
         self.scroll_muted_brush = Some(self.create_brush(&rgba(232, 236, 242, 0.62))?);
         self.scroll_button_brush = Some(self.create_brush(&color(1.0, 1.0, 1.0, 0.08))?);
-        self.scroll_badge_brush = Some(self.create_brush(&color(0.0, 0.0, 0.0, SCROLL_BADGE_OPACITY))?);
+        self.scroll_badge_brush =
+            Some(self.create_brush(&color(0.0, 0.0, 0.0, SCROLL_BADGE_OPACITY))?);
         let stops = [
             D2D1_GRADIENT_STOP {
                 position: 0.0,

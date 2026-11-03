@@ -20,7 +20,6 @@ use super::row_band_png::{ExportError, ImageMeta};
 use super::save_format::SaveFormat;
 use super::webp_sink::WebpSink;
 
-
 /// What a conversion did, for the caller's log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversion {
@@ -41,18 +40,17 @@ pub fn convert(
     quality: u8,
     mut out: impl Write,
 ) -> Result<Conversion, ExportError> {
-    let file = File::open(master).map_err(|error| {
-        ExportError::Sink(format!("the PNG master cannot be opened: {error}"))
-    })?;
+    let file = File::open(master)
+        .map_err(|error| ExportError::Sink(format!("the PNG master cannot be opened: {error}")))?;
 
     // PNG to PNG is a copy: decoding and re-encoding a lossless file would spend seconds to
     // produce a different file with the same pixels.
     if format == SaveFormat::Png {
         let mut reader = BufReader::new(file);
         let mut buffer = Vec::new();
-        reader
-            .read_to_end(&mut buffer)
-            .map_err(|error| ExportError::Sink(format!("the PNG master cannot be read: {error}")))?;
+        reader.read_to_end(&mut buffer).map_err(|error| {
+            ExportError::Sink(format!("the PNG master cannot be read: {error}"))
+        })?;
         out.write_all(&buffer)
             .map_err(|error| ExportError::Sink(format!("the copy cannot be written: {error}")))?;
         out.flush()
@@ -70,9 +68,9 @@ pub fn convert(
     // No transformations: the master is written by our own sink as straight RGBA8, and a
     // silent palette or 16-bit expansion would change what the encoder sees.
     decoder.set_transformations(png::Transformations::IDENTITY);
-    let mut reader = decoder
-        .read_info()
-        .map_err(|error| ExportError::Sink(format!("the PNG master has no readable header: {error}")))?;
+    let mut reader = decoder.read_info().map_err(|error| {
+        ExportError::Sink(format!("the PNG master has no readable header: {error}"))
+    })?;
     // Copies, not a borrow: `next_row` needs the reader mutably once the loop starts.
     let (png_width, png_height, color, depth) = {
         let info = reader.info();
@@ -83,14 +81,18 @@ pub fn convert(
         height: u64::from(png_height),
     };
     if meta.width == 0 || meta.height == 0 {
-        return Err(ExportError::Sink("the PNG master is 0 pixels wide or high".into()));
+        return Err(ExportError::Sink(
+            "the PNG master is 0 pixels wide or high".into(),
+        ));
     }
     // The formats' own limits are checked before anything is allocated (`can_encode` is the
     // same rule the scroll session asks before it starts scrolling).
-    format.can_encode(meta.width, meta.height).map_err(|_| ExportError::TooLarge {
-        width: meta.width,
-        height: meta.height,
-    })?;
+    format
+        .can_encode(meta.width, meta.height)
+        .map_err(|_| ExportError::TooLarge {
+            width: meta.width,
+            height: meta.height,
+        })?;
 
     let mut writer = SinkWriter::begin(format, quality, &meta)?;
     let mut row = vec![0u8; row_bytes(png_width, color, depth)?];
@@ -141,8 +143,9 @@ pub fn convert_to_file(
     quality: u8,
 ) -> Result<Conversion, ExportError> {
     let temporary = out.with_extension("partial");
-    let file = File::create(&temporary)
-        .map_err(|error| ExportError::Sink(format!("the destination cannot be created: {error}")))?;
+    let file = File::create(&temporary).map_err(|error| {
+        ExportError::Sink(format!("the destination cannot be created: {error}"))
+    })?;
     let conversion = convert(master, format, quality, BufWriter::new(file));
     match conversion {
         Ok(conversion) => {
@@ -163,7 +166,9 @@ fn png_size(master: &Path) -> Result<(u64, u64), ExportError> {
         .map_err(|error| ExportError::Sink(format!("the PNG master cannot be opened: {error}")))?;
     let reader = png::Decoder::new(BufReader::new(file))
         .read_info()
-        .map_err(|error| ExportError::Sink(format!("the PNG master has no readable header: {error}")))?;
+        .map_err(|error| {
+            ExportError::Sink(format!("the PNG master has no readable header: {error}"))
+        })?;
     let info = reader.info();
     Ok((u64::from(info.width), u64::from(info.height)))
 }
@@ -180,7 +185,7 @@ fn row_bytes(
         other => {
             return Err(ExportError::Sink(format!(
                 "the PNG master is {other:?}, and every artifact we write is RGB or RGBA"
-            )))
+            )));
         }
     };
     if depth != png::BitDepth::Eight {
@@ -267,8 +272,9 @@ impl SinkWriter {
             // Already on disk, so there is nothing left to copy.
             Self::Bmp(writer) => return writer.finish(out),
         };
-        out.write_all(&bytes)
-            .map_err(|error| ExportError::Sink(format!("the artifact cannot be written: {error}")))?;
+        out.write_all(&bytes).map_err(|error| {
+            ExportError::Sink(format!("the artifact cannot be written: {error}"))
+        })?;
         Ok(bytes.len() as u64)
     }
 }
@@ -339,7 +345,11 @@ mod tests {
         let decoded = ::image::load_from_memory_with_format(&out, ::image::ImageFormat::Jpeg)
             .expect("jpeg decodes");
         assert_eq!((decoded.width(), decoded.height()), (32, 24));
-        assert_eq!(decoded.color(), ::image::ColorType::Rgb8, "JPEG has no alpha");
+        assert_eq!(
+            decoded.color(),
+            ::image::ColorType::Rgb8,
+            "JPEG has no alpha"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -416,14 +426,15 @@ mod tests {
             bytes.truncate(bytes.len() / 2);
             bytes
         });
-        let destination = std::env::temp_dir().join(format!(
-            "snapclip-convert-out-{}.jpg",
-            std::process::id()
-        ));
+        let destination =
+            std::env::temp_dir().join(format!("snapclip-convert-out-{}.jpg", std::process::id()));
         let _ = std::fs::remove_file(&destination);
         let result = convert_to_file(&path, &destination, SaveFormat::Jpeg, 92);
         assert!(result.is_err(), "a corrupt master cannot convert");
-        assert!(!destination.exists(), "a failure must not leave an artifact");
+        assert!(
+            !destination.exists(),
+            "a failure must not leave an artifact"
+        );
         assert!(
             !destination.with_extension("partial").exists(),
             "a failure must not leave its temporary either"
@@ -434,7 +445,11 @@ mod tests {
     /// BMP decoder and adding one to serve a test would be the wrong trade, so the test walks the
     /// header it already knows the shape of.
     fn read_bmp(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
-        assert_eq!(&bytes[0..2], b"BM", "the file starts with the BMP signature");
+        assert_eq!(
+            &bytes[0..2],
+            b"BM",
+            "the file starts with the BMP signature"
+        );
         let file_bytes = u32::from_le_bytes(bytes[2..6].try_into().expect("a size"));
         let offset = u32::from_le_bytes(bytes[10..14].try_into().expect("an offset"));
         let header = u32::from_le_bytes(bytes[14..18].try_into().expect("a header size"));
@@ -443,8 +458,15 @@ mod tests {
         let height = i32::from_le_bytes(bytes[22..26].try_into().expect("a height"));
         let bits = u16::from_le_bytes(bytes[28..30].try_into().expect("a bit count"));
         assert_eq!(bits, 32, "32 bits per pixel");
-        assert!(height < 0, "a negative height is what makes the rows top-down");
-        assert_eq!(file_bytes as usize, bytes.len(), "the header counts the file exactly");
+        assert!(
+            height < 0,
+            "a negative height is what makes the rows top-down"
+        );
+        assert_eq!(
+            file_bytes as usize,
+            bytes.len(),
+            "the header counts the file exactly"
+        );
         let pixels = bytes[offset as usize..].to_vec();
         assert_eq!(pixels.len(), (width * -height * 4) as usize);
         (width as u32, (-height) as u32, pixels)
@@ -476,12 +498,20 @@ mod tests {
         };
         let mut buffer = Vec::new();
         let mut writer = BmpRowBandWriter::begin(&meta).expect("a writer");
-        writer.write_rows(0, &top, &mut buffer).expect("the first row");
-        writer.write_rows(1, &bottom, &mut buffer).expect("the second row");
+        writer
+            .write_rows(0, &top, &mut buffer)
+            .expect("the first row");
+        writer
+            .write_rows(1, &bottom, &mut buffer)
+            .expect("the second row");
         let total = writer.finish(&mut buffer).expect("the file");
         assert_eq!(total, buffer.len() as u64);
         let (_, _, pixels) = read_bmp(&buffer);
-        assert_eq!(&pixels[..16], &top[..], "the first row written is the first row stored");
+        assert_eq!(
+            &pixels[..16],
+            &top[..],
+            "the first row written is the first row stored"
+        );
     }
 
     #[test]

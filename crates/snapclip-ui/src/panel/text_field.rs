@@ -312,7 +312,11 @@ mod tests {
     #[test]
     fn a_new_field_keeps_the_digits_and_nothing_else() {
         assert_eq!(TextField::new("1341").text(), "1341");
-        assert_eq!(TextField::new(" 13a4b1 ").text(), "1341", "letters and spaces go");
+        assert_eq!(
+            TextField::new(" 13a4b1 ").text(),
+            "1341",
+            "letters and spaces go"
+        );
         assert_eq!(TextField::new("").text(), "");
         assert_eq!(
             TextField::new("1234567890").text(),
@@ -368,7 +372,10 @@ mod tests {
         full.move_end();
         assert!(full.insert("567890"), "only what fits is taken");
         assert_eq!(full.text(), "1234567");
-        assert!(!full.insert("8"), "a full field refuses rather than overflows");
+        assert!(
+            !full.insert("8"),
+            "a full field refuses rather than overflows"
+        );
     }
 
     #[test]
@@ -419,7 +426,11 @@ mod tests {
         assert_eq!(at_bottom.text(), "1", "a size cannot go below one pixel");
         let mut empty = TextField::new("");
         empty.step(1);
-        assert_eq!(empty.text(), "1", "an empty field steps from the smallest size");
+        assert_eq!(
+            empty.text(),
+            "1",
+            "an empty field steps from the smallest size"
+        );
         let mut at_top = TextField::new("9999999");
         at_top.step(10);
         assert_eq!(at_top.text(), "9999999", "and stops at the largest");
@@ -438,7 +449,11 @@ mod tests {
         assert_eq!(large.text(), "4096");
         let mut inside = TextField::new("800");
         inside.clamp_to(1, 4096);
-        assert_eq!(inside.text(), "800", "a number inside the range is left alone");
+        assert_eq!(
+            inside.text(),
+            "800",
+            "a number inside the range is left alone"
+        );
     }
 
     #[test]
@@ -447,7 +462,11 @@ mod tests {
         field.set_text("672");
         assert_eq!(field.text(), "672");
         assert_eq!(field.caret(), 3);
-        assert_eq!(field.selection(), None, "the whole text is what the caller said");
+        assert_eq!(
+            field.selection(),
+            None,
+            "the whole text is what the caller said"
+        );
         assert!(field.focused(), "writing a number is not losing the focus");
     }
 

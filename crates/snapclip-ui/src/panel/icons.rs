@@ -316,8 +316,16 @@ mod tests {
         // One white pixel and one transparent one, in the order icon-bake writes them.
         let rgba = [255, 255, 255, 255, 255, 255, 255, 0];
         let out = tint_rgba_to_premultiplied_bgra(&rgba, [94, 162, 245, 255]);
-        assert_eq!(&out[0..4], &[245, 162, 94, 255], "the ink takes the colour, blue first");
-        assert_eq!(&out[4..8], &[0, 0, 0, 0], "a transparent pixel stays transparent");
+        assert_eq!(
+            &out[0..4],
+            &[245, 162, 94, 255],
+            "the ink takes the colour, blue first"
+        );
+        assert_eq!(
+            &out[4..8],
+            &[0, 0, 0, 0],
+            "a transparent pixel stays transparent"
+        );
     }
 
     #[test]
@@ -326,8 +334,14 @@ mod tests {
         let rgba = [255, 255, 255, 128];
         let out = tint_rgba_to_premultiplied_bgra(&rgba, [94, 162, 245, 255]);
         assert_eq!(out[3], 128, "alpha is carried through");
-        assert_eq!(out[2], 47, "red is tinted to 94 and then halved: 94 * 128 / 255");
-        assert_eq!(out[0], 122, "blue is tinted to 245 and then halved: 245 * 128 / 255");
+        assert_eq!(
+            out[2], 47,
+            "red is tinted to 94 and then halved: 94 * 128 / 255"
+        );
+        assert_eq!(
+            out[0], 122,
+            "blue is tinted to 245 and then halved: 245 * 128 / 255"
+        );
     }
 
     /// Half a turn is a corner-to-corner read, and doing it twice is doing nothing — which is the
@@ -404,6 +418,9 @@ mod tests {
                 );
             }
         }
-        assert_eq!(pixels[3], 0, "the corner outside the rounded mask stays empty");
+        assert_eq!(
+            pixels[3], 0,
+            "the corner outside the rounded mask stays empty"
+        );
     }
 }

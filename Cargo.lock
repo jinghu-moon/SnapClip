@@ -1435,7 +1435,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.3",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1654,7 +1654,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2234,7 +2234,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.21",
- "windows 0.62.2",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -2728,6 +2728,7 @@ dependencies = [
  "gpui-pre-shared-string",
  "gpui-pre-sum-tree",
  "gpui-pre-util",
+ "half",
  "heapless",
  "image",
  "inventory",
@@ -3159,8 +3160,6 @@ dependencies = [
 [[package]]
 name = "gpui-pre-windows"
 version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "513d4f0fc7d596d3bdef2a73a524ffb83dabc95bf484f2855a698e7f431290a9"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -3172,6 +3171,7 @@ dependencies = [
  "gpui-pre-collections",
  "gpui-pre-scheduler",
  "gpui-pre-util",
+ "half",
  "image",
  "itertools 0.14.0",
  "log",
@@ -3502,7 +3502,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -5590,7 +5590,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6172,7 +6172,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6706,18 +6706,16 @@ name = "snapclip-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arboard",
  "async-channel",
  "blake3",
- "encoding_rs",
  "enough",
  "gpui-kit",
  "image",
  "png 0.18.1",
- "rclip-rtf",
  "serde",
  "serde_json",
  "snapclip-capture",
+ "snapclip-clipboard",
  "snapclip-history",
  "snapclip-model",
  "snapclip-pin",
@@ -6745,6 +6743,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "snapclip-clipboard"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "blake3",
+ "encoding_rs",
+ "html5ever",
+ "image",
+ "markup5ever_rcdom",
+ "png 0.18.1",
+ "rclip-rtf",
+ "serde_json",
+ "snapclip-model",
+ "url",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "snapclip-history"
 version = "0.1.0"
 dependencies = [
@@ -6753,9 +6769,9 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "snapclip-clipboard",
  "snapclip-model",
  "thiserror 2.0.21",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6771,11 +6787,16 @@ name = "snapclip-pin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
+ "gpui-kit",
+ "image",
  "parking_lot",
  "png 0.18.1",
+ "raw-window-handle",
  "snapclip-model",
  "snapclip-ui",
  "windows-sys 0.59.0",
+ "yue-component",
 ]
 
 [[package]]
@@ -6794,7 +6815,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7083,7 +7104,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7471,7 +7492,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8381,7 +8402,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -9209,7 +9230,11 @@ name = "yue-component"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "half",
+ "image",
  "lyon",
+ "moxcms",
+ "png 0.18.1",
  "yue-component-icons",
 ]
 

@@ -52,7 +52,7 @@ pub fn resolve_source(snapshot: SourceWindowSnapshot) -> Option<SourceAppInfo> {
     resolve_from_hwnd(foreground, self_pid)
 }
 
-pub fn resolve_from_hwnd(hwnd: HWND, self_pid: u32) -> Option<SourceAppInfo> {
+fn resolve_from_hwnd(hwnd: HWND, self_pid: u32) -> Option<SourceAppInfo> {
     if hwnd.is_null() {
         return None;
     }
@@ -104,16 +104,16 @@ unsafe fn resolve_uwp_exe(hwnd: HWND, exe_path: &str) -> Option<String> {
         let data = unsafe { &mut *(lparam as *mut CallbackData) };
         let mut child_pid: u32 = 0;
         unsafe { GetWindowThreadProcessId(child, &mut child_pid) };
-        if child_pid != 0 && child_pid != data.host_pid {
-            if let Some(path) = unsafe { exe_path_from_pid(child_pid) } {
-                let name = Path::new(&path)
-                    .file_name()
-                    .and_then(|value| value.to_str());
-                if !name.is_some_and(|value| value.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
-                {
-                    data.found_path = Some(path);
-                    return 0;
-                }
+        if child_pid != 0
+            && child_pid != data.host_pid
+            && let Some(path) = unsafe { exe_path_from_pid(child_pid) }
+        {
+            let name = Path::new(&path)
+                .file_name()
+                .and_then(|value| value.to_str());
+            if !name.is_some_and(|value| value.eq_ignore_ascii_case("ApplicationFrameHost.exe")) {
+                data.found_path = Some(path);
+                return 0;
             }
         }
         1

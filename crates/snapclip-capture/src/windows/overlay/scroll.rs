@@ -83,9 +83,8 @@ fn trace_preview(preview: &crate::scroll::Preview, layout: &Layout) {
     static LAST_ROWS: AtomicU32 = AtomicU32::new(u32::MAX);
     let rows = preview.rows;
     let last = LAST_ROWS.swap(rows, Ordering::Relaxed);
-    let worth_it = last == u32::MAX
-        || rows.abs_diff(last) >= 64
-        || DUMPS.load(Ordering::Relaxed) < 4;
+    let worth_it =
+        last == u32::MAX || rows.abs_diff(last) >= 64 || DUMPS.load(Ordering::Relaxed) < 4;
     if worth_it {
         DUMPS.fetch_add(1, Ordering::Relaxed);
     }
@@ -126,7 +125,8 @@ fn write_preview_bmp(preview: &crate::scroll::Preview, image_row: u32) -> Option
         let from = row * width * 4;
         bmp.extend_from_slice(&preview.bytes[from..from + width * 4]);
     }
-    let path = std::env::temp_dir().join(format!("snapclip-thumb-{image_row}-{width}x{height}.bmp"));
+    let path =
+        std::env::temp_dir().join(format!("snapclip-thumb-{image_row}-{width}x{height}.bmp"));
     std::fs::write(&path, &bmp).ok()?;
     Some(path.display().to_string())
 }
@@ -358,7 +358,8 @@ impl OverlayController {
             run.image_rows = preview.image_rows;
             // The pixels are in D2D's bitmap now, so the capture thread can gather the next
             // thumbnail straight into this buffer instead of allocating a new one per frame.
-            run.worker.recycle_preview(std::mem::take(&mut preview.bytes));
+            run.worker
+                .recycle_preview(std::mem::take(&mut preview.bytes));
         }
         run.status = report.status;
         run.auto = report.auto;
@@ -455,7 +456,10 @@ impl OverlayController {
         Box::new(move |job: &ExportJob| {
             // A scroll session's long image reaches the writer as bands; a screenshot arrives whole.
             // This is the step that keeps thirty thousand rows out of memory on the file path.
-            let mut source = job.source.lock().expect("the export source is never poisoned");
+            let mut source = job
+                .source
+                .lock()
+                .expect("the export source is never poisoned");
             let artifact = match source.spec() {
                 Some(spec) => {
                     let bands = source
@@ -471,7 +475,9 @@ impl OverlayController {
                 }
                 None => {
                     let prepared = source.pixels().ok_or_else(|| {
-                        CaptureError::EncodeFailed("an export carried neither pixels nor bands".into())
+                        CaptureError::EncodeFailed(
+                            "an export carried neither pixels nor bands".into(),
+                        )
                     })?;
                     writer.write(
                         &job.session_id,
@@ -586,11 +592,11 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         use super::super::{ExportJob, OverlayController, SCROLL_PROVIDER};
-        use crate::session::CapturedFrame;
-        use crate::windows::export_worker::ExportSource;
         use crate::artifact::SelectionPixels;
         use crate::geometry::Rect;
         use crate::ports::{ArtifactWriter, ClipboardWriter};
+        use crate::session::CapturedFrame;
+        use crate::windows::export_worker::ExportSource;
         use crate::{CaptureError, CaptureResult, PixelFormat};
         use snapclip_model::{CaptureArtifact, CapturePayload};
 
@@ -671,8 +677,8 @@ mod tests {
                 generation: 1,
                 session_id: "s1".into(),
                 source: Mutex::new(ExportSource::whole(SelectionPixels {
-            // 拼接长图没有四角可言：圆角是面板对单帧选区的要求。
-            corner_radius: 0,
+                    // 拼接长图没有四角可言：圆角是面板对单帧选区的要求。
+                    corner_radius: 0,
                     frame: CapturedFrame {
                         width,
                         height: rows,
@@ -768,8 +774,10 @@ mod tests {
                     _monitor_device_name: Option<String>,
                 ) -> CaptureResult<CaptureArtifact> {
                     self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    self.rows
-                        .store(crate::ports::BandSource::rows(bands), std::sync::atomic::Ordering::SeqCst);
+                    self.rows.store(
+                        crate::ports::BandSource::rows(bands),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
                     Ok(CaptureArtifact {
                         session_id: session_id.into(),
                         width: spec.region.width() as u32,
@@ -786,7 +794,8 @@ mod tests {
             }
             let writer = Arc::new(Bands::default());
             let clipboard = Arc::new(Recorder::default());
-            let executor = OverlayController::scroll_executor(writer.clone(), clipboard, Ok(scratch("bands")));
+            let executor =
+                OverlayController::scroll_executor(writer.clone(), clipboard, Ok(scratch("bands")));
             let bands = crate::scroll::test_bands();
             let expected = crate::ports::BandSource::rows(&bands);
             let job = ExportJob {
@@ -800,7 +809,10 @@ mod tests {
             };
             executor(&job).expect("the banded write succeeds");
             assert_eq!(writer.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-            assert_eq!(writer.rows.load(std::sync::atomic::Ordering::SeqCst), expected);
+            assert_eq!(
+                writer.rows.load(std::sync::atomic::Ordering::SeqCst),
+                expected
+            );
         }
 
         /// A desktop that cannot be resolved does not withhold the clipboard or the history entry.

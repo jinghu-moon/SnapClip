@@ -180,10 +180,9 @@ impl SettingsView {
                     .children(LABEL_UNITS.map(|unit| self.unit_radio(unit, cx))),
             )
             .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .child("dp = px ÷ 屏幕缩放：150% 显示器上 1500 px = 1000 dp；尺寸和坐标一起换算"),
+                div().text_xs().text_color(muted).child(
+                    "dp = px ÷ 屏幕缩放：150% 显示器上 1500 px = 1000 dp；尺寸和坐标一起换算",
+                ),
             )
             .children(self.result(LABEL_UNIT_ID, muted))
     }

@@ -286,7 +286,11 @@ impl Win32Renderer {
     /// The badge's rectangle is the pointer's way into the custom-region panel (docs/23 §14.54), so
     /// "the badge the user aims at" and "the badge the user sees" being the same rectangle has to be
     /// structural, not two pieces of arithmetic that happen to agree today.
-    fn view(&self, state: &OverlayFrameState, annotations: Option<&AnnotationDocument>) -> RenderView {
+    fn view(
+        &self,
+        state: &OverlayFrameState,
+        annotations: Option<&AnnotationDocument>,
+    ) -> RenderView {
         // Build the RenderView. Prefer live borrow when available.
         let live_items: Vec<AnnotationItem> = annotations
             .map(|d| d.items().to_vec())

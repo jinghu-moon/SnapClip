@@ -21,8 +21,8 @@ pub(crate) mod stats;
 pub mod store;
 pub(crate) mod thumb;
 
-use estimate::{Estimate, FrameSig, estimate};
 use backed::BackedCanvas;
+use estimate::{Estimate, FrameSig, estimate};
 use stitch::{CanvasStore, Placement, Stitcher};
 use thumb::Thumb;
 
@@ -133,7 +133,7 @@ pub(crate) fn scroll_format(
     crate::save_format::SaveFormat,
     Option<crate::save_format::Lowering>,
 ) {
-    use crate::save_format::{within_jpeg_frame_budget, Lowering, SaveFormat};
+    use crate::save_format::{Lowering, SaveFormat, within_jpeg_frame_budget};
 
     let rows = row_limit(width, view, MAX_BYTES);
     if let Err(limit) = preferred.can_encode(u64::from(width), u64::from(rows)) {
@@ -196,7 +196,13 @@ impl Tracker {
     /// without allocating half a gigabyte.
     fn with_rows(first: &[u8], width: u32, view: u32, thumb_width: u32, max_rows: u32) -> Self {
         let stitcher = Stitcher::with_store(
-            BackedCanvas::new(first, width, view, max_rows),
+            BackedCanvas::new(
+                first,
+                width,
+                view,
+                max_rows,
+                snapclip_model::PixelFormat::Bgra8Unorm,
+            ),
             width,
             view,
         );
@@ -304,7 +310,11 @@ impl Tracker {
         let bytes = ((last - first) as usize) * (self.width as usize * 4);
         self.band.clear();
         self.band.resize(bytes, 0);
-        if let Err(error) = self.stitcher.store().read_rows(first, last - first, &mut self.band) {
+        if let Err(error) = self
+            .stitcher
+            .store()
+            .read_rows(first, last - first, &mut self.band)
+        {
             // A stale preview is a cosmetic problem; a zeroed one would look like content.
             eprintln!("[snapclip][scroll] the preview cannot be refreshed: {error}");
             return;
@@ -413,7 +423,9 @@ impl Tracker {
     }
 
     /// The long image: `(width, rows, bgra)`.
-    pub(crate) fn into_image(self) -> Result<(u32, u32, Vec<u8>), crate::scroll::store::RowReadError> {
+    pub(crate) fn into_image(
+        self,
+    ) -> Result<(u32, u32, Vec<u8>), crate::scroll::store::RowReadError> {
         let rows = self.stitcher.rows();
         let width = self.width;
         let mut store = self.stitcher.into_store();
@@ -445,11 +457,14 @@ mod tests {
         let mut tracker = Tracker::new(&frame_at(&page, 0, 0), W, H, 40);
         for (tick, top) in [64u32, 128, 192, 256, 320].into_iter().enumerate() {
             tracker.push(&frame_at(&page, top, tick as u32 + 1));
-            assert_eq!(tracker.status(), Status::Tracking, "the sequence must keep tracking");
+            assert_eq!(
+                tracker.status(),
+                Status::Tracking,
+                "the sequence must keep tracking"
+            );
         }
         ScrollBands::new(tracker)
     }
-
 
     /// The store used to zero the rows it could not read and still report success, which is how a
     /// picture ends up with a hole in it (docs/36 §12.1).
@@ -482,11 +497,11 @@ mod tests {
         assert!(!ok, "the port must refuse rows it could not read");
     }
 
+    use super::ScrollBands;
     use super::estimate::tests::{page, shift_of, window};
     use super::estimate::{FrameSig, estimate};
     use super::stitch::Placement;
     use super::{MAX_SCREENS, Status, Tracker, row_limit};
-    use super::ScrollBands;
 
     const W: u32 = 120;
     const H: u32 = 200;
@@ -691,7 +706,11 @@ mod tests {
         let refused = tracker.push(&window(&page, w, (step + 1) * 100, view));
         assert_eq!(refused.placement, Some(Placement::Full));
         assert_eq!(tracker.status(), Status::Full);
-        assert_eq!(tracker.image_rows(), 16300, "a refused push changes nothing");
+        assert_eq!(
+            tracker.image_rows(),
+            16300,
+            "a refused push changes nothing"
+        );
         let still_refused = tracker.push(&window(&page, w, (step + 2) * 100, view));
         assert_eq!(still_refused.placement, Some(Placement::Full));
     }
@@ -762,7 +781,9 @@ mod tests {
             let measured = estimate(&tracker.reference, &signature);
             estimate_us.push(started.elapsed().as_micros());
             let started = std::time::Instant::now();
-            let placement = tracker.stitcher.place(&frame, shift_of(measured).unwrap_or(0));
+            let placement = tracker
+                .stitcher
+                .place(&frame, shift_of(measured).unwrap_or(0));
             place_us.push(started.elapsed().as_micros());
             if let Placement::Appended { band, .. } = placement {
                 let rows = tracker.stitcher.rows();
@@ -916,7 +937,10 @@ pub mod probe {
                 grow_bytes: after.grow_bytes - before.grow_bytes,
                 shift_bytes: after.shift_bytes - before.shift_bytes,
                 band_bytes: after.band_bytes - before.band_bytes,
-                appended: matches!(step.placement, Some(super::stitch::Placement::Appended { .. })),
+                appended: matches!(
+                    step.placement,
+                    Some(super::stitch::Placement::Appended { .. })
+                ),
                 prepended: matches!(
                     step.placement,
                     Some(super::stitch::Placement::Prepended { .. })
@@ -950,7 +974,11 @@ pub mod probe {
         pub fn image(&self) -> Vec<u8> {
             let rows = self.tracker.stitcher.rows();
             let mut out = vec![0u8; (self.tracker.width() * rows * 4) as usize];
-            self.tracker.stitcher.store().read_rows(0, rows, &mut out).expect("rows");
+            self.tracker
+                .stitcher
+                .store()
+                .read_rows(0, rows, &mut out)
+                .expect("rows");
             out
         }
 
@@ -999,14 +1027,23 @@ mod scroll_format_tests {
 
     #[test]
     fn png_is_never_lowered() {
-        assert_eq!(scroll_format(SaveFormat::Png, 3840, 2100), (SaveFormat::Png, None));
-        assert_eq!(scroll_format(SaveFormat::Png, 1280, 960), (SaveFormat::Png, None));
+        assert_eq!(
+            scroll_format(SaveFormat::Png, 3840, 2100),
+            (SaveFormat::Png, None)
+        );
+        assert_eq!(
+            scroll_format(SaveFormat::Png, 1280, 960),
+            (SaveFormat::Png, None)
+        );
     }
 
     #[test]
     fn jpeg_is_lowered_when_the_frame_would_not_fit_its_budget() {
         // MAX_SCREENS x 240 rows of 640 pixels is 15.4 MP, inside the 16 MP JPG frame budget.
-        assert_eq!(scroll_format(SaveFormat::Jpeg, 640, 240), (SaveFormat::Jpeg, None));
+        assert_eq!(
+            scroll_format(SaveFormat::Jpeg, 640, 240),
+            (SaveFormat::Jpeg, None)
+        );
         // The same rows at 1280 wide is 30.7 MP, so the JPG save path would have to hold the frame.
         let (effective, why) = scroll_format(SaveFormat::Jpeg, 1280, 240);
         assert_eq!(effective, SaveFormat::Png);
@@ -1029,7 +1066,7 @@ mod scroll_format_tests {
 
     #[test]
     fn the_scroll_log_prints_on_a_change_and_then_every_sixty_frames() {
-        use super::{should_log, Status};
+        use super::{Status, should_log};
         // 首帧必打（还没有"上一次状态"）。
         assert!(should_log(2, Status::Tracking, None));
         // 状态变化必打，不论帧号。
@@ -1097,9 +1134,7 @@ impl crate::ports::BandSource for ScrollBands {
             Err(error) => {
                 // The writer refuses the artifact on `false`; saying so here is what makes a broken
                 // tile file a failed export instead of a picture with a hole (docs/36 §12.1).
-                eprintln!(
-                    "[snapclip][scroll] rows {first_row}..+{rows} cannot be read: {error}"
-                );
+                eprintln!("[snapclip][scroll] rows {first_row}..+{rows} cannot be read: {error}");
                 false
             }
         }

@@ -24,24 +24,24 @@ use std::ffi::c_void;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, POINT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    SetWindowRgn, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP,
+    HDC, ReleaseDC, SelectObject, SetWindowRgn,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
-    GetWindowRect, IsWindow, IsWindowVisible, LoadCursorW, RegisterClassW, SetWindowDisplayAffinity,
-    SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WNDCLASSW,
-    WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    GetWindowRect, HWND_TOPMOST, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, RegisterClassW,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowDisplayAffinity,
+    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WDA_EXCLUDEFROMCAPTURE, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WS_VISIBLE,
 };
 
 use crate::geometry::Rect;
 use crate::ring_contrast::{ACCENT_RGB, MASK_ALPHA, MASK_RGB, MASK_TINT_ALPHA};
 use crate::windows::win::d2d::DimSource;
-use crate::windows::win::window::{region_from_pieces, WindowRegion};
+use crate::windows::win::window::{WindowRegion, region_from_pieces};
 
 /// 窗口类名。只在第一次显示时注册。
 const CLASS_NAME: &str = "SnapClipCountdownDim";
@@ -139,7 +139,12 @@ impl DimLayer {
     }
 
     /// 拖动改框时只换"洞"：不重填 DIB、不重新提交层内容。
-    pub(super) fn update(&mut self, monitor: Rect, selection: Rect, radius: i32) -> Result<(), String> {
+    pub(super) fn update(
+        &mut self,
+        monitor: Rect,
+        selection: Rect,
+        radius: i32,
+    ) -> Result<(), String> {
         if self.hwnd.is_null() {
             return Ok(());
         }
@@ -332,9 +337,7 @@ impl DimLayer {
             let Some(slice) = source.pixels.get(from..from + row_bytes) else {
                 return;
             };
-            unsafe {
-                std::ptr::copy_nonoverlapping(slice.as_ptr(), target.add(from), row_bytes)
-            };
+            unsafe { std::ptr::copy_nonoverlapping(slice.as_ptr(), target.add(from), row_bytes) };
         }
     }
 
@@ -391,7 +394,10 @@ impl DimLayer {
     fn apply_shape(&mut self, monitor: Rect, selection: Rect, radius: i32) -> Result<(), String> {
         let outer = Rect::new(0, 0, monitor.width(), monitor.height());
         let radius = radius
-            .min(crate::geometry::radius_cap(selection.width(), selection.height()))
+            .min(crate::geometry::radius_cap(
+                selection.width(),
+                selection.height(),
+            ))
             .max(0);
         let pieces = match dim_hole(monitor, selection) {
             // 有圆角时洞必须跟着弧走，否则弧与方角之间会露出四个楔形空白（docs/23 §14.55.23）。
@@ -400,10 +406,7 @@ impl DimLayer {
                 inner: hole,
                 radius,
             }],
-            Some(hole) => vec![WindowRegion::Ring {
-                outer,
-                inner: hole,
-            }],
+            Some(hole) => vec![WindowRegion::Ring { outer, inner: hole }],
             // 没有选区（或退化）时整块铺满：宁可多压暗，也不要留一个"什么都不显示"的空洞。
             None => vec![WindowRegion::Rect(outer)],
         };
@@ -503,5 +506,4 @@ mod tests {
         assert_ne!(ex & WS_EX_TOOLWINDOW, 0);
         assert_ne!(ex & WS_EX_NOACTIVATE, 0);
     }
-
 }

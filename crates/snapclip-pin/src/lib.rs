@@ -1,46 +1,19 @@
-//! Windows pin windows: display supplied pixels above other windows without taking focus.
-//!
-//! [`PinManager`] owns one host thread and all of its windows. Clones share that lifetime;
-//! dropping the last manager closes the windows, unregisters F6, and joins the thread.
-//! [`PinPoster`] is a weak posting handle and cannot keep the host alive.
-//!
-//! Capture and clipboard sources belong to the application. F6 consumes a selection through
-//! [`PinHome`]; prepared images can be submitted through [`PinManager::create_pin`]. Both paths
-//! allocate handles from the same counter and report their results as [`PinEvent`].
-//!
-//! This crate does not capture screens, read the clipboard, encode images, or depend on GPUI.
-//! See `docs/51-pin-crate.md` in the workspace for wiring and validation.
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//! use snapclip_pin::{ImageSource, PinHome, PinManager, PinRequest, PinSelection};
-//!
-//! struct Source;
-//! impl PinHome for Source {
-//!     fn take_selection(&self) -> Option<PinSelection> { None }
-//! }
-//! # fn main() -> anyhow::Result<()> {
-//! let pins = PinManager::start(Arc::new(Source))?;
-//! let image = ImageSource::from_bgra(vec![0xFF4488AA; 32 * 32], 32, 32)?;
-//! let handle = pins.create_pin(PinRequest::new(image, (100, 100)).radius(4))?;
-//! // The application polls pins.try_recv_event() or pins.drain_events() in its event loop.
-//! pins.close_pin(handle)?;
-//! # Ok(())
-//! # }
-//! ```
-
+//! Prepared-content pins: Yue-backed GPUI viewers and an original-position native F6 host.
 #![cfg(windows)]
-
+mod feedback;
 mod host;
+mod image_preview;
+mod manager;
+mod platform;
 mod source;
-
-use std::sync::Arc;
-
+mod table;
+mod view;
+pub use host::{PinEvent, PinHandle, PinReport, PinRequest};
+pub use manager::{CopyTarget, PinCommand, PinManager, PinPlacement};
 use snapclip_model::geometry::Rect;
-
-pub use host::{PinEvent, PinHandle, PinManager, PinPoster, PinReport, PinRequest};
+pub use snapclip_model::pin::*;
 pub use source::ImageSource;
-
+use std::sync::Arc;
 /// The most recently confirmed screenshot, in virtual-desktop physical pixels.
 ///
 /// The application supplies top-down BGRA bytes and the corner radius captured with the image.
@@ -84,11 +57,18 @@ impl PinSelection {
     }
 }
 
-/// Supplies the most recently confirmed screenshot when F6 or [`PinPoster::post`] is handled.
-///
-/// Called on the pin host thread. Implementations must return promptly and must not require a
-/// synchronous callback to the UI thread. Return `None` when there is no image; this allocates
-/// no handle. Taking a selection should consume it so repeated F6 cannot duplicate it.
-pub trait PinHome: Send + Sync + 'static {
-    fn take_selection(&self) -> Option<PinSelection>;
+/// Bind pin-window commands once after GPUI/Yue initialization.
+pub fn init(cx: &mut gpui_kit::App) {
+    view::init(cx);
+}
+
+/// A transient reading result near the command's origin; never enters the live pin registry.
+pub fn show_feedback(message: impl Into<String>, position: (i32, i32), cx: &mut gpui_kit::App) {
+    feedback::show(
+        message.into(),
+        position,
+        None,
+        std::time::Duration::from_secs(3),
+        cx,
+    );
 }

@@ -15,13 +15,13 @@ use crate::save::{
 use directories::DirectoryPresets;
 use gpui_kit::*;
 use model::Dimensions;
-use preview::{Preview, PreviewMode};
+use preview::Preview;
 use snapclip_capture::save_format::SaveFormat;
 pub use source::Picture;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use yue_component::{
-    ColorPickerEvent, InputEvent, InputState, SelectEvent, SelectMode, SelectOption, SelectValue,
-    YueColorPickerState, YueSelectState,
+    ColorPickerEvent, ImagePreviewEvent, ImagePreviewLoad, InputEvent, InputState, SelectEvent,
+    SelectMode, SelectOption, SelectValue, YueColorPickerState, YueSelectState,
 };
 
 pub const WIDTH: f32 = 1000.;
@@ -246,21 +246,21 @@ impl SavePanel {
         subscriptions.push(cx.subscribe_in(
             &format_select,
             window,
-            |this, _, event: &SelectEvent, _, cx| {
+            |this, _, event: &SelectEvent, window, cx| {
                 if let SelectEvent::Change(change) = event {
                     this.format = match change.after().keys().first().map(|s| s.as_ref()) {
                         Some("jpeg") => SaveFormat::Jpeg,
                         Some("webp") => SaveFormat::Webp,
                         _ => SaveFormat::Png,
                     };
-                    this.schedule_preview(cx);
+                    this.schedule_preview(window, cx);
                 }
             },
         ));
         subscriptions.push(cx.subscribe_in(
             &fill_picker,
             window,
-            |this, _, event: &ColorPickerEvent, _, cx| {
+            |this, _, event: &ColorPickerEvent, window, cx| {
                 if let ColorPickerEvent::Change(color) = event {
                     this.fill = [
                         (color.b * 255.).round() as u8,
@@ -268,7 +268,21 @@ impl SavePanel {
                         (color.r * 255.).round() as u8,
                     ];
                     this.fill_choice = "custom".into();
-                    this.schedule_preview(cx);
+                    this.schedule_preview(window, cx);
+                }
+            },
+        ));
+        let preview = Preview::new(window, cx);
+        subscriptions.push(cx.subscribe_in(
+            &preview.state,
+            window,
+            |this, _, event: &ImagePreviewEvent, window, cx| {
+                if let ImagePreviewEvent::RetryRequested { result, .. } = event {
+                    if *result {
+                        this.schedule_preview(window, cx);
+                    } else {
+                        this.load_original(window, cx);
+                    }
                 }
             },
         ));
@@ -289,7 +303,7 @@ impl SavePanel {
             after: source::remembered_after(),
             conflict: ConflictPolicy::AutoRename,
             limit_on: false,
-            preview: Preview::default(),
+            preview,
             bytes: None,
             measuring: false,
             busy: false,
@@ -307,8 +321,8 @@ impl SavePanel {
             _subscriptions: subscriptions,
         };
         panel.focus.focus(window, cx);
-        panel.load_original(cx);
-        panel.schedule_preview(cx);
+        panel.load_original(window, cx);
+        panel.schedule_preview(window, cx);
         panel
     }
 
@@ -368,7 +382,7 @@ impl SavePanel {
                     });
                     self.dimension_errors[1 - index] = None;
                 }
-                self.schedule_preview(cx);
+                self.schedule_preview(window, cx);
             }
             Err(error) => {
                 self.dimension_errors[index] = Some(error.into());
@@ -376,6 +390,9 @@ impl SavePanel {
                 self.revision += 1;
                 self.preview_task = None;
                 self.measuring = false;
+                self.bytes = None;
+                self.preview.encoded = ImagePreviewLoad::Empty;
+                self.publish_preview(window, cx);
                 cx.notify();
             }
         }
@@ -384,7 +401,7 @@ impl SavePanel {
     fn preset(&mut self, percent: u32, window: &mut Window, cx: &mut Context<Self>) {
         self.dimensions.preset(percent);
         self.sync_dimensions(window, cx);
-        self.schedule_preview(cx);
+        self.schedule_preview(window, cx);
     }
 
     fn set_mode(&mut self, mode: SizeMode, window: &mut Window, cx: &mut Context<Self>) {
@@ -393,47 +410,56 @@ impl SavePanel {
         cx.notify();
     }
 
-    fn load_original(&mut self, cx: &mut Context<Self>) {
+    fn load_original(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let picture = self.picture.clone();
-        self._original_task = Some(cx.spawn(async move |this, cx| {
+        self.preview.original = ImagePreviewLoad::Loading;
+        self.publish_preview(window, cx);
+        self._original_task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move { preview::original(&picture) })
                 .await;
-            _ = this.update(cx, |panel, cx| {
-                match result {
-                    Ok(image) => panel.preview.original = Some(image),
-                    Err(error) if panel.status.is_none() => {
-                        panel.status_error = true;
-                        panel.status = Some(error);
-                    }
-                    Err(_) => {}
-                }
+            _ = this.update_in(cx, |panel, window, cx| {
+                panel.preview.original = match result {
+                    Ok(image) => ImagePreviewLoad::Ready(image),
+                    Err(error) => ImagePreviewLoad::Failed(error.into()),
+                };
+                panel.publish_preview(window, cx);
                 cx.notify();
             });
         }));
     }
 
-    fn schedule_preview(&mut self, cx: &mut Context<Self>) {
+    fn schedule_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.revision += 1;
         self.status = None;
         self.saved_path = None;
         self.bytes = None;
+        if self.dimension_errors.iter().any(Option::is_some) {
+            self.preview_task = None;
+            self.preview.encoded = ImagePreviewLoad::Empty;
+            self.measuring = false;
+            self.publish_preview(window, cx);
+            cx.notify();
+            return;
+        }
         if let Err(error) = model::validate_preview_size(self.dimensions.output) {
             self.preview_task = None;
-            self.preview.encoded = None;
+            self.preview.encoded = ImagePreviewLoad::Empty;
             self.measuring = false;
             self.dimension_errors[0] = Some(error.into());
             self.status_error = true;
             self.status = Some(error.into());
+            self.publish_preview(window, cx);
             cx.notify();
             return;
         }
         self.measuring = true;
         let revision = self.revision;
         let export = self.export(cx);
-        self.preview.encoded = None;
-        self.preview_task = Some(cx.spawn(async move |this, cx| {
+        self.preview.encoded = ImagePreviewLoad::Loading;
+        self.publish_preview(window, cx);
+        self.preview_task = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(180))
                 .await;
@@ -441,7 +467,7 @@ impl SavePanel {
                 .background_executor()
                 .spawn(async move { preview::encode(&export) })
                 .await;
-            _ = this.update(cx, |panel, cx| {
+            _ = this.update_in(cx, |panel, window, cx| {
                 if panel.revision != revision {
                     return;
                 }
@@ -449,13 +475,15 @@ impl SavePanel {
                 match result {
                     Ok(result) => {
                         panel.bytes = Some(result.bytes);
-                        panel.preview.encoded = Some(result.encoded);
+                        panel.preview.encoded = ImagePreviewLoad::Ready(result.encoded);
                     }
                     Err(error) => {
                         panel.status_error = true;
+                        panel.preview.encoded = ImagePreviewLoad::Failed(error.clone().into());
                         panel.status = Some(error);
                     }
                 }
+                panel.publish_preview(window, cx);
                 cx.notify();
             });
         }));

@@ -20,15 +20,15 @@
 //! # 线程亲和性
 //!
 //! `LayeredBuffer` 里握着 HDC 和 DIB，只能在宿主线程上碰。为了从类型上堵住误用，
-//! `PinManager::create_pin`（可以从任意线程调用）只把请求投进通道，真正操作
+//! `NativeImages::create_pin`（可以从任意线程调用）只把请求投进通道，真正操作
 //! GDI 对象的代码全部在宿主线程内部，不对外暴露任何 GDI 句柄。
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, c_void};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
-use std::sync::{Arc, Weak};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -48,8 +48,7 @@ use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerf
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, UnregisterHotKey, VK_F6,
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -57,13 +56,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, IDC_ARROW, IsWindow, LoadCursorW, MSG, PostThreadMessageW, RegisterClassW,
     SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos,
     TranslateMessage, ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow, WM_APP, WM_DPICHANGED,
-    WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 
+#[cfg(test)]
+use super::PinSelection;
 use super::source::ImageSource;
-use super::{PinHome, PinSelection};
 
 /// `WM_APP` 之后的自定义消息：宿主线程用它来唤醒消息泵，去处理通道里的新命令。
 ///
@@ -73,13 +73,6 @@ const WM_APP_PIN_WAKE: u32 = WM_APP + 0x51;
 
 /// 窗口类名。用了它就要在退出前注销。
 const PIN_WINDOW_CLASS: &str = "SnapClipPinWindow";
-
-/// `F6` 的 `RegisterHotKey` 编号。
-///
-/// 注册在宿主线程上，所以只要与同一个线程上的编号不同即可；真正让它不会撞车的
-/// 是这套编号自己的一段（`0x5347`，紧跟捕获那边的 `0x5343`–`0x5346`），
-/// 而不是「别人不会用这个数」的假设。
-const PIN_HOTKEY_ID: i32 = 0x5347;
 
 /// 贴图窗口的边框宽度（DIP）。这条边不是为了好看，是为了让贴图与它下面那个
 /// 同尺寸的窗口在视觉上分开——没有它，「贴上了」和「没贴上」看起来一样。
@@ -136,11 +129,6 @@ fn wheel_delta(wparam: WPARAM) -> i32 {
     ((wparam >> 16) & 0xFFFF) as u16 as i16 as i32
 }
 
-/// 「贴图没了」这条通道的容量。
-///
-/// 见 `PinManager::start` 里为什么它有界。
-const EVENT_QUEUE_CAPACITY: usize = 64;
-
 /// 从 `WNDCLASSW` 创建窗口时传给 `WndProc` 的初始化参数，经 `CreateWindowExW`
 /// 的 `lpCreateParams` 过去，在 `WM_NCCREATE` 里取回。放在堆上，保证在
 /// `CreateWindowExW` 返回之前地址稳定。
@@ -154,18 +142,21 @@ struct WindowSeed {
     host: *mut HostState,
     /// 成图四角的圆角半径（原图像素）。
     radius: i32,
+    initial_zoom: f64,
+    text_available: bool,
 }
 
 /// 一次贴图请求：一块**已经准备好**的像素，以及它要落在屏幕上的位置。
 ///
 /// 像素必须由调用方备好。这台宿主线程不回读屏幕，也不解析窗口——它上面运行的是
-/// 用户按下 F6 那一刻的窗口消息，而那一刻覆盖层可能还盖着整块显示器。图从哪来是
-/// [`PinHome`](super::PinHome) 的事，不是这里的。
+/// 应用已经确认的请求；F3/F6 与来源读取由应用协调，不在图片宿主中处理。
 #[derive(Debug)]
 pub struct PinRequest {
     image: ImageSource,
     position: (i32, i32),
     radius: i32,
+    initial_zoom: f64,
+    text_available: bool,
 }
 
 impl PinRequest {
@@ -175,7 +166,19 @@ impl PinRequest {
             image,
             position,
             radius: 0,
+            initial_zoom: 1.0,
+            text_available: false,
         }
+    }
+
+    pub(crate) fn text_available(mut self, available: bool) -> Self {
+        self.text_available = available;
+        self
+    }
+
+    pub(crate) fn initial_zoom(mut self, zoom: f64) -> Self {
+        self.initial_zoom = zoom;
+        self
     }
 
     /// Set the corner radius in source-image physical pixels. Default: 0 (square corners).
@@ -189,11 +192,24 @@ impl PinRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinEvent {
     /// 一个贴图真的上屏了。
-    Created { id: u64 },
+    Created {
+        id: u64,
+    },
     /// 一个贴上屏之后被关闭（双击、宿主销毁…）。**这不是失败。**
-    Closed { id: u64 },
+    Closed {
+        id: u64,
+    },
     /// 请求过这个贴图，但它始终没出现（创建失败）。
-    Failed { id: u64 },
+    Failed {
+        id: u64,
+    },
+    /// Explicit image-menu intent. The host never writes the clipboard itself.
+    CopyRequested {
+        id: u64,
+    },
+    TextRequested {
+        id: u64,
+    },
 }
 
 /// 一批事件的汇总：日志要能说出"创建了几张、关掉了几张、几张没出现"。
@@ -222,6 +238,7 @@ pub fn summarize(events: impl IntoIterator<Item = PinEvent>) -> PinReport {
             PinEvent::Created { .. } => report.created += 1,
             PinEvent::Closed { .. } => report.closed += 1,
             PinEvent::Failed { .. } => report.failed += 1,
+            PinEvent::CopyRequested { .. } | PinEvent::TextRequested { .. } => {}
         }
     }
     report
@@ -234,6 +251,9 @@ pub struct PinHandle {
 }
 
 impl PinHandle {
+    pub(crate) fn from_id(id: u64) -> Self {
+        Self { id }
+    }
     /// The host-allocated identifier used in lifecycle events. Unique within this host lifetime.
     pub fn id(self) -> u64 {
         self.id
@@ -244,32 +264,8 @@ impl PinHandle {
 ///
 /// 克隆是廉价的：克隆出来的东西共享同一条宿主线程和同一份消息通道。
 #[derive(Clone)]
-pub struct PinManager {
+pub struct NativeImages {
     inner: Arc<HostInner>,
-}
-
-/// 「把刚截的那张贴出去」的跨线程手柄。
-///
-/// 它做的事与用户按 `F6` **完全一样**：让宿主线程消费最近截图。留着这一层，
-/// 是为了让"消息号 + 热键号"只出现在本模块里——调用方只需要一个能跨线程调用的手柄，
-/// 而不是自己拼一条窗口消息（docs/23 §14.55.8）。
-///
-/// A weak reference to the owning host: shutdown makes further posts fail, even if Windows
-/// later reuses the old thread identifier. Posting does not extend the host lifetime.
-#[derive(Clone)]
-pub struct PinPoster {
-    inner: Weak<HostInner>,
-}
-
-impl PinPoster {
-    /// Queue the same take-selection operation as F6. Returns an error after host shutdown.
-    /// Success means queued; the eventual window result is reported through `PinEvent`.
-    pub fn post(&self) -> Result<()> {
-        self.inner
-            .upgrade()
-            .context("贴图宿主线程已经不在了")?
-            .send(HostCommand::PinLatest)
-    }
 }
 
 struct HostInner {
@@ -284,34 +280,32 @@ struct HostInner {
 
 enum HostCommand {
     Create { id: u64, request: Box<PinRequest> },
-    PinLatest,
     Close(PinHandle),
+    Raise(PinHandle),
+    Visible(PinHandle, bool),
 }
 
 enum ControlMessage {
     Shutdown,
 }
 
-impl PinManager {
+impl NativeImages {
     /// 起一条宿主线程，并在返回之前确认它已经能收命令。
     ///
     /// 这里刻意**不**做「注册窗口类」之外的任何初始化：窗口在收到第一条命令时
     /// 才创建。没贴图的时候，这条线程只是一条阻塞在 `GetMessageW` 上的空泵。
-    pub fn start(home: Arc<dyn PinHome>) -> Result<Self> {
+    pub fn start() -> Result<Self> {
         let (command_tx, command_rx) = mpsc::channel::<HostCommand>();
         let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
-        // 创建、失败、关闭均上报；有界且不阻塞窗口线程，调用方必须定期排空。
-        let (event_tx, event_rx) = mpsc::sync_channel::<PinEvent>(EVENT_QUEUE_CAPACITY);
+        // 生命周期与用户意图可靠上报；不因一帧内事件较多而丢失关闭通知。
+        let (event_tx, event_rx) = mpsc::channel::<PinEvent>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<HostReady, String>>();
 
         let next_id = Arc::new(AtomicU64::new(1));
-        let host_ids = Arc::clone(&next_id);
         let thread = thread::Builder::new()
             .name("snapclip-pin".to_string())
             .spawn(move || {
-                if let Err(err) =
-                    run_host(&ready_tx, control_rx, command_rx, event_tx, home, host_ids)
-                {
+                if let Err(err) = run_host(&ready_tx, control_rx, command_rx, event_tx) {
                     // 线程跑起来之后才失败，已经没有调用方可以回报了，只能记日志。
                     eprintln!("[snapclip-pin] 贴图宿主线程异常退出：{err:#}");
                 }
@@ -340,7 +334,7 @@ impl PinManager {
         }
     }
 
-    /// Queue prepared pixels and synchronously allocate their handle from the same counter as F6.
+    /// Queue prepared pixels and allocate their handle from the shared pin counter.
     ///
     /// Returning a handle means queued, not displayed. Poll `try_recv_event` for `Created` or
     /// `Failed`, or `drain_events` for aggregate counts. The request never supplies its own ID.
@@ -353,16 +347,20 @@ impl PinManager {
         Ok(PinHandle { id })
     }
 
+    pub(crate) fn reserve_handle(&self) -> Result<PinHandle> {
+        Ok(PinHandle {
+            id: allocate_id(&self.inner.next_id)?,
+        })
+    }
+    pub(crate) fn raise(&self, handle: PinHandle) -> Result<()> {
+        self.inner.send(HostCommand::Raise(handle))
+    }
+    pub(crate) fn set_visible(&self, handle: PinHandle, visible: bool) -> Result<()> {
+        self.inner.send(HostCommand::Visible(handle, visible))
+    }
     /// 主动关掉一个贴图。不存在的 id 会被忽略。
     pub fn close_pin(&self, handle: PinHandle) -> Result<()> {
         self.inner.send(HostCommand::Close(handle))
-    }
-
-    /// 拿一个可以跨线程调用的贴图手柄（见 [`PinPoster`]）。
-    pub fn pin_poster(&self) -> PinPoster {
-        PinPoster {
-            inner: Arc::downgrade(&self.inner),
-        }
     }
 
     /// 取一条宿主线程发回来的事件，没有就返回 `None`。
@@ -372,15 +370,9 @@ impl PinManager {
     pub fn try_recv_event(&self) -> Option<PinEvent> {
         self.inner.events.lock().try_recv().ok()
     }
-
-    /// Drain all currently queued lifecycle events. The queue is bounded at 64 events;
-    /// the application must poll regularly. Overflow is logged rather than blocking the host.
-    pub fn drain_events(&self) -> PinReport {
-        summarize(self.inner.events.lock().try_iter())
-    }
 }
 
-/// Shared by the direct and F6 paths; exhaustion is an error, never wraparound to an old ID.
+/// Shared by native images and GPUI views; exhaustion never wraps to an old ID.
 fn allocate_id(counter: &AtomicU64) -> Result<u64> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -424,14 +416,7 @@ struct HostState {
     instance: HINSTANCE,
     windows: Vec<PinWindowState>,
     /// 往调用方汇报「某个贴图没了」的通道。
-    events: SyncSender<PinEvent>,
-    /// Shared with direct requests; no input path has a second identifier namespace.
-    next_id: Arc<AtomicU64>,
-    /// F6 的取图来源。
-    ///
-    /// 宿主线程在收到 `WM_HOTKEY` 时现取现贴：图必须和「按下 F6 的那一刻」同时
-    /// 成立，缓存一份在宿主线程上只会让它变旧。
-    home: Arc<dyn PinHome>,
+    events: Sender<PinEvent>,
 }
 
 impl HostState {
@@ -441,7 +426,7 @@ impl HostState {
 
     /// 上报「这个贴图没了」。
     ///
-    /// 队列满了不是静默失败：那意味着有东西在往这条通道里塞不属于它的消息。
+    /// 生命周期事件可靠投递；只有接收方已经释放时发送失败。
     fn report_closed(&mut self, id: u64) {
         self.report(PinEvent::Closed { id }, id, "「贴图已关闭」");
     }
@@ -456,13 +441,10 @@ impl HostState {
         self.report(PinEvent::Failed { id }, id, "「贴图创建失败」");
     }
 
-    /// 队列满了不是静默失败：那意味着有东西在往这条通道里塞不属于它的消息。
+    /// 生命周期事件可靠投递；只有接收方已经释放时发送失败。
     fn report(&mut self, event: PinEvent, id: u64, what: &str) {
-        if self.events.try_send(event).is_err() {
-            eprintln!(
-                "[snapclip-pin] {what}队列已满，丢弃 id={id}；\
-                 这条通道是宿主线程回报生命周期的唯一通道，不该积压"
-            );
+        if self.events.send(event).is_err() {
+            eprintln!("[snapclip-pin] {what}接收方已释放 id={id}");
         }
     }
 }
@@ -498,6 +480,7 @@ fn report_drag_perf(id: u64, perf: &DragPerf) {
 /// 一个贴图窗口的宿主侧状态。
 struct PinWindowState {
     id: u64,
+    text_available: bool,
     hwnd: HWND,
     /// 整窗内容的 DIB 后备缓冲。尺寸随缩放变化，所以每次改缩放都要重建（见
     /// [`resize_framebuffer`]）。
@@ -599,9 +582,7 @@ fn run_host(
     ready: &Sender<Result<HostReady, String>>,
     control: Receiver<ControlMessage>,
     commands: Receiver<HostCommand>,
-    events: SyncSender<PinEvent>,
-    home: Arc<dyn PinHome>,
-    next_id: Arc<AtomicU64>,
+    events: Sender<PinEvent>,
 ) -> Result<()> {
     let class_name: Vec<u16> = PIN_WINDOW_CLASS
         .encode_utf16()
@@ -619,45 +600,11 @@ fn run_host(
     }
     let thread_id = unsafe { GetCurrentThreadId() };
 
-    // F6 注册在这条线程上：`WM_HOTKEY` 只会投到注册它的线程队列，而贴图的
-    // 取图与窗口创建都在这条线程上按顺序发生。
-    //
-    // `RegisterHotKey` 传的是空窗口，于是 F6 变成一条**线程消息**（`msg.hwnd` 为
-    // null），这条线程的消息泵必须自己把它交给处理函数——`DispatchMessageW` 对
-    // 没有窗口的消息是静默丢弃的。这一点踩过：见 `unsafe extern "system" fn wnd_proc`
-    // 上面那一段。
-    //
-    // 失败**不致命**：贴图能力本身（宿主线程、窗口、`PinManager` 的调用方路径）
-    // 都还在，只是热键这条入口没了。热键被别的程序占着是可能的，所以这里只报告，
-    // 不让整个模块起不来。
-    //
-    // 注册失败时，直接创建与 PinPoster 入口仍然可用；日志明确报告热键不可用。
-    if unsafe {
-        RegisterHotKey(
-            std::ptr::null_mut(),
-            PIN_HOTKEY_ID,
-            MOD_NOREPEAT,
-            VK_F6 as u32,
-        )
-    } == 0
-    {
-        eprintln!(
-            "[snapclip-pin] 注册 F6 失败（错误码 {}）：贴图热键不可用，其余功能照常",
-            last_error()
-        );
-    } else {
-        // 成功的路径也要留一行：F5/F7/F9 都会打印注册结果，贴图这条不打印的话，
-        // 「F6 按下去没反应」就只能靠猜是没注册上还是没收到。
-        eprintln!("[snapclip-pin] 注册全局热键 F6 id={PIN_HOTKEY_ID}");
-    }
-
     let mut state = HostState {
         class_name,
         instance,
         windows: Vec::new(),
         events,
-        next_id,
-        home,
     };
 
     if ready.send(Ok(HostReady { thread_id })).is_err() {
@@ -676,20 +623,45 @@ fn run_host(
         while let Some(command) = pending.pop_front() {
             match command {
                 HostCommand::Create { id, request } => {
-                    if let Err(err) = create_pin_window(
-                        &mut state,
-                        id,
-                        request.image,
-                        request.position,
-                        request.radius,
-                    ) {
+                    if let Err(err) = create_pin_window(&mut state, id, *request) {
                         eprintln!("[snapclip-pin] 创建贴图窗口失败：{err:#}");
                         // 创建失败单独记账：它是"没能创建"，不是"创建后被关闭"
                         //（这两件事以前混成一条，日志因此说谎，docs/23 §14.55.9.6）。
                         state.report_failed(id);
                     }
                 }
-                HostCommand::PinLatest => on_pin_hotkey(&mut state),
+                HostCommand::Raise(handle) => {
+                    if let Some(window) = state.windows.iter().find(|w| w.id == handle.id) {
+                        unsafe {
+                            SetWindowPos(
+                                window.hwnd,
+                                HWND_TOPMOST,
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOACTIVATE
+                                    | SWP_NOMOVE
+                                    | SWP_NOSIZE
+                                    | windows_sys::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
+                            );
+                        }
+                    }
+                }
+                HostCommand::Visible(handle, visible) => {
+                    if let Some(window) = state.windows.iter().find(|w| w.id == handle.id) {
+                        unsafe {
+                            windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                                window.hwnd,
+                                if visible {
+                                    windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE
+                                } else {
+                                    windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE
+                                },
+                            );
+                        }
+                    }
+                }
                 HostCommand::Close(handle) => {
                     if let Some(window) = state.windows.iter().find(|w| w.id == handle.id) {
                         let hwnd = window.hwnd;
@@ -703,7 +675,7 @@ fn run_host(
             }
         }
 
-        // 窗口全没了也不退出：F6 还注册在这条线程上，贴图可以再来一张。
+        // 窗口全没了也不退出：应用仍可提交下一张贴图。
         // 这条线程与进程同寿，退出只由 `ControlMessage::Shutdown` 决定。
 
         // 消息泵。窗口消息派发到 `wnd_proc`；**没有窗口的消息**必须自己处理。
@@ -720,13 +692,9 @@ fn run_host(
         }
         match route_message(msg.hwnd, msg.message) {
             MessageRoute::HandleHere => {
-                // `F6` 是用 `RegisterHotKey(null, …)` 注册的，于是 `WM_HOTKEY` 是一条
-                // **线程消息**：`msg.hwnd` 为 null，`DispatchMessageW` 对它是静默丢弃
-                // （没有窗口可以派发），窗口过程永远不会被调用。这里自己把它交给
-                // 处理函数，与 `snapclip-capture` 的覆盖层消息泵同一个做法。
-                //
-                // 这条分支踩过一次：F6 注册成功、日志干净、按下去毫无反应，就是因为
-                // 消息在这里被丢掉了。
+                // Command wakeups are thread messages (null HWND). They must be
+                // handled here because DispatchMessageW cannot dispatch them.
+                // Global F3/F6 registration now belongs to the application tray.
                 on_message(
                     &mut state,
                     std::ptr::null_mut(),
@@ -742,14 +710,13 @@ fn run_host(
         }
     }
 
-    // 收摊：销毁残留的贴图窗口，退掉热键，注销窗口类。
+    // 收摊：销毁残留的贴图窗口，注销窗口类。
     let hwnds: Vec<HWND> = state.windows.iter().map(|w| w.hwnd).collect();
     for hwnd in hwnds {
         if unsafe { IsWindow(hwnd) } != 0 {
             unsafe { DestroyWindow(hwnd) };
         }
     }
-    unsafe { UnregisterHotKey(std::ptr::null_mut(), PIN_HOTKEY_ID) };
     unregister_window_class(state.instance, &state.class_name);
     Ok(())
 }
@@ -776,45 +743,11 @@ fn route_message(hwnd: HWND, _message: u32) -> MessageRoute {
     }
 }
 
-/// `F6` 被按下：把刚截的那张图贴出来。
-///
-/// `host` 由消息泵保证非空（它就是消息泵自己手里的那个状态）。
-fn on_pin_hotkey(host: *mut HostState) {
-    // 每一个 F6 都先留一行，再决定做什么：`RegisterHotKey` 成功但消息没到，
-    // 和消息到了却还没有可贴的图，是两种完全不同的故障，日志必须能分开它们。
-    eprintln!("[snapclip-pin] latest-selection request received");
-    let state = unsafe { &mut *host };
-    let started = now_us();
-    // 先取图再发号：没有图的时候什么都不发生，编号表里不该留下一个洞。
-    let Some(selection) = state.home.take_selection() else {
-        eprintln!("[snapclip-pin] F6 还没有可贴的图：先按 F5 截一张");
-        return;
-    };
-    let took_us = now_us().saturating_sub(started);
-    let id = match allocate_id(&state.next_id) {
-        Ok(id) => id,
-        Err(error) => {
-            eprintln!("[snapclip-pin] {error}");
-            return;
-        }
-    };
-    let converted = now_us();
-    if let Err(err) = pin_home_selection(state, id, selection) {
-        eprintln!("[snapclip-pin] F6 贴图失败：{err:#}");
-        state.report_failed(id);
-    }
-    let total_us = now_us().saturating_sub(started);
-    let convert_us = converted.saturating_sub(started).saturating_sub(took_us);
-    eprintln!(
-        "[snapclip-pin] create stage=hotkey_to_window total_us={total_us} \
-         take_us={took_us} convert_and_window_us={convert_us}"
-    );
-}
-
-/// 把 [`PinHome`] 交出来的一块选区贴成窗口。
+/// Create a supplied screenshot at its original physical desktop position.
 ///
 /// 位置由选区自己决定：它带着屏幕坐标（`region`），所以贴图落在原地——「钉住」
 /// 在视觉上就是这副画面留在它刚才在的地方，用户不必再把窗口拖回去。
+#[cfg(test)]
 fn pin_home_selection(state: &mut HostState, id: u64, selection: PinSelection) -> Result<()> {
     let region = selection.region;
     let width = u32::try_from(region.width()).context("选区宽度非法")?;
@@ -842,9 +775,7 @@ fn pin_home_selection(state: &mut HostState, id: u64, selection: PinSelection) -
     create_pin_window(
         state,
         id,
-        image,
-        (region.left, region.top),
-        selection.radius,
+        PinRequest::new(image, (region.left, region.top)).radius(selection.radius),
     )?;
     let window_us = now_us().saturating_sub(started);
     // 拆开是为了定位瓶颈：`convert` 是字节→`u32` 的重解释与分配，`window` 是
@@ -858,19 +789,23 @@ fn pin_home_selection(state: &mut HostState, id: u64, selection: PinSelection) -
 }
 
 /// 创建并上屏一个贴图窗口。
-fn create_pin_window(
-    state: &mut HostState,
-    id: u64,
-    image: ImageSource,
-    position: (i32, i32),
-    radius: i32,
-) -> Result<()> {
+fn create_pin_window(state: &mut HostState, id: u64, request: PinRequest) -> Result<()> {
+    let PinRequest {
+        image,
+        position,
+        radius,
+        initial_zoom,
+        text_available,
+    } = request;
+    if !initial_zoom.is_finite() || initial_zoom <= 0. || initial_zoom > ZOOM_MAX {
+        bail!("invalid initial zoom");
+    }
     // 这里的 DPI 只是一个**临时**值，用来给 `CreateWindowExW` 一个不至于为 0 的尺寸：
     // 窗口还不存在，问不到它落在哪块显示器上。真正的尺寸在 `WM_NCCREATE` 里按
     // `GetDpiForWindow` 重算，而那一趟会连同第一帧画面一起提交，所以这个猜测永远
     // 不会被人看见。
     let border = border_px(system_dpi());
-    let (width, height) = window_size(image.width(), image.height(), 1.0, border);
+    let (width, height) = window_size(image.width(), image.height(), initial_zoom, border);
     if width <= 0 || height <= 0 {
         bail!("贴图尺寸非法：{width}x{height}");
     }
@@ -881,6 +816,8 @@ fn create_pin_window(
         position,
         host: state as *mut HostState,
         radius,
+        initial_zoom,
+        text_available,
     };
 
     let hwnd = unsafe {
@@ -967,6 +904,73 @@ unsafe extern "system" fn wnd_proc(
 ///
 /// `host` 已经确认非空：它是 `WM_NCCREATE` 存进 `GWLP_USERDATA` 的那个指针，
 /// 只在窗口存续期间有效，而窗口的存活期严格短于宿主线程。
+fn image_menu(host: *mut HostState, hwnd: HWND) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON, TrackPopupMenu,
+    };
+    let Some((id, text_available)) =
+        (unsafe { window_mut(host, hwnd) }).map(|w| (w.id, w.text_available))
+    else {
+        return;
+    };
+    // Release hover capture before entering the native menu's modal message loop.
+    unsafe {
+        ReleaseCapture();
+    }
+    let menu = unsafe { CreatePopupMenu() };
+    if menu.is_null() {
+        return;
+    }
+    for (id, label) in [(1, "复制图片"), (2, "查看文字备选…"), (3, "关闭")] {
+        if id == 2 && !text_available {
+            continue;
+        }
+        if id == 3 {
+            unsafe {
+                AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            }
+        }
+        let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            AppendMenuW(menu, MF_STRING, id, wide.as_ptr());
+        }
+    }
+    let mut p = POINT { x: 0, y: 0 };
+    unsafe {
+        GetCursorPos(&mut p);
+    }
+    let selected = unsafe {
+        TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            p.x,
+            p.y,
+            0,
+            hwnd,
+            std::ptr::null(),
+        )
+    };
+    unsafe {
+        DestroyMenu(menu);
+    }
+    match selected {
+        1 => {
+            _ = unsafe { &*host }
+                .events
+                .send(PinEvent::CopyRequested { id });
+        }
+        2 => {
+            _ = unsafe { &*host }
+                .events
+                .send(PinEvent::TextRequested { id });
+        }
+        3 => unsafe {
+            DestroyWindow(hwnd);
+        },
+        _ => {}
+    }
+}
 fn on_message(
     host: *mut HostState,
     hwnd: HWND,
@@ -975,6 +979,10 @@ fn on_message(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP => {
+            image_menu(host, hwnd);
+            0
+        }
         WM_NCDESTROY => {
             on_wm_ncdestroy(host, hwnd);
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -1011,13 +1019,6 @@ fn on_message(
                     eprintln!("[snapclip-pin] 换 DPI 重画失败 id={}：{err:#}", window.id);
                 }
             }
-            0
-        }
-        WM_HOTKEY => {
-            // 空窗口的 `WM_HOTKEY` 是一条线程消息，由消息泵直接送到这里
-            // （`hwnd` 为 null；原因见消息泵那段注释）。有窗口的那种不会发生：
-            // 本模块只注册过这一条热键，而且是按空窗口注册的。
-            on_pin_hotkey(host);
             0
         }
         WM_NCHITTEST => {
@@ -1322,7 +1323,7 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
     // `UpdateLayeredWindow` 里提交，中间没有一帧是错尺寸。
     let image_width = seed.image.width();
     let image_height = seed.image.height();
-    let size = window_size(image_width, image_height, 1.0, border);
+    let size = window_size(image_width, image_height, seed.initial_zoom, border);
     let mut framebuffer = LayeredBuffer::new(size.0, size.1, true)?;
     paint_pin_with_radius(
         framebuffer.pixels_mut(),
@@ -1331,12 +1332,16 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
         seed.image.pixels(),
         image_width,
         image_height,
-        1.0,
+        seed.initial_zoom,
         dpi,
-        scaled_radius(seed.radius, 1.0),
+        scaled_radius(seed.radius, seed.initial_zoom),
     );
     framebuffer
-        .submit(hwnd, Some(seed.position), scaled_radius(seed.radius, 1.0))
+        .submit(
+            hwnd,
+            Some(seed.position),
+            scaled_radius(seed.radius, seed.initial_zoom),
+        )
         .context("首次提交贴图内容失败")?;
 
     // 原图像素在**第一次提交之后**才取所有权：`seed.image` 是 `ImageSource`（拥有
@@ -1346,13 +1351,14 @@ unsafe fn attach_window(hwnd: HWND, seed: &mut WindowSeed) -> Result<()> {
     unsafe {
         (*seed.host).windows.push(PinWindowState {
             id: seed.id,
+            text_available: seed.text_available,
             hwnd,
             framebuffer,
             image,
             image_width,
             image_height,
             radius: seed.radius,
-            zoom: 1.0,
+            zoom: seed.initial_zoom,
             dpi,
             wheel_remainder: 0,
             tracking_leave: false,
@@ -3213,30 +3219,18 @@ fn last_error() -> u32 {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
-    struct SelectionSlot(parking_lot::Mutex<Option<PinSelection>>);
-
-    impl PinHome for SelectionSlot {
-        fn take_selection(&self) -> Option<PinSelection> {
-            self.0.lock().take()
-        }
-    }
-
-    fn test_state(home: Arc<dyn PinHome>) -> (HostState, Receiver<PinEvent>) {
-        let (events, receiver) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+    fn test_state() -> (HostState, Receiver<PinEvent>) {
+        let (events, receiver) = mpsc::channel();
         (
             HostState {
                 class_name: Vec::new(),
                 instance: std::ptr::null_mut(),
                 windows: Vec::new(),
                 events,
-                next_id: Arc::new(AtomicU64::new(1)),
-                home,
             },
             receiver,
         )
     }
-
     #[test]
     fn ids_are_unique_and_start_at_one() {
         let ids = AtomicU64::new(1);
@@ -3250,7 +3244,7 @@ mod tests {
         assert!(Rect::new(10, 10, 10, 50).is_empty());
         assert!(Rect::new(10, 10, 50, 10).is_empty());
         assert!(!Rect::new(10, 10, 11, 11).is_empty());
-        let (mut state, receiver) = test_state(Arc::new(SelectionSlot::default()));
+        let (mut state, receiver) = test_state();
         assert!(
             pin_home_selection(
                 &mut state,
@@ -3293,38 +3287,26 @@ mod tests {
     }
 
     #[test]
-    fn f6_without_a_selection_allocates_no_id_or_event() {
-        let (mut state, receiver) = test_state(Arc::new(SelectionSlot::default()));
-        on_pin_hotkey(&mut state);
-        assert_eq!(allocate_id(&state.next_id).unwrap(), 1);
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn an_invalid_f6_selection_reports_failed_in_the_shared_sequence() {
+    fn invalid_supplied_pixels_do_not_create_a_window_or_event() {
         use snapclip_model::geometry::Rect;
-        let slot = Arc::new(SelectionSlot::default());
-        *slot.0.lock() = Some(PinSelection::new(
-            Rect::new(-10, -20, -8, -18),
-            Arc::new(vec![0; 3]),
-        ));
-        let (mut state, receiver) = test_state(slot);
-        assert_eq!(allocate_id(&state.next_id).unwrap(), 1);
-        on_pin_hotkey(&mut state);
-        assert_eq!(receiver.try_recv().unwrap(), PinEvent::Failed { id: 2 });
-        assert!(receiver.try_recv().is_err());
-        on_pin_hotkey(&mut state);
-        assert_eq!(allocate_id(&state.next_id).unwrap(), 3);
+        let (mut state, receiver) = test_state();
+        assert!(
+            pin_home_selection(
+                &mut state,
+                2,
+                PinSelection::new(Rect::new(-10, -20, -8, -18), Arc::new(vec![0; 3]))
+            )
+            .is_err()
+        );
         assert!(receiver.try_recv().is_err());
     }
-
     #[test]
-    fn a_poster_does_not_keep_a_stopped_host_alive() {
+    fn stopped_native_host_rejects_create_close_and_raise() {
         let (commands, receiver) = mpsc::channel();
         drop(receiver);
         let (control, _) = mpsc::channel();
         let (_, events) = mpsc::channel();
-        let manager = PinManager {
+        let manager = NativeImages {
             inner: Arc::new(HostInner {
                 commands,
                 control,
@@ -3334,8 +3316,7 @@ mod tests {
                 thread: parking_lot::Mutex::new(None),
             }),
         };
-        let poster = manager.pin_poster();
-        assert!(poster.post().is_err());
+        let handle = manager.reserve_handle().unwrap();
         assert!(
             manager
                 .create_pin(PinRequest::new(
@@ -3344,19 +3325,19 @@ mod tests {
                 ))
                 .is_err()
         );
+        assert!(manager.close_pin(handle).is_err());
+        assert!(manager.raise(handle).is_err());
+        let weak = Arc::downgrade(&manager.inner);
         let clone = manager.clone();
         drop(manager);
-        assert!(poster.inner.upgrade().is_some());
+        assert!(weak.upgrade().is_some());
         drop(clone);
-        assert!(poster.inner.upgrade().is_none());
-        assert!(poster.post().is_err());
+        assert!(weak.upgrade().is_none());
     }
-
     #[test]
     fn the_public_handles_can_cross_threads() {
         fn send_sync<T: Send + Sync>() {}
-        send_sync::<PinManager>();
-        send_sync::<PinPoster>();
+        send_sync::<NativeImages>();
         send_sync::<PinRequest>();
         send_sync::<PinSelection>();
     }
@@ -3573,7 +3554,10 @@ mod tests {
         // 断言分两层：路由必须选 `HandleHere`（也就是真的会进 `on_message`），
         // 而且 `WM_HOTKEY` 无论在哪种窗口情形下都不能掉进 `Dispatch`。
         assert_eq!(
-            route_message(std::ptr::null_mut(), WM_HOTKEY),
+            route_message(
+                std::ptr::null_mut(),
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_HOTKEY
+            ),
             MessageRoute::HandleHere
         );
         assert_eq!(
@@ -5145,3 +5129,7 @@ mod tests {
         assert_eq!(middle >> 24, 0xFF, "alpha 必须留在 255（贴图整窗不透明）");
     }
 }
+
+#[cfg(test)]
+#[path = "windows_host_tests.rs"]
+mod windows_host_tests;

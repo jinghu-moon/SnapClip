@@ -27,7 +27,9 @@ pub(crate) fn sweep() {
             }
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(pid) = tile_owner(name) else { continue };
+            let Some(pid) = tile_owner(name) else {
+                continue;
+            };
             let age = meta
                 .modified()
                 .ok()
@@ -43,7 +45,7 @@ pub(crate) fn sweep() {
 /// Whether another process still exists. Access denied counts as alive: a handle we may not open
 /// must never be a reason to delete its working file.
 fn is_running(pid: u32) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_INVALID_PARAMETER};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError};
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
     // SAFETY: opening a synchronisation handle for a liveness query; closed immediately.
     match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {

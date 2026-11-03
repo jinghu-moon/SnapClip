@@ -18,7 +18,10 @@ const WIDTH: u32 = 1280;
 const ROWS: u32 = 29_760;
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("codec-bench-bands-{name}-{}.png", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "codec-bench-bands-{name}-{}.png",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&path);
     path
 }

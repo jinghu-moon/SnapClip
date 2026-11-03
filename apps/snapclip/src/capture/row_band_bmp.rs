@@ -26,14 +26,26 @@ pub struct BmpRowBandWriter {
 impl BmpRowBandWriter {
     pub fn begin(meta: &ImageMeta) -> Result<Self, ExportError> {
         if meta.width == 0 || meta.height == 0 {
-            return Err(ExportError::TooLarge { width: meta.width, height: meta.height });
+            return Err(ExportError::TooLarge {
+                width: meta.width,
+                height: meta.height,
+            });
         }
         let pixels = meta.width.saturating_mul(meta.height);
         let file_bytes = PIXEL_OFFSET + pixels.saturating_mul(4);
         if file_bytes > BMP_MAX_FILE_BYTES {
-            return Err(ExportError::TooLarge { width: meta.width, height: meta.height });
+            return Err(ExportError::TooLarge {
+                width: meta.width,
+                height: meta.height,
+            });
         }
-        Ok(Self { width: meta.width, height: meta.height, written: 0, file_bytes, header_written: false })
+        Ok(Self {
+            width: meta.width,
+            height: meta.height,
+            written: 0,
+            file_bytes,
+            header_written: false,
+        })
     }
 
     fn header(&self) -> [u8; PIXEL_OFFSET as usize] {
@@ -74,40 +86,58 @@ impl BmpRowBandWriter {
         header
     }
 
-    pub fn write_rows(&mut self, first_row: u64, rows: &[u8], out: &mut dyn Write) -> Result<(), ExportError> {
+    pub fn write_rows(
+        &mut self,
+        first_row: u64,
+        rows: &[u8],
+        out: &mut dyn Write,
+    ) -> Result<(), ExportError> {
         if first_row != self.written {
-            return Err(ExportError::OutOfOrder { first_row, expected: self.written });
+            return Err(ExportError::OutOfOrder {
+                first_row,
+                expected: self.written,
+            });
         }
         let row_bytes = self.width as usize * 4;
         if rows.is_empty() || rows.len() % row_bytes != 0 {
-            return Err(ExportError::RowLength { expected: row_bytes as u64, got: rows.len() as u64 });
+            return Err(ExportError::RowLength {
+                expected: row_bytes as u64,
+                got: rows.len() as u64,
+            });
         }
         let count = (rows.len() / row_bytes) as u64;
         if self.written + count > self.height {
-            return Err(ExportError::BeyondHeight { first_row, height: self.height });
+            return Err(ExportError::BeyondHeight {
+                first_row,
+                height: self.height,
+            });
         }
         if !self.header_written {
-            out.write_all(&self.header())
-                .map_err(|error| ExportError::Sink(format!("the BMP header cannot be written: {error}")))?;
+            out.write_all(&self.header()).map_err(|error| {
+                ExportError::Sink(format!("the BMP header cannot be written: {error}"))
+            })?;
             self.header_written = true;
         }
-        out.write_all(rows)
-            .map_err(|error| ExportError::Sink(format!("the BMP rows cannot be written: {error}")))?;
+        out.write_all(rows).map_err(|error| {
+            ExportError::Sink(format!("the BMP rows cannot be written: {error}"))
+        })?;
         self.written += count;
         Ok(())
     }
 
     pub fn finish(mut self, out: &mut dyn Write) -> Result<u64, ExportError> {
         if !self.header_written {
-            out.write_all(&self.header())
-                .map_err(|error| ExportError::Sink(format!("the BMP header cannot be written: {error}")))?;
+            out.write_all(&self.header()).map_err(|error| {
+                ExportError::Sink(format!("the BMP header cannot be written: {error}"))
+            })?;
             self.header_written = true;
         }
         if self.written != self.height {
-            return Err(ExportError::Sink(format!("the BMP has {} of {} rows", self.written, self.height)));
+            return Err(ExportError::Sink(format!(
+                "the BMP has {} of {} rows",
+                self.written, self.height
+            )));
         }
         Ok(self.file_bytes)
     }
 }
-
-

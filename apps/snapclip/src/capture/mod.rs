@@ -53,7 +53,7 @@ pub mod webp_sink;
 /// 153 MiB frame.
 pub mod convert;
 
-pub use convert::{convert, convert_to_file, Conversion};
+pub use convert::{Conversion, convert, convert_to_file};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -185,9 +185,8 @@ impl TakeSelection for SelectionHome {
 
 #[cfg(test)]
 mod tests {
-    use super::{start, SelectionHome, TakeSelection};
+    use super::{SelectionHome, TakeSelection, start};
     use crate::events::EventBus;
-    use snapclip_pin::PinHome;
     use snapclip_capture::window_detection::DetectionOptions;
     use snapclip_model::CaptureState;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -220,7 +219,8 @@ mod tests {
         // Dropping every handle shuts the overlay down (its own `Drop`), including the hotkey.
         // The pin source keeps the runtime alive by design, so both have to go.
         drop(pin_source);
-        drop(runtime);        let _ = std::fs::remove_dir_all(&root);
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A platform that hands out one selection and counts the cancel requests it sees.

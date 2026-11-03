@@ -114,8 +114,7 @@ pub fn region_from_pieces(
                     let band_width = (outer.width() - inner.width()).max(0) / 2;
                     let outer_diameter = (radius.max(0) * 2).min(outer.width()).min(outer.height());
                     let inner_radius = (radius.max(0) - band_width).max(0);
-                    let inner_diameter =
-                        (inner_radius * 2).min(inner.width()).min(inner.height());
+                    let inner_diameter = (inner_radius * 2).min(inner.width()).min(inner.height());
                     // `CreateRoundRectRgn` 的圆角参数是椭圆的**直径**，不是半径。
                     let band = CreateRoundRectRgn(
                         outer.left,
@@ -796,8 +795,7 @@ mod tests {
         );
     }
 
-    
-#[test]
+    #[test]
     #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn a_click_through_layered_window_is_not_a_candidate() {
         require_desktop();
@@ -942,54 +940,54 @@ mod tests {
     /// 倒计时期间浮层靠**窗口区域**把点击让给别的应用（`HTTRANSPARENT` 只覆盖同一线程的下层
     /// 窗口，浮层没有同线程兄弟 ⇒ 那一击被丢弃；docs/23 §14.55.9）。这条在活桌面上证明机制本身：
     /// 区域能把窗口真的收窄到给定矩形，也能整块还原。
-/// 倒计时期间的窗口形状：**选框环 + 角标 + 倒计时小框**，而选区正中心那一块不属于窗口。
-/// 这是"点击跨进程落到别的应用"的机制依据（`HTTRANSPARENT` 只覆盖同线程；docs/23 §14.55.9）。
+    /// 倒计时期间的窗口形状：**选框环 + 角标 + 倒计时小框**，而选区正中心那一块不属于窗口。
+    /// 这是"点击跨进程落到别的应用"的机制依据（`HTTRANSPARENT` 只覆盖同线程；docs/23 §14.55.9）。
     #[test]
     #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn a_combined_region_keeps_the_frame_ring_and_drops_the_middle() {
-    use windows_sys::Win32::Graphics::Gdi::{
-        CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion, SetWindowRgn,
-    };
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateRectRgn, DeleteObject, GetWindowRgn, PtInRegion, SetWindowRgn,
+        };
 
-    require_desktop();
-    let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE)
-        .expect("desktop is available");
-    let raw = window.handle() as *mut core::ffi::c_void;
+        require_desktop();
+        let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE)
+            .expect("desktop is available");
+        let raw = window.handle() as *mut core::ffi::c_void;
 
-    let pieces = [
-        WindowRegion::Ring {
-            outer: Rect::new(40, 60, 340, 260),
-            inner: Rect::new(60, 80, 320, 240),
-        },
-        WindowRegion::Rect(Rect::new(40, 20, 140, 50)),
-        WindowRegion::Rect(Rect::new(180, 150, 220, 200)),
-    ];
-    let region = region_from_pieces(&pieces).expect("pieces must combine");
-    assert_ne!(
-        unsafe { SetWindowRgn(raw, region, 1) },
-        0,
-        "SetWindowRgn must succeed"
-    );
-
-    // 系统接管了 region，所以读一份副本再判点。
-    let probe = unsafe { CreateRectRgn(0, 0, 0, 0) };
-    assert!(!probe.is_null());
-    assert_ne!(unsafe { GetWindowRgn(raw, probe) }, 0, "窗口现在有区域");
-    unsafe {
-        assert_ne!(PtInRegion(probe, 50, 70), 0, "选框环属于窗口");
-        assert_eq!(
-            PtInRegion(probe, 200, 120),
+        let pieces = [
+            WindowRegion::Ring {
+                outer: Rect::new(40, 60, 340, 260),
+                inner: Rect::new(60, 80, 320, 240),
+            },
+            WindowRegion::Rect(Rect::new(40, 20, 140, 50)),
+            WindowRegion::Rect(Rect::new(180, 150, 220, 200)),
+        ];
+        let region = region_from_pieces(&pieces).expect("pieces must combine");
+        assert_ne!(
+            unsafe { SetWindowRgn(raw, region, 1) },
             0,
-            "选区内部不属于窗口（点击才能穿过去）"
+            "SetWindowRgn must succeed"
         );
-        assert_ne!(PtInRegion(probe, 60, 30), 0, "角标属于窗口");
-        assert_ne!(PtInRegion(probe, 200, 170), 0, "倒计时小框属于窗口");
-    }
 
-    assert_ne!(unsafe { SetWindowRgn(raw, std::ptr::null_mut(), 1) }, 0);
-    assert_eq!(unsafe { GetWindowRgn(raw, probe) }, 0, "还原后没有区域");
-    unsafe { DeleteObject(probe) };
-}
+        // 系统接管了 region，所以读一份副本再判点。
+        let probe = unsafe { CreateRectRgn(0, 0, 0, 0) };
+        assert!(!probe.is_null());
+        assert_ne!(unsafe { GetWindowRgn(raw, probe) }, 0, "窗口现在有区域");
+        unsafe {
+            assert_ne!(PtInRegion(probe, 50, 70), 0, "选框环属于窗口");
+            assert_eq!(
+                PtInRegion(probe, 200, 120),
+                0,
+                "选区内部不属于窗口（点击才能穿过去）"
+            );
+            assert_ne!(PtInRegion(probe, 60, 30), 0, "角标属于窗口");
+            assert_ne!(PtInRegion(probe, 200, 170), 0, "倒计时小框属于窗口");
+        }
+
+        assert_ne!(unsafe { SetWindowRgn(raw, std::ptr::null_mut(), 1) }, 0);
+        assert_eq!(unsafe { GetWindowRgn(raw, probe) }, 0, "还原后没有区域");
+        unsafe { DeleteObject(probe) };
+    }
 
     /// 圆角洞：弧与方角之间那块楔形必须落在区域里（否则遮罩在那里留白，docs/23 §14.55.23）。
     #[test]
@@ -1041,7 +1039,11 @@ mod tests {
             radius: 40,
         }];
         let region = region_from_pieces(&pieces).expect("round ring must combine");
-        assert_ne!(unsafe { SetWindowRgn(raw, region, 1) }, 0, "SetWindowRgn 必须成功");
+        assert_ne!(
+            unsafe { SetWindowRgn(raw, region, 1) },
+            0,
+            "SetWindowRgn 必须成功"
+        );
 
         let probe = unsafe { CreateRectRgn(0, 0, 0, 0) };
         assert!(!probe.is_null());
@@ -1083,12 +1085,19 @@ mod tests {
 
         assert!(unsafe { GetCapture() }.is_null(), "起手不应该有任何捕获");
         let _previous = unsafe { SetCapture(raw) };
-        assert_eq!(unsafe { GetCapture() }, raw, "SetCapture 之后本窗口持有捕获");
+        assert_eq!(
+            unsafe { GetCapture() },
+            raw,
+            "SetCapture 之后本窗口持有捕获"
+        );
         // 幂等：再抓一次还是自己，不会抓在别人手里。
         let _ = unsafe { SetCapture(raw) };
         assert_eq!(unsafe { GetCapture() }, raw, "重复捕获仍是本窗口");
         assert_ne!(unsafe { ReleaseCapture() }, 0, "ReleaseCapture 必须成功");
-        assert!(unsafe { GetCapture() }.is_null(), "释放之后没有窗口持有捕获");
+        assert!(
+            unsafe { GetCapture() }.is_null(),
+            "释放之后没有窗口持有捕获"
+        );
     }
 
     /// 倒计时到点的过渡：**先隐藏窗口，再还原区域**（docs/23 §14.55.9.4）。
@@ -1100,7 +1109,7 @@ mod tests {
     #[ignore = "L3 (docs/31 D-14): creates a real window; run with --ignored --test-threads=1 on a live desktop"]
     fn hiding_before_clearing_the_region_leaves_no_visible_frame() {
         use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, GetWindowRgn, SetWindowRgn};
-        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_HIDE};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, SW_HIDE, ShowWindow};
 
         require_desktop();
         let window = TestWindow::create(WINDOW_EX_STYLE(0), WS_POPUP | WS_VISIBLE)
@@ -1125,7 +1134,11 @@ mod tests {
         );
         let probe = unsafe { CreateRectRgn(0, 0, 0, 0) };
         assert!(!probe.is_null());
-        assert_eq!(unsafe { GetWindowRgn(raw, probe) }, 0, "区域已还原（无区域）");
+        assert_eq!(
+            unsafe { GetWindowRgn(raw, probe) },
+            0,
+            "区域已还原（无区域）"
+        );
         assert_eq!(unsafe { IsWindowVisible(raw) }, 0, "收尾之后仍然不可见");
     }
 
@@ -1145,7 +1158,11 @@ mod tests {
         let probe = unsafe { CreateRectRgn(0, 0, 0, 0) };
         assert!(!probe.is_null(), "CreateRectRgn must succeed");
         // A fresh window has no region: the whole window is it.
-        assert_eq!(unsafe { GetWindowRgn(raw, probe) }, 0, "a fresh window has no region");
+        assert_eq!(
+            unsafe { GetWindowRgn(raw, probe) },
+            0,
+            "a fresh window has no region"
+        );
 
         // Narrow it to (40,60)-(340,260) — this is what the countdown does (region = selection).
         let region = unsafe { CreateRectRgn(40, 60, 340, 260) };

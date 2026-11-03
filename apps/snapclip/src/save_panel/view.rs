@@ -540,13 +540,13 @@ impl SavePanel {
                                     YueSegmentedOption::new("medium", "中 · 75"),
                                     YueSegmentedOption::new("low", "低 · 50"),
                                 ])
-                                .on_change(cx.listener(|this, value: &SharedString, _, cx| {
+                                .on_change(cx.listener(|this, value: &SharedString, window, cx| {
                                     this.tier = match value.as_ref() {
                                         "medium" => 1,
                                         "low" => 2,
                                         _ => 0,
                                     };
-                                    this.schedule_preview(cx);
+                                    this.schedule_preview(window, cx);
                                 }))
                                 .into_any_element()
                             } else {
@@ -628,7 +628,7 @@ impl SavePanel {
                                             )
                                             .disabled(self.busy)
                                             .on_change(cx.listener(
-                                                |this, value: &SharedString, _, cx| {
+                                                |this, value: &SharedString, window, cx| {
                                                     this.fill_choice = value.clone();
                                                     if value != "custom" {
                                                         this.fill = if value == "black" {
@@ -636,7 +636,7 @@ impl SavePanel {
                                                         } else {
                                                             [255; 3]
                                                         };
-                                                        this.schedule_preview(cx);
+                                                        this.schedule_preview(window, cx);
                                                     }
                                                 },
                                             )),
@@ -739,7 +739,7 @@ impl SavePanel {
                 if let Some(size) = fitted {
                     panel.dimensions.output = size;
                     panel.sync_dimensions(window, cx);
-                    panel.schedule_preview(cx);
+                    panel.schedule_preview(window, cx);
                 } else {
                     panel.status_error = true;
                     panel.status = Some("无法满足体积上限，请提高上限或更换格式".into());
@@ -761,11 +761,6 @@ impl Render for SavePanel {
         let font = yue_component::typography::ui_font(theme);
         let muted = rgb(theme.text_secondary());
         let border = rgb(theme.border_default());
-        let mode = match self.preview.mode {
-            PreviewMode::Original => "original",
-            PreviewMode::Split => "split",
-            PreviewMode::Encoded => "encoded",
-        };
         let can_save = !self.busy
             && self.validation(cx).is_ok()
             && !self.measuring
@@ -843,106 +838,10 @@ impl Render for SavePanel {
                             .flex_1()
                             .min_h_0()
                             .gap_3()
-                            .child(
-                                YueSegmented::new("preview-mode", theme, mode)
-                                    .size(SegmentedSize::Small)
-                                    .accessibility_label("预览模式")
-                                    .options([
-                                        YueSegmentedOption::new("original", "原图"),
-                                        YueSegmentedOption::new("split", "对比"),
-                                        YueSegmentedOption::new("encoded", "编码后"),
-                                    ])
-                                    .on_change(cx.listener(|this, value: &SharedString, _, cx| {
-                                        this.preview.mode = match value.as_ref() {
-                                            "split" => PreviewMode::Split,
-                                            "encoded" => PreviewMode::Encoded,
-                                            _ => PreviewMode::Original,
-                                        };
-                                        if this.preview.split == 0. {
-                                            this.preview.split = 0.5;
-                                        }
-                                        cx.notify();
-                                    })),
-                            )
                             .child(self.viewport(cx))
-                            .child(
-                                row()
-                                    .justify_between()
-                                    .flex_wrap()
-                                    .child(
-                                        row()
-                                            .child(text_button("zoom-out", "−", theme).on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.zoom_by(1. / 1.25, None, cx)
-                                                }),
-                                            ))
-                                            .child(
-                                                YueButton::text(
-                                                    "zoom-reset",
-                                                    theme,
-                                                    format!("{:.0}%", self.zoom() * 100.),
-                                                )
-                                                .size(ButtonSize::Small)
-                                                .variant(ButtonVariant::Ghost)
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.preview.zoom = Some(1.);
-                                                    this.preview.pan = Point::default();
-                                                    cx.notify();
-                                                })),
-                                            )
-                                            .child(text_button("zoom-in", "+", theme).on_click(
-                                                cx.listener(|this, _, _, cx| {
-                                                    this.zoom_by(1.25, None, cx)
-                                                }),
-                                            ))
-                                            .child(
-                                                text_button("zoom-fit", "适应", theme).on_click(
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.preview.zoom = None;
-                                                        this.preview.pan = Point::default();
-                                                        cx.notify();
-                                                    }),
-                                                ),
-                                            ),
-                                    )
-                                    .child(
-                                        row()
-                                            .child(
-                                                YueTag::checkable(
-                                                    "preview-background",
-                                                    "浅色底",
-                                                    self.preview.light,
-                                                )
-                                                .theme(theme)
-                                                .size(TagSize::Small)
-                                                .shape(TagShape::Pill)
-                                                .on_change(toggle(cx, |this, value, _, cx| {
-                                                    this.preview.light = value;
-                                                    cx.notify();
-                                                })),
-                                            )
-                                            .child(
-                                                YueTag::checkable(
-                                                    "preview-grid",
-                                                    "像素网格",
-                                                    self.preview.grid,
-                                                )
-                                                .theme(theme)
-                                                .size(TagSize::Small)
-                                                .shape(TagShape::Pill)
-                                                .on_change(toggle(cx, |this, value, _, cx| {
-                                                    this.preview.grid = value;
-                                                    cx.notify();
-                                                })),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child("滚轮缩放 · 拖动平移 · 对比模式可拖动分隔线"),
-                            ),
+                            .child(div().text_xs().text_color(muted).child(
+                                "滚轮缩放 · 拖动平移 · 双击适应窗口 · 宽高比改变时不可对比",
+                            )),
                     )
                     .child(self.form(theme, cx)),
             )

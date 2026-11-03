@@ -177,7 +177,8 @@ pub fn over_fill(bgra: &[u8], fill: [u8; 3]) -> Vec<u8> {
             // `channel` indexes the buffer's own order (blue first), and the fill arrives in that
             // same order, so no channel is reordered here.
             let value =
-                (u32::from(pixel[channel]) * alpha + u32::from(fill[channel]) * inverse + 127) / 255;
+                (u32::from(pixel[channel]) * alpha + u32::from(fill[channel]) * inverse + 127)
+                    / 255;
             out.push(value as u8);
         }
         out.push(255);
@@ -335,7 +336,11 @@ mod tests {
             output: Size::new(1, 1),
         };
         let out = scaled(&frame);
-        assert_eq!(out, vec![50, 50, 0, 255], "the mean of the four, in BGRA order");
+        assert_eq!(
+            out,
+            vec![50, 50, 0, 255],
+            "the mean of the four, in BGRA order"
+        );
     }
 
     /// A flat colour stays flat at any size, which is what the weights summing to one buys.
@@ -343,7 +348,12 @@ mod tests {
     fn a_flat_colour_survives_shrinking_and_growing() {
         let source = Size::new(5, 3);
         let flat = solid(source, [40, 80, 120, 255]);
-        for output in [Size::new(2, 2), Size::new(11, 7), Size::new(5, 3), Size::new(1, 1)] {
+        for output in [
+            Size::new(2, 2),
+            Size::new(11, 7),
+            Size::new(5, 3),
+            Size::new(1, 1),
+        ] {
             let frame = Frame {
                 bgra: &flat,
                 source,
@@ -429,7 +439,11 @@ mod tests {
         assert_eq!(parse_size(" 1440 "), Some(1440));
         assert_eq!(parse_size("0"), None, "zero is not a size");
         assert_eq!(parse_size(""), None);
-        assert_eq!(parse_size("1440px"), None, "the unit is not part of the field");
+        assert_eq!(
+            parse_size("1440px"),
+            None,
+            "the unit is not part of the field"
+        );
         assert_eq!(parse_size("-3"), None);
         assert_eq!(parse_size("1 4"), None);
     }
@@ -521,7 +535,10 @@ mod tests {
             ("50".to_owned(), "50".to_owned())
         );
         let back = output_size(SizeMode::Percent, "50", "50", source);
-        assert_eq!(back, half, "the size survives the round trip through percent");
+        assert_eq!(
+            back, half,
+            "the size survives the round trip through percent"
+        );
     }
 
     /// A transparent pixel takes the fill colour; an opaque one is left exactly as it was.
@@ -543,7 +560,14 @@ mod tests {
         // Half transparent, straight alpha: half the colour and half the fill.
         let half = [100u8, 50, 0, 128];
         let filled = over_fill(&half, [0, 0, 0]);
-        assert_eq!(&filled[..3], &[50, 25, 0], "half of a straight-alpha colour");
-        assert_eq!(filled[3], 255, "the result is opaque, because JPEG has no alpha");
+        assert_eq!(
+            &filled[..3],
+            &[50, 25, 0],
+            "half of a straight-alpha colour"
+        );
+        assert_eq!(
+            filled[3], 255,
+            "the result is opaque, because JPEG has no alpha"
+        );
     }
 }

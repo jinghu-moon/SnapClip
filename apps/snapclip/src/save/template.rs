@@ -99,11 +99,8 @@ mod tests {
     /// Every variable produces exactly the shape the spec's table shows.
     #[test]
     fn each_variable_expands_to_the_shape_the_spec_shows() {
-        let expanded = expand(
-            "[日期]_[时间]_[序号]_[分辨率]_[软件名]",
-            &values(),
-        )
-        .expect("a template of known variables");
+        let expanded = expand("[日期]_[时间]_[序号]_[分辨率]_[软件名]", &values())
+            .expect("a template of known variables");
         assert_eq!(
             expanded, "2026-10-18_1432_7_1250x809_SnapClip",
             "the spec's examples: 2026-10-18, 1432, 7, 1440x900, SnapClip"
@@ -130,13 +127,19 @@ mod tests {
     /// A half-typed bracket is not a name either.
     #[test]
     fn an_unclosed_bracket_is_refused() {
-        assert_eq!(expand("shot_[日期", &values()).expect_err("unclosed"), TemplateError::Unclosed);
+        assert_eq!(
+            expand("shot_[日期", &values()).expect_err("unclosed"),
+            TemplateError::Unclosed
+        );
     }
 
     /// An empty template, and one that expands to nothing, both leave no name.
     #[test]
     fn an_empty_template_or_an_empty_result_is_refused() {
-        assert_eq!(expand("", &values()).expect_err("empty"), TemplateError::Empty);
+        assert_eq!(
+            expand("", &values()).expect_err("empty"),
+            TemplateError::Empty
+        );
         let mut v = values();
         v.date = "";
         assert_eq!(

@@ -28,12 +28,25 @@ const BLOCK: usize = 8;
 /// Luma of one RGBA pixel, BT.601 weights, which is what the eye's structural sensitivity follows.
 fn luma(rgba: &[u8], width: usize, x: usize, y: usize) -> f64 {
     let index = (y * width + x) * 4;
-    0.299 * f64::from(rgba[index]) + 0.587 * f64::from(rgba[index + 1]) + 0.114 * f64::from(rgba[index + 2])
+    0.299 * f64::from(rgba[index])
+        + 0.587 * f64::from(rgba[index + 1])
+        + 0.114 * f64::from(rgba[index + 2])
 }
 
 /// Metrics over the whole frame.
 pub fn whole(reference: &[u8], candidate: &[u8], width: usize, height: usize) -> Metrics {
-    measure(reference, candidate, width, height, &[TextRegion { x0: 0, y0: 0, x1: width, y1: height }])
+    measure(
+        reference,
+        candidate,
+        width,
+        height,
+        &[TextRegion {
+            x0: 0,
+            y0: 0,
+            x1: width,
+            y1: height,
+        }],
+    )
 }
 
 /// Metrics over the union of `regions`, which must not overlap.
@@ -55,7 +68,10 @@ fn measure(
     regions: &[TextRegion],
 ) -> Metrics {
     assert_eq!(reference.len(), candidate.len(), "sizes must match");
-    assert!(reference.len() >= width * height * 4, "buffers must cover the frame");
+    assert!(
+        reference.len() >= width * height * 4,
+        "buffers must cover the frame"
+    );
     Metrics {
         ssim: ssim(reference, candidate, width, height, regions),
         psnr: psnr(reference, candidate, width, height, regions),
@@ -77,7 +93,8 @@ fn psnr(
             for x in region.x0..region.x1.min(width) {
                 let index = (y * width + x) * 4;
                 for channel in 0..3 {
-                    let difference = f64::from(reference[index + channel]) - f64::from(candidate[index + channel]);
+                    let difference = f64::from(reference[index + channel])
+                        - f64::from(candidate[index + channel]);
                     squared += difference * difference;
                     samples += 1;
                 }
@@ -88,7 +105,11 @@ fn psnr(
         return f64::INFINITY;
     }
     let mse = squared / samples as f64;
-    if mse == 0.0 { f64::INFINITY } else { 10.0 * (255.0 * 255.0 / mse).log10() }
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
 }
 
 /// Mean SSIM over every window that lies entirely inside one of `regions`.
@@ -123,7 +144,11 @@ fn ssim(
             y += block_y;
         }
     }
-    if windows == 0 { 1.0 } else { total / windows as f64 }
+    if windows == 0 {
+        1.0
+    } else {
+        total / windows as f64
+    }
 }
 
 fn window_ssim(
@@ -166,7 +191,11 @@ fn window_ssim(
     let numerator = (2.0 * mean_reference * mean_candidate + C1) * (2.0 * covariance + C2);
     let denominator = (mean_reference * mean_reference + mean_candidate * mean_candidate + C1)
         * (variance_reference + variance_candidate + C2);
-    if denominator == 0.0 { 1.0 } else { numerator / denominator }
+    if denominator == 0.0 {
+        1.0
+    } else {
+        numerator / denominator
+    }
 }
 
 /// Copies a rectangle out of an RGBA frame, for the zoomed side-by-side dump.
@@ -194,7 +223,11 @@ mod tests {
         for y in 0..height {
             for x in 0..width {
                 let index = (y * width + x) * 4;
-                let value = if x < width / 2 { ((x * 37 + y * 11) % 256) as u8 } else { 128 };
+                let value = if x < width / 2 {
+                    ((x * 37 + y * 11) % 256) as u8
+                } else {
+                    128
+                };
                 rgba[index] = value;
                 rgba[index + 1] = value;
                 rgba[index + 2] = value;
@@ -245,11 +278,24 @@ mod tests {
                 }
             }
         }
-        let text = TextRegion { x0: 0, y0: 0, x1: width / 2, y1: height };
+        let text = TextRegion {
+            x0: 0,
+            y0: 0,
+            x1: width / 2,
+            y1: height,
+        };
         let inside = in_regions(&reference, &candidate, width, height, &[text]);
         let outside = whole(&reference, &candidate, width, height);
-        assert!((inside.ssim - 1.0).abs() < 1e-9, "region ssim {}", inside.ssim);
-        assert!(outside.ssim < 0.99, "whole ssim {} should notice", outside.ssim);
+        assert!(
+            (inside.ssim - 1.0).abs() < 1e-9,
+            "region ssim {}",
+            inside.ssim
+        );
+        assert!(
+            outside.ssim < 0.99,
+            "whole ssim {} should notice",
+            outside.ssim
+        );
     }
 
     #[test]
@@ -257,7 +303,12 @@ mod tests {
         let (width, height) = (64, 32);
         let reference = frame(width, height);
         let mut candidate = reference.clone();
-        let tiny = TextRegion { x0: 4, y0: 4, x1: 14, y1: 9 };
+        let tiny = TextRegion {
+            x0: 4,
+            y0: 4,
+            x1: 14,
+            y1: 9,
+        };
         for y in tiny.y0..tiny.y1 {
             for x in tiny.x0..tiny.x1 {
                 let index = (y * width + x) * 4;
@@ -265,7 +316,11 @@ mod tests {
             }
         }
         let metrics = in_regions(&reference, &candidate, width, height, &[tiny]);
-        assert!(metrics.ssim < 0.9, "a 10x5 region must be measurable, got {}", metrics.ssim);
+        assert!(
+            metrics.ssim < 0.9,
+            "a 10x5 region must be measurable, got {}",
+            metrics.ssim
+        );
         assert!(metrics.psnr.is_finite());
     }
 
@@ -279,7 +334,16 @@ mod tests {
                 rgba[index] = (y * 10) as u8;
             }
         }
-        let (pixels, crop_width, crop_height) = crop(&rgba, width, TextRegion { x0: 2, y0: 1, x1: 6, y1: 3 });
+        let (pixels, crop_width, crop_height) = crop(
+            &rgba,
+            width,
+            TextRegion {
+                x0: 2,
+                y0: 1,
+                x1: 6,
+                y1: 3,
+            },
+        );
         assert_eq!((crop_width, crop_height), (4, 2));
         assert_eq!(pixels.len(), 4 * 2 * 4);
         // First row of the crop is row 1 of the frame.

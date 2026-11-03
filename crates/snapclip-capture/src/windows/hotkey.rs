@@ -330,9 +330,7 @@ mod tests {
     /// L1: the table is what `register` walks, so the registration order is the table order.
     #[test]
     fn the_registration_order_is_the_table_order() {
-        assert_eq!(
-            HOTKEYS,
-            [CAPTURE_HOTKEY, SCROLL_HOTKEY, EXPORT_HOTKEY]        );
+        assert_eq!(HOTKEYS, [CAPTURE_HOTKEY, SCROLL_HOTKEY, EXPORT_HOTKEY]);
     }
 
     /// L3 (`docs/32` §7, row 79): both keys really register on this desktop, and releasing them

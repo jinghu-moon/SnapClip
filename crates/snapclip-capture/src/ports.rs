@@ -197,7 +197,6 @@ pub fn whole_from_bands(
     spec: &SelectionSpec,
     bands: &mut dyn BandSource,
 ) -> crate::CaptureResult<crate::artifact::SelectionPixels> {
-
     let width = u32::try_from(spec.region.width()).unwrap_or(0);
     let rows = bands.rows();
     if width == 0 || rows == 0 || u32::try_from(spec.region.height()).ok() != Some(rows) {
@@ -228,5 +227,5 @@ pub fn whole_from_bands(
         origin: spec.origin,
         corner_radius: spec.corner_radius,
     };
-        Ok(prepared)
+    Ok(prepared)
 }

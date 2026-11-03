@@ -37,7 +37,7 @@ use super::win::wgc::{WgcFrame, WgcSession};
 use crate::geometry::{Point, Rect};
 use crate::scroll::estimate::Estimate;
 use crate::scroll::stitch::Placement;
-use crate::scroll::{should_log, Auto, Preview, Status, Step, Tracker};
+use crate::scroll::{Auto, Preview, Status, Step, Tracker, should_log};
 
 /// One auto notch every this long: slow enough for a page to repaint before the next one.
 ///
@@ -92,7 +92,9 @@ const AUTO_INTERVAL_ENV: &str = "SCROLL_AUTO_INTERVAL_MS";
 #[cfg(any(test, feature = "test-support"))]
 fn parse_ms_override(raw: &str) -> Option<Duration> {
     let ms: u64 = raw.trim().parse().ok()?;
-    (20..=5_000).contains(&ms).then(|| Duration::from_millis(ms))
+    (20..=5_000)
+        .contains(&ms)
+        .then(|| Duration::from_millis(ms))
 }
 
 /// [`AUTO_INTERVAL`], or the override when a measurement build was asked for one.
@@ -948,9 +950,16 @@ mod tests {
     #[test]
     fn a_notch_ends_the_instant_a_frame_shows_it() {
         let now = Instant::now();
-        for age in [Duration::ZERO, Duration::from_millis(1), Duration::from_millis(30)] {
+        for age in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(30),
+        ] {
             let mut flight = pending(now + OBSERVE_TIMEOUT);
-            assert_eq!(observe(&mut flight, true, now + age), Some(Observation::Moved));
+            assert_eq!(
+                observe(&mut flight, true, now + age),
+                Some(Observation::Moved)
+            );
         }
     }
 
@@ -960,7 +969,11 @@ mod tests {
     fn a_notch_that_times_out_reports_what_the_page_did() {
         let now = Instant::now();
         let mut silent = pending(now + OBSERVE_TIMEOUT);
-        assert_eq!(observe(&mut silent, false, now), None, "the window is still open");
+        assert_eq!(
+            observe(&mut silent, false, now),
+            None,
+            "the window is still open"
+        );
         assert_eq!(
             observe(&mut silent, false, now + OBSERVE_TIMEOUT),
             Some(Observation::NoMove { saw_frame: false }),
@@ -991,7 +1004,10 @@ mod tests {
             None,
             "the page is still drawing; an old deadline must not end the notch"
         );
-        assert_eq!(observe(&mut flight, true, late + Duration::from_millis(200)), Some(Observation::Moved));
+        assert_eq!(
+            observe(&mut flight, true, late + Duration::from_millis(200)),
+            Some(Observation::Moved)
+        );
     }
 
     /// The override is a measurement tool, so its parser has to refuse the values that would make
@@ -1005,7 +1021,11 @@ mod tests {
         assert_eq!(parse_ms_override("20"), Some(Duration::from_millis(20)));
         assert_eq!(parse_ms_override("5000"), Some(Duration::from_millis(5000)));
         for nonsense in ["0", "-1", "19", "5001", "", "fast", "1.5", "200ms"] {
-            assert_eq!(parse_ms_override(nonsense), None, "{nonsense:?} must be refused");
+            assert_eq!(
+                parse_ms_override(nonsense),
+                None,
+                "{nonsense:?} must be refused"
+            );
         }
     }
 
@@ -1056,7 +1076,9 @@ mod tests {
         let fast = notches(fast_frame, fast_frame);
         let expected = AUTO_INTERVAL.max(fast_frame * 2);
         assert_eq!(
-            fast.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>(),
+            fast.windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect::<Vec<_>>(),
             vec![expected; 9],
             "a 40 ms page is read every two frames, or at the interval when that is slower"
         );
@@ -1070,7 +1092,9 @@ mod tests {
         // the answer -- not the clock -- is what spaces the notches.
         let late = notches(Duration::from_millis(40), OBSERVE_TIMEOUT);
         assert_eq!(
-            late.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>(),
+            late.windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect::<Vec<_>>(),
             vec![OBSERVE_TIMEOUT; 9],
             "a page that takes a window to answer is read at the window"
         );
@@ -1079,7 +1103,10 @@ mod tests {
         // up on the run -- the count `idle_after` is handed below.
         let offline = notches(Duration::from_millis(5_000), OBSERVE_TIMEOUT);
         assert_eq!(
-            offline.windows(2).map(|pair| pair[1] - pair[0]).collect::<Vec<_>>(),
+            offline
+                .windows(2)
+                .map(|pair| pair[1] - pair[0])
+                .collect::<Vec<_>>(),
             vec![Duration::from_millis(5_000); 9],
             "a single frame per five seconds is unanswered, and the timeout is what advances"
         );
@@ -1087,7 +1114,10 @@ mod tests {
         for _ in 0..10 {
             idle_after(Observation::NoMove { saw_frame: false }, &mut idle_notches);
         }
-        assert_eq!(idle_notches, AUTO_IDLE_NOTCHES, "ten unanswered notches is the give-up run");
+        assert_eq!(
+            idle_notches, AUTO_IDLE_NOTCHES,
+            "ten unanswered notches is the give-up run"
+        );
     }
 
     /// Ten notches in a row that moved nothing is the end of auto, and one that moves is a fresh
@@ -1106,9 +1136,18 @@ mod tests {
             idle_after(Observation::NoMove { saw_frame: false }, &mut idle_notches),
             Idle::GiveUp
         );
-        assert_eq!(idle_notches, AUTO_IDLE_NOTCHES, "the log names the run it ended on");
-        assert_eq!(idle_after(Observation::Moved, &mut idle_notches), Idle::Moved);
-        assert_eq!(idle_notches, 0, "a page that answers is not the page that stops auto");
+        assert_eq!(
+            idle_notches, AUTO_IDLE_NOTCHES,
+            "the log names the run it ended on"
+        );
+        assert_eq!(
+            idle_after(Observation::Moved, &mut idle_notches),
+            Idle::Moved
+        );
+        assert_eq!(
+            idle_notches, 0,
+            "a page that answers is not the page that stops auto"
+        );
     }
 
     /// The overlay hands the thumbnail's buffer back on every wake-up, and the next frame gathers
@@ -1144,12 +1183,19 @@ mod tests {
         let preview = tracker.fill_preview(SHOWN, Vec::new());
         let row = (preview.width * 4) as usize;
         assert_eq!(preview.bytes.len(), row * SHOWN as usize);
-        assert_eq!(preview.width, PANEL, "the thumbnail is as wide as the panel");
+        assert_eq!(
+            preview.width, PANEL,
+            "the thumbnail is as wide as the panel"
+        );
         {
             let mut report = worker.shared.report.lock().unwrap();
             report.preview = Some(preview);
         }
-        let held = worker.take_report().preview.expect("the report carries it").bytes;
+        let held = worker
+            .take_report()
+            .preview
+            .expect("the report carries it")
+            .bytes;
         let capacity = held.capacity();
         worker.recycle_preview(held);
 
@@ -1178,6 +1224,9 @@ mod tests {
         worker.recycle_preview(again.bytes);
         let spare = std::mem::take(&mut *worker.shared.recycled.lock().unwrap());
         assert_eq!(spare.capacity(), capacity.max(row * WIDER as usize));
-        assert!(spare.is_empty(), "the overlay's buffer goes back empty and ready");
+        assert!(
+            spare.is_empty(),
+            "the overlay's buffer goes back empty and ready"
+        );
     }
 }

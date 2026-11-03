@@ -242,7 +242,6 @@ fn the_export_path_allocates_no_second_full_copy() {
     let _ = std::fs::remove_dir_all(directory);
 }
 
-
 /// A band source over a page the caller already owns: the shape a scroll session hands the writer.
 struct Bands<'a> {
     image: &'a [u8],

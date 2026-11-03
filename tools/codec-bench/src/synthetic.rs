@@ -113,8 +113,16 @@ fn rounded_rect(
 ) {
     for y in y0..y1 {
         for x in x0..x1 {
-            let dx = if x - x0 < x1 - 1 - x { x - x0 } else { x1 - 1 - x };
-            let dy = if y - y0 < y1 - 1 - y { y - y0 } else { y1 - 1 - y };
+            let dx = if x - x0 < x1 - 1 - x {
+                x - x0
+            } else {
+                x1 - 1 - x
+            };
+            let dy = if y - y0 < y1 - 1 - y {
+                y - y0
+            } else {
+                y1 - 1 - y
+            };
             if dx < radius && dy < radius {
                 let cx = radius - dx;
                 let cy = radius - dy;
@@ -158,7 +166,14 @@ fn glyph_rows(
             let ink = INK[rng.range(0, INK.len() as i32) as usize];
             for stroke in 0..3 {
                 let offset = rng.range(0, cell - 2);
-                horizontal(pixels, width, x + offset, x + offset + rng.range(1, 3), y + 2 + stroke * 3, ink);
+                horizontal(
+                    pixels,
+                    width,
+                    x + offset,
+                    x + offset + rng.range(1, 3),
+                    y + 2 + stroke * 3,
+                    ink,
+                );
             }
             x += cell + rng.range(2, 6);
         }
@@ -180,7 +195,14 @@ fn ui(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
     // A vertical gradient, then flat panels, hairlines and text: the mix that separates encoders.
     for y in 0..height {
         let shade = 236 - (y * 40 / height) as u8;
-        horizontal(&mut pixels, width, 0, width as i32, y as i32, [shade, shade, shade.saturating_add(3), 255]);
+        horizontal(
+            &mut pixels,
+            width,
+            0,
+            width as i32,
+            y as i32,
+            [shade, shade, shade.saturating_add(3), 255],
+        );
     }
     let panels = 4;
     for panel in 0..panels {
@@ -188,15 +210,53 @@ fn ui(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
         let y0 = 60;
         let x1 = x0 + width as i32 / panels as i32 - 80;
         let y1 = height as i32 - 120;
-        let fill = [200 + rng.range(0, 20) as u8, 200 + rng.range(0, 20) as u8, 205, 255];
+        let fill = [
+            200 + rng.range(0, 20) as u8,
+            200 + rng.range(0, 20) as u8,
+            205,
+            255,
+        ];
         rounded_rect(&mut pixels, width, x0, y0, x1, y1, 10, fill);
-        rounded_rect(&mut pixels, width, x0, y0, x1, y0 + 34, 10, [90, 120, 160, 255]);
+        rounded_rect(
+            &mut pixels,
+            width,
+            x0,
+            y0,
+            x1,
+            y0 + 34,
+            10,
+            [90, 120, 160, 255],
+        );
         vertical(&mut pixels, width, x0, y0, y1, [150, 150, 150, 255]);
         horizontal(&mut pixels, width, x0, x1, y1 - 1, [150, 150, 150, 255]);
-        glyph_rows(&mut pixels, width, height, &mut rng, y0 + 60, 6, 11, &mut text_regions);
+        glyph_rows(
+            &mut pixels,
+            width,
+            height,
+            &mut rng,
+            y0 + 60,
+            6,
+            11,
+            &mut text_regions,
+        );
     }
-    glyph_rows(&mut pixels, width, height, &mut rng, 24, 2, 13, &mut text_regions);
-    Asset { name, width, height, pixels, text_regions }
+    glyph_rows(
+        &mut pixels,
+        width,
+        height,
+        &mut rng,
+        24,
+        2,
+        13,
+        &mut text_regions,
+    );
+    Asset {
+        name,
+        width,
+        height,
+        pixels,
+        text_regions,
+    }
 }
 
 fn scroll(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
@@ -208,12 +268,41 @@ fn scroll(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
     let band = 240;
     let mut y = 0;
     while y < height {
-        horizontal(&mut pixels, width, 0, width as i32, y as i32, [245, 245, 245, 255]);
-        horizontal(&mut pixels, width, 32, width as i32 - 32, (y + band - 1) as i32, [210, 210, 210, 255]);
-        glyph_rows(&mut pixels, width, height, &mut rng, y as i32 + 16, 4, 10, &mut text_regions);
+        horizontal(
+            &mut pixels,
+            width,
+            0,
+            width as i32,
+            y as i32,
+            [245, 245, 245, 255],
+        );
+        horizontal(
+            &mut pixels,
+            width,
+            32,
+            width as i32 - 32,
+            (y + band - 1) as i32,
+            [210, 210, 210, 255],
+        );
+        glyph_rows(
+            &mut pixels,
+            width,
+            height,
+            &mut rng,
+            y as i32 + 16,
+            4,
+            10,
+            &mut text_regions,
+        );
         y += band;
     }
-    Asset { name, width, height, pixels, text_regions }
+    Asset {
+        name,
+        width,
+        height,
+        pixels,
+        text_regions,
+    }
 }
 
 fn translucent(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
@@ -222,17 +311,57 @@ fn translucent(name: &'static str, width: usize, height: usize, seed: u64) -> As
     let mut text_regions = Vec::new();
     for y in 0..height {
         let shade = 30 + (y * 60 / height) as u8;
-        horizontal(&mut pixels, width, 0, width as i32, y as i32, [shade + 20, shade, shade, 255]);
+        horizontal(
+            &mut pixels,
+            width,
+            0,
+            width as i32,
+            y as i32,
+            [shade + 20, shade, shade, 255],
+        );
     }
     // Windows with real alpha, plus opaque content inside them.
     for window in 0..3 {
         let x0 = 120 + window * 560;
         let y0 = 160 + window * 300;
-        rounded_rect(&mut pixels, width, x0, y0, x0 + 460, y0 + 300, 16, [250, 250, 250, 190]);
-        rounded_rect(&mut pixels, width, x0, y0, x0 + 460, y0 + 36, 16, [40, 90, 140, 210]);
-        glyph_rows(&mut pixels, width, height, &mut rng, y0 + 60, 3, 9, &mut text_regions);
+        rounded_rect(
+            &mut pixels,
+            width,
+            x0,
+            y0,
+            x0 + 460,
+            y0 + 300,
+            16,
+            [250, 250, 250, 190],
+        );
+        rounded_rect(
+            &mut pixels,
+            width,
+            x0,
+            y0,
+            x0 + 460,
+            y0 + 36,
+            16,
+            [40, 90, 140, 210],
+        );
+        glyph_rows(
+            &mut pixels,
+            width,
+            height,
+            &mut rng,
+            y0 + 60,
+            3,
+            9,
+            &mut text_regions,
+        );
     }
-    Asset { name, width, height, pixels, text_regions }
+    Asset {
+        name,
+        width,
+        height,
+        pixels,
+        text_regions,
+    }
 }
 
 #[cfg(test)]
@@ -244,7 +373,10 @@ mod tests {
         for seed in [0x5eed_1000u64, 0x5eed_a000] {
             let first = ui("a", 320, 200, seed);
             let second = ui("a", 320, 200, seed);
-            assert_eq!(first.pixels, second.pixels, "seed {seed:#x} must be reproducible");
+            assert_eq!(
+                first.pixels, second.pixels,
+                "seed {seed:#x} must be reproducible"
+            );
         }
     }
 
@@ -258,7 +390,12 @@ mod tests {
     #[test]
     fn every_asset_is_fully_sized_and_has_content() {
         for asset in corpus() {
-            assert_eq!(asset.pixels.len(), asset.width * asset.height * 4, "{}", asset.name);
+            assert_eq!(
+                asset.pixels.len(),
+                asset.width * asset.height * 4,
+                "{}",
+                asset.name
+            );
             // Not a blank canvas: at least one pixel differs from the first.
             let first = &asset.pixels[0..4];
             assert!(

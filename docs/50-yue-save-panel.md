@@ -2,6 +2,8 @@
 
 日期：2026-11-02。范围：普通选区的 GPUI 保存面板与独立开发预览。
 
+后续HDR资源、保留HDR／转换为SDR和编码结果预览的待实施改造见 [53 · HDR捕获与消费接入](53-hdr-capture.md)，不将本文既有SDR验收视作HDR验证。
+
 依据 `docs/design/save-panel-demo-v3.html` 保留任务、信息层级与左右布局，按 GPUI 控件尺寸、滚动、焦点和真实编码能力作调整。此次删除旧 `gpui_probe.rs`，将 `gpui_save.rs` 的有效业务适配与回归测试迁入 `save_panel/source.rs`；没有同名转发模块或旧探针 API。
 
 ## 1. 先判断组件缺口
@@ -17,10 +19,10 @@
 | 体积开关 | YueSwitch | 否 |
 | JPEG 填充色 | YueSwatchGroup + YueColorPickerState | 否 |
 | 编码说明浮层 | Base Popover 负责开关、定位、Escape 和焦点，宿主提供 Yue 表面样式 | 不为一个说明浮层新增通用 Popover |
-| 图片、缩放平移、原图/编码后比较 | 宿主私有 canvas 视口，显示真实图像 | 当前库没有已实现的 YueImagePreview；本次不冒充该公开组件 |
+| 图片、缩放平移、原图/编码后比较 | YueImagePreview + 保留的 YueImagePreviewState | 已接入现有组件；宿主只负责准备图像及导出 |
 | 富通知、内联重命名、OLE 拖出、PDF/长图分片 | 未纳入普通选区面板重写 | 不用原型的模拟按钮替代真实业务 |
 
-Yue 仓库 `docs/25-image-preview.md` 仍是公开组件的设计合同，本次私有视口不代表它已经实现。
+2026-11-03 已接入 Yue 仓库 `docs/25-image-preview.md` 对应的现有实现，删除原私有视口的相机、手势、网格和分隔线绘制逻辑。
 
 ## 2. 原型到桌面的调整
 
@@ -43,7 +45,7 @@ apps/snapclip/src/save_panel/
   directories.rs  路径预设、校验去重、原子持久化和应用级记录
   model.rs     源尺寸、输出像素、单位、当前锁定比例与校验
   view.rs      Yue 控件组合、表单滚动、状态和底栏
-  preview.rs   内存图像、视口计算、绘制和手势
+  preview.rs   内存图像准备、版本化结果提交及 YueImagePreview 组合
   source.rs    原保存适配与编码/落盘回归测试
   tests.rs     新面板行为与布局测试
 ```
@@ -56,7 +58,7 @@ apps/snapclip/src/save_panel/
 
 这里是**同一编码规则，不是复用同一个编码产物**：预览与正式保存仍各编码一次。`docs/42` §3 中规划的 PendingCapture / 文件型 EncodedArtifact / 长图有界 tile 解码尚未由本次实现，不能将此面板称为该长图架构已完成。
 
-宿主持有一份 `Arc<Picture>`；任务克隆资源引用。原图两边均不超过 4096 px 时，直接复制 BGRA 到原尺寸纹理，由 GPU 在绘制时缩放；单张 CPU 帧像素缓冲最多 64 MiB，纹理像素也采用这个上限，具体图集开销由后端决定。单边超过 4096 px 的源保留最长边 2048 的缩略策略，从借用的源直接采样，不额外复制完整原图；这条大图路径仍有 CPU 重采样成本。编码后的纹理维持最长边 2048，文件按完整所选尺寸导出，保存算法不变。
+宿主持有一份 `Arc<Picture>`，任务克隆资源引用。原图通过Yue公共BGRA入口准备，编码结果通过公共静态解码入口准备；二者采用相同的8192单边／64MiB栅格双预算。预算内保留完整分辨率，超预算从借用源生成有界代理，不先复制整张原图；实际atlas开销、宿主原图及旧结果另计。已移除4096阈值与固定2048结果纹理；当前合同详见§11.1，保存算法不变。
 
 当前普通选区编辑器使用整帧编码/解码，明确拒绝超过 6400 万像素或单边 32768 px 的输出草稿，避免无界分配；格式自身的更严限制同样生效。这是面板预算，不是 PNG 等格式的能力上限。长图的独立流式导出路径没有改动，也没有被转换成整图送入此面板。
 
@@ -72,6 +74,7 @@ apps/snapclip/src/save_panel/
 [patch.crates-io]
 gpui-base = { path = "../GPUI-Yue-Component/vendor/gpui-base" }
 gpui-pre = { path = "../GPUI-Yue-Component/vendor/gpui-pre" }
+gpui-pre-windows = { path = "../GPUI-Yue-Component/vendor/gpui-pre-windows" }
 ```
 
 依赖库工作区中的 patch 不会自动传播给消费方。未修改 Cargo registry。
@@ -188,7 +191,7 @@ cargo build -p snapclip-app --locked
 | 真实 1700 × 1373 截图，PNG 232890 字节 | 1119–1137 ms，且此前还要等 180 ms 防抖 | 约 1.3 ms；编码独立继续，PNG 字节数相同 |
 | 合成 3840 × 2160 BGRA 截图 | 约 1049–1056 ms，仅计算缩略处理 | 约 4 ms，保留 3840 × 2160 原像素 |
 
-这是从已有 BGRA 到 `RenderImage` 可发布的 **CPU 阶段**计时，第一行修改前包含串行编码/解码等待，第二行隔离了原图缩略热点；两行不是同一套工作负载。计时不包括窗口创建、GPU 上传或屏幕呈现，不能据此声称首帧在 1–4 ms 内显示。超过 4096 px 的原图仍走受限缩略路径，未承诺所有尺寸都立即就绪。
+这是从已有 BGRA 到 `RenderImage` 可发布的 **CPU 阶段**计时，第一行修改前包含串行编码/解码等待，第二行隔离了原图缩略热点；两行不是同一套工作负载。计时不包括窗口创建、GPU 上传或屏幕呈现，不能据此声称首帧在 1–4 ms 内显示。该批采用的4096／2048策略已由§11.1公共双预算替代；大图仍有后台准备成本，未承诺所有尺寸都立即就绪。
 
 新增 5 项永久回归：①原图不等待 180 ms，且非法尺寸不会替换已加载原图；②在导出启动前取消它仍能得到原图；③BGRA/alpha 与大图纹理边界；④4K 原像素直通；⑤非法像素缓冲拒绝。首图时序及 4K 路径用例均先观察到失败，再实施修复。现有 PNG/JPEG/WebP 预览与落盘字节/尺寸/透明填充测试继续通过。具体命令与测试总数见第 6 节；实机边界仍按该节说明。
 
@@ -207,3 +210,50 @@ cargo build -p snapclip-app --locked
 自定义路径存入 `<app data>/save-panel-paths.json`，与设置页的文件分开，避免它们互相覆盖。目录验证、路径解析和写盘在后台执行，临时文件写完后原子替换；写盘成功后才发布新 Tag。应用级记录串行化新增请求，视图订阅记录变化；保存任务不会因为发起面板关闭而取消，失败保留现有预设并反馈错误。测试使用独立目录或内存记录，不写真实用户预设。
 
 本节新增 8 项 SnapClip 回归（含关闭面板期间保存、读回持久化、重复/非法路径和写盘失败）、1 项 Yue Select 回归；最新计数见第 6 节。Computer Use 仍报告 native pipe 不可用，真实窗口截图验收尚未完成；无头几何、交互和绘制检查不等同于实机验收。
+
+
+## 11. 接入现有 YueImagePreview（2026-11-03）
+
+保存面板现在持有一个 `Entity<YueImagePreviewState>`，由现有 `YueImagePreview` 提供原图/对比/编码后三种模式、缩放、100%、适应窗口/宽度、拖动平移、对比分隔线、背景选择、像素网格及作用域快捷键。原 `PreviewMode`、zoom/pan/split、手写 checker canvas 和重复工具条已删除。
+
+消费根已补齐 `gpui-pre-windows` 本地patch并更新Cargo.lock；三个补丁分别为Base、GPUI core、Windows后端。仅core与Base不足以提供组件工具条的真实局部磨砂和像素网格的最近邻采样，必须使用与Yue工作区相同的Windows后端。依赖树已核对指向相邻Yue仓库，不修改Cargo registry。
+
+应用仍负责独立原图准备、180ms 防抖后的真实编码、导出字节计数、保存与复制；`RenderImage` 使用共享 Arc 提交。每次原图/结果状态改变，在事件或异步完成回调中提交同一文档 ID 及单调 revision，不在 render 中重建状态或启动任务。旧编码任务不能覆盖新版本。刷新期间组件可显示带“上一版”标记的旧结果；非法尺寸草稿会明确清除结果，保留原图并阻止保存。源图与结果的失败通过组件错误态和重试事件接回应用任务。
+
+对比只用于同一完整画面且宽高比对齐的两张图；解除比例锁并改变宽高比后，对比不可用，原图和编码后仍可单独查看。不会把不同宽高比的图强行拉伸。双击图像改为适应窗口。预览快捷键只在图像焦点内工作，输入框中的 `1` 等字符继续作为输入。
+
+原图和编码结果现统一走Yue公共资源准备，移除私有通道转换和固定2048结果纹理。组件的100%按方向归一化后的**原始尺寸**映射物理屏幕像素，代理纹理不改变倍率语义；页脚分别标明两侧的可用纹理和细节边界。实际导出尺寸和字节不随预览纹理缩小，4K原图快速路径与PNG/JPEG/WebP落盘回归继续保留。
+
+### 行为与验证
+
+| 项目 | 接入前 | 接入后 |
+| --- | --- | --- |
+| 相机和手势 | 面板私有逻辑 | YueImagePreviewState统一拥有 |
+| 原图首次准备 | 不等待编码 | 保留，并以组件Loading/Ready/Failed呈现 |
+| 对比 | 私有canvas直接覆盖 | 组件检查完整画面和宽高比，真实分隔线交互 |
+| 失败重试 | 面板状态文字 | 组件错误态/重试按钮，宿主执行真实任务 |
+| 100% | 私有逻辑像素比例 | 按原始尺寸的物理像素比例；代理显式报告细节边界 |
+| 保存与复制 | 应用真实编码/写盘/系统复制 | 保留业务所有权，无组件内伪操作 |
+
+接入前保存面板相关测试40项通过；先补组件挂载断言并实际观察旧代码失败，日志为 `target/save-image-preview-before.log`。随后用真实组件UI测试替代已删除的私有相机算式测试，并新增错误重试及综合交互回归，当前相关测试41项通过。
+
+最终消费方回归：
+
+```powershell
+cargo test -p snapclip-app -p snapclip-pin --features snapclip-app/test-support,snapclip-pin/headless-tests --lib --locked
+cargo clippy -p snapclip-pin --features headless-tests --all-targets --no-deps --locked -- -D warnings
+```
+
+`target/image-preview-final-tests.log`：app **283 passed / 5 ignored**，pin **70 passed / 4 ignored**；pin严格Clippy通过。Yue图片预览专项33项通过（`target/snapclip-image-preview-regression.log`，位于Yue仓库）。应用包的全量严格Clippy仍被旧捕获、历史记录和原生保存窗口中的既有告警阻断，见 `target/image-preview-clippy.log`，不据此声称整个应用lint干净。完整workspace上轮已记录的两个集成失败见docs/52 §11.4，本次未改其断言。
+
+没有取得本轮真实窗口截图或实机交互验收证据；无头的交互、几何和绘制检查不能代替Windows DPI、字体、显卡与读屏检查。开发预览入口仍使用§5的环境变量。
+
+### 11.1 公共资源与采样升级（2026-11-03）
+
+- 原图借用Picture的连续BGRA，通过`ImagePreviewImage::from_bgra8`后台准备；不等待180ms导出防抖或编码结果。编码结果使用实际导出的字节和`from_encoded`，体积继续统计同一文件。
+- 两侧默认纹理限制为单边8192、栅格64MiB；超出时明确使用代理。原始像素、原始尺寸和保存／复制对象保持不变。默认静态解码还限制64MiB编码、6400万像素、32768原始单边、512MiB解码分配；限制并不等于进程或显存峰值。
+- 同文档代理升级完整图时保留手动倍率和中心。Compare任意一侧为代理时禁用最近邻和原始像素网格；完整图可选平滑／像素显示，静止100%与整数倍率对齐物理像素。保持现有版本取消／过期保护。
+- Windows精确采样与上传生命周期依赖相邻Yue仓库的core和Windows补丁；不修改Cargo registry，不另建图片缓存。EXIF方向在解码时应用，未转换ICC／非sRGB色彩明确标记，未提供完整色彩管理或超长图分块细节。
+- 新回归验证长图代理保留原始尺寸，以及3072px编码结果保留完整分辨率且纹理像素逐字节来自实际导出。最终命令、统计和真实UI边界见Yue的`docs/25-image-preview.md` §17.9；CPU测量见其`docs/performance/2026-11-03-image-preview-resources.md`。
+
+本批最终`target/image-preview-resources-final-tests.log`：app **285 passed / 5 ignored**、pin **71 passed / 4 ignored**；pin all-targets严格Clippy与两包all-targets check通过，见`image-preview-resources-pin-clippy.log`及`image-preview-resources-check.log`。应用及pin_preview示例均重新构建，通过`-C extra-filename=-image-resources`生成本批链接产物，日志为`image-preview-resources-app-build.log`和`image-preview-resources-pin-build.log`。未启动实窗，未提交或推送。

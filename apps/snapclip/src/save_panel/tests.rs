@@ -54,14 +54,22 @@ fn raw_preview_preserves_bgra_alpha_and_bounds_its_texture() {
     let pixels = vec![17, 70, 180, 0, 93, 21, 45, 255];
     let picture = Picture::from_selection(pixels.clone(), Size::new(2, 1));
     let original = preview::original(&picture).unwrap();
-    assert_eq!(original.as_bytes(0).unwrap(), pixels);
-    assert_eq!(original.size(0), size(DevicePixels(2), DevicePixels(1)));
+    assert_eq!(original.image().as_bytes(0).unwrap(), pixels);
+    assert_eq!(original.pixel_size(), [2, 1]);
+    assert_eq!(original.texture_size(), [2, 1]);
+    assert!(!original.is_proxy());
 
     let picture = Picture::from_selection([17, 70, 180, 128].repeat(8192 * 2), Size::new(8192, 2));
     let original = preview::original(&picture).unwrap();
-    assert_eq!(original.size(0), size(DevicePixels(2048), DevicePixels(1)));
+    assert_eq!(original.pixel_size(), [8192, 2]);
+    assert_eq!(original.texture_size(), [8192, 2]);
+    assert!(
+        !original.is_proxy(),
+        "a thin 8192px capture fits both budgets"
+    );
     assert!(
         original
+            .image()
             .as_bytes(0)
             .unwrap()
             .as_chunks::<4>()
@@ -79,11 +87,62 @@ fn raw_preview_keeps_4k_pixels_without_cpu_resampling() {
     pixels[last..].copy_from_slice(&[4, 5, 6, 255]);
     let picture = Picture::from_selection(pixels, Size::new(3840, 2160));
     let original = preview::original(&picture).unwrap();
-    assert_eq!(
-        original.size(0),
-        size(DevicePixels(3840), DevicePixels(2160))
+    assert_eq!(original.texture_size(), [3840, 2160]);
+    assert_eq!(original.image().as_bytes(0).unwrap(), picture.pixels().0);
+}
+
+#[::core::prelude::v1::test]
+fn long_preview_declares_proxy_without_relabelling_source_pixels() {
+    let picture =
+        Picture::from_selection([17, 70, 180, 128].repeat(64 * 32768), Size::new(64, 32768));
+    let preview = preview::original(&picture).unwrap();
+    assert_eq!(preview.pixel_size(), [64, 32768]);
+    assert_eq!(preview.texture_size(), [16, 8192]);
+    assert!(preview.is_proxy());
+    assert!(
+        preview
+            .image()
+            .as_bytes(0)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|v| *v == [17, 70, 180, 128])
     );
-    assert_eq!(original.as_bytes(0).unwrap(), picture.pixels().0);
+}
+
+#[::core::prelude::v1::test]
+fn encoded_preview_keeps_native_detail_above_the_old_2048_cap() {
+    let export = Export {
+        picture: Arc::new(Picture::with_transparent_middle()),
+        output: Size::new(3072, 2),
+        directory: String::new(),
+        name: "preview-only".into(),
+        format: SaveFormat::Png,
+        tier: 1,
+        fill: [17, 70, 180],
+        date: "2026-11-03".into(),
+        time: "1200".into(),
+        sequence: 1,
+        conflict: ConflictPolicy::Overwrite,
+        limit: None,
+    };
+    let preview = preview::encode(&export).unwrap();
+    assert_eq!(preview.encoded.pixel_size(), [3072, 2]);
+    assert_eq!(preview.encoded.texture_size(), [3072, 2]);
+    assert!(!preview.encoded.is_proxy());
+    let bytes = crate::save::assemble::encoded_bytes(
+        &export.values(),
+        &export.picture.frame(export.output),
+    )
+    .unwrap();
+    let decoded = image::load_from_memory(&bytes).unwrap().into_rgba8();
+    let mut bgra = decoded.into_raw();
+    for pixel in bgra.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    assert_eq!(preview.encoded.image().as_bytes(0).unwrap(), bgra);
+    assert_eq!(preview.bytes, bytes.len() as u64);
 }
 
 #[::core::prelude::v1::test]
@@ -97,31 +156,33 @@ fn raw_preview_rejects_inconsistent_capture_buffers() {
     }
 }
 
-#[::core::prelude::v1::test]
-fn viewport_fit_and_zoom_remain_centered_for_a_non_demo_capture() {
-    let viewport = Bounds::new(point(px(20.), px(40.)), size(px(600.), px(400.)));
-    let source = Size::new(1600, 900);
-    let fit = preview::fitted_zoom(source, viewport);
-    let bounds = preview::image_bounds(source, viewport, fit, Point::default());
-    assert!(bounds.size.width <= viewport.size.width);
-    assert!(bounds.size.height <= viewport.size.height);
-    assert_eq!(bounds.center(), viewport.center());
-    let enlarged = preview::image_bounds(source, viewport, fit * 2., point(px(10.), px(-20.)));
-    assert_eq!(
-        enlarged.center(),
-        viewport.center() + point(px(10.), px(-20.))
-    );
-}
-
 #[cfg(feature = "test-support")]
 mod ui {
     use super::*;
-    use gpui_kit::{component::Root, test::TestWindowExt};
+    use gpui_kit::{
+        component::Root,
+        test::{TestQueryExt as _, TestWindowExt},
+    };
+    use yue_component::{ImagePreviewBackground, ImagePreviewFit, ImagePreviewMode};
 
     fn setup(
         cx: &mut TestAppContext,
         width: f32,
         height: f32,
+    ) -> (WindowHandle<Root>, Entity<SavePanel>) {
+        setup_picture(
+            cx,
+            width,
+            height,
+            Picture::from_selection(vec![255; 800 * 600 * 4], Size::new(800, 600)),
+        )
+    }
+
+    fn setup_picture(
+        cx: &mut TestAppContext,
+        width: f32,
+        height: f32,
+        picture: Picture,
     ) -> (WindowHandle<Root>, Entity<SavePanel>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -130,7 +191,6 @@ mod ui {
         });
         let mut view = None;
         let handle = cx.open_window(size(px(width), px(height)), |window, cx| {
-            let picture = Picture::from_selection(vec![255; 800 * 600 * 4], Size::new(800, 600));
             let panel = cx.new(|cx| SavePanel::new(picture, window, cx));
             view = Some(panel.clone());
             Root::new(panel, window, cx)
@@ -142,6 +202,142 @@ mod ui {
         cx.run_until_parked();
         cx.executor().advance_clock(Duration::from_millis(250));
         cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn failed_capture_uses_the_component_error_and_real_retry_action(cx: &mut TestAppContext) {
+        let (handle, panel) = setup_picture(
+            cx,
+            1000.,
+            720.,
+            Picture::from_selection(vec![0; 3], Size::new(2, 1)),
+        );
+        cx.run_until_parked();
+        // Drop the completed task so the assertion detects a missing host retry subscription.
+        panel.update(cx, |panel, _| panel._original_task = None);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(matches!(&panel.read(cx).preview.original, ImagePreviewLoad::Failed(message) if message.contains("像素")));
+            let retry = (ElementId::from("save-image-preview"), "retry");
+            assert!(window.find(retry.clone()).visible());
+            window.click(retry, cx);
+        }).unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                panel.read(cx)._original_task.is_some(),
+                "retry must schedule real image preparation"
+            );
+            assert!(matches!(
+                panel.read(cx).preview.original,
+                ImagePreviewLoad::Failed(_)
+            ));
+            assert!(
+                window
+                    .find((ElementId::from("save-image-preview"), "retry"))
+                    .visible()
+            );
+            window.remove_window();
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn yue_viewer_owns_zoom_pan_comparison_background_and_keyboard_scope(cx: &mut TestAppContext) {
+        let (handle, panel) = setup(cx, 1000., 720.);
+        cx.update(|cx| cx.set_reduce_motion(true));
+        settle_preview(cx);
+        let state = cx.update(|cx| panel.read(cx).preview.state.clone());
+        let child = |name| (ElementId::from("save-image-preview"), name);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let initial = state.read(cx).snapshot();
+            assert_eq!(initial.reference_size(), Some([800, 600]));
+            assert_eq!(initial.fit(), ImagePreviewFit::FitAll);
+            assert!(initial.zoom() > 0. && initial.zoom() <= 1.);
+            let viewport = window.find(child("viewport")).bounds();
+            assert!(viewport.size.width > px(220.) && viewport.size.height > px(200.));
+            assert!(
+                800. * initial.zoom() / window.scale_factor() <= f32::from(viewport.size.width)
+            );
+            assert!(
+                600. * initial.zoom() / window.scale_factor() <= f32::from(viewport.size.height)
+            );
+            window.click(child("actual-size"), cx);
+            assert_eq!(state.read(cx).snapshot().zoom(), 1.);
+            window.click(child("viewport"), cx);
+            window.press("right", cx);
+            assert_ne!(state.read(cx).snapshot().center(), [0.5, 0.5]);
+            window.click(child("fit-all"), cx);
+            assert_eq!(state.read(cx).snapshot().center(), [0.5, 0.5]);
+            assert!((state.read(cx).snapshot().zoom() - initial.zoom()).abs() < 0.001);
+            window.click(child("viewport"), cx);
+            window.press("=", cx);
+            let zoom = state.read(cx).snapshot().zoom();
+            assert!(zoom > initial.zoom());
+            window.click("save-name", cx);
+            window.press("ctrl-a", cx);
+            window.input("1", cx);
+            assert_eq!(panel.read(cx).name.read(cx).value().as_ref(), "1");
+            assert_eq!(
+                state.read(cx).snapshot().zoom(),
+                zoom,
+                "preview keys must stay local"
+            );
+            let compare = window.find_by_label("对比").path().last().unwrap().clone();
+            window.click(compare, cx);
+            assert_eq!(state.read(cx).snapshot().mode(), ImagePreviewMode::Compare);
+            let grip = window.find(child("split")).bounds().center();
+            let split = state.read(cx).snapshot().split();
+            window.drag(grip, grip + point(px(80.), px(0.)), cx);
+            assert!(state.read(cx).snapshot().split() > split);
+            window.click(child("more-trigger"), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let black = window.find_by_label("纯黑").path().last().unwrap().clone();
+            window.click(black, cx);
+            assert_eq!(
+                state.read(cx).snapshot().background(),
+                ImagePreviewBackground::Black
+            );
+            window.click(child("more-trigger"), cx);
+            window.press("escape", cx);
+            assert!(
+                window.find("yue-save-panel").visible(),
+                "Escape dismisses the preview menu first"
+            );
+            let result = window
+                .find_by_label("编码后")
+                .path()
+                .last()
+                .unwrap()
+                .clone();
+            window.click(result, cx);
+            assert_eq!(state.read(cx).snapshot().mode(), ImagePreviewMode::Result);
+            window.click("lock-ratio", cx);
+            window.click("save-width", cx);
+            window.press("ctrl-a", cx);
+            window.input("500", cx);
+        })
+        .unwrap();
+        settle_preview(cx);
+        cx.update(|cx| {
+            let state = state.read(cx);
+            assert!(
+                !state.is_mode_available(ImagePreviewMode::Compare),
+                "unaligned frames must not be stretched into a comparison"
+            );
+            assert!(state.is_mode_available(ImagePreviewMode::Result));
+            assert_eq!(
+                state.snapshot().result_revision(),
+                Some(panel.read(cx).revision)
+            );
+            assert_eq!(panel.read(cx).dimensions.output, Size::new(500, 600));
+        });
     }
 
     #[gpui_kit::test]
@@ -266,7 +462,10 @@ mod ui {
         .unwrap();
         cx.run_until_parked();
         cx.update(|cx| {
-            assert_eq!(cx.global::<DirectoryPresets>().paths, [directory.clone()]);
+            assert_eq!(
+                cx.global::<DirectoryPresets>().paths.as_slice(),
+                std::slice::from_ref(&directory)
+            );
             assert!(!panel.read(cx).adding_directory);
             assert!(!panel.read(cx).status_error);
         });
@@ -314,7 +513,12 @@ mod ui {
         .unwrap();
         drop(panel);
         cx.run_until_parked();
-        cx.update(|cx| assert_eq!(cx.global::<DirectoryPresets>().paths, [directory.clone()]));
+        cx.update(|cx| {
+            assert_eq!(
+                cx.global::<DirectoryPresets>().paths.as_slice(),
+                std::slice::from_ref(&directory)
+            )
+        });
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -329,15 +533,22 @@ mod ui {
             let panel = panel.read(cx);
             assert!(panel.measuring);
             assert!(panel.bytes.is_none());
-            assert!(panel.preview.encoded.is_none());
+            assert!(panel.preview.encoded.ready().is_none());
             panel
                 .preview
                 .original
-                .clone()
+                .ready()
                 .expect("raw capture must not wait for encoding")
+                .image()
+                .clone()
         });
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
+            assert!(
+                window
+                    .find((ElementId::from("save-image-preview"), "viewport"))
+                    .visible()
+            );
             window.click("save-width", cx);
             window.press("ctrl-a", cx);
             window.input("0", cx);
@@ -349,7 +560,7 @@ mod ui {
             assert!(panel.dimension_errors[0].is_some());
             assert!(!panel.measuring);
             assert!(Arc::ptr_eq(
-                panel.preview.original.as_ref().unwrap(),
+                panel.preview.original.ready().unwrap().image(),
                 &original
             ));
         });
@@ -370,8 +581,8 @@ mod ui {
         cx.run_until_parked();
         cx.update(|cx| {
             let panel = panel.read(cx);
-            assert!(panel.preview.original.is_some());
-            assert!(panel.preview.encoded.is_none());
+            assert!(panel.preview.original.ready().is_some());
+            assert!(panel.preview.encoded.ready().is_none());
             assert!(panel.bytes.is_none());
             assert!(panel.dimension_errors[0].is_some());
         });
@@ -392,7 +603,11 @@ mod ui {
                 window.render_frame(cx);
                 let scale = window.scale_factor();
                 let panel = window.find("yue-save-panel").bounds().scale(scale);
-                let preview = window.find("save-preview").bounds().scale(scale);
+                let preview_bounds = window
+                    .find((ElementId::from("save-image-preview"), "viewport"))
+                    .bounds();
+                let preview = preview_bounds.scale(scale);
+                let checker = preview_bounds.inset(px(1.)).scale(scale);
                 let quads = window.painted_quads();
                 let panel_fill = quads
                     .iter()
@@ -404,9 +619,16 @@ mod ui {
                 assert_eq!(panel_fill, Some(rgb(theme.page()).into()), "{mode:?}");
                 assert!(
                     quads.iter().any(|quad| {
-                        quad.bounds == preview
+                        quad.bounds == checker
                             && quad.background.as_solid()
-                                == Some(rgb(theme.surface_component()).into())
+                                == Some(
+                                    theme
+                                        .token("--image-preview-checker-dark-a")
+                                        .unwrap()
+                                        .rgba()
+                                        .unwrap()
+                                        .into(),
+                                )
                     }),
                     "preview surface must preserve the theme's RGB channels: {mode:?}"
                 );
@@ -559,7 +781,10 @@ mod ui {
             let expected =
                 assemble::weigh(&export.values(), &export.picture.frame(export.output)).unwrap();
             assert_eq!(panel.bytes, Some(expected));
-            assert!(panel.preview.encoded.is_some());
+            assert!(panel.preview.encoded.ready().is_some());
+            let preview = panel.preview.state.read(cx).snapshot();
+            assert_eq!(preview.revision(), panel.revision);
+            assert_eq!(preview.result_revision(), Some(panel.revision));
         });
     }
 

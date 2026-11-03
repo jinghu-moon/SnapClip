@@ -4,8 +4,8 @@
 //! it publishes, the worker hand-offs, the single cancellation path and the colour sampler.
 //! `pub(super)` because the parent module's window procedure and the input handlers call in.
 
-use crate::windows::win::window::WindowRegion;
 use super::*;
+use crate::windows::win::window::WindowRegion;
 
 impl OverlayController {
     pub(super) fn session_id(&self) -> String {
@@ -158,7 +158,11 @@ impl OverlayController {
     ///
     /// **不改变 Z 序** —— 提层是 [`EnterStep::RaiseOverlay`]，顺序由数据钉住（docs/23 §14.55.9.9）。
     pub(super) fn show_countdown_dim(&mut self) {
-        let Some(monitor) = self.renderer.as_ref().map(|renderer| renderer.layout().bounds) else {
+        let Some(monitor) = self
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.layout().bounds)
+        else {
             return;
         };
         let selection = self.session.selection();
@@ -166,19 +170,23 @@ impl OverlayController {
         // （docs/23 §14.55.9.11）。渲染与读回都在帧之外做，按 1/DIM_DIVISOR 分辨率降级；
         // 拿不到就退回纯色 —— 少一层模糊也比阻断倒计时强。
         let started = Instant::now();
-        let content = self
-            .renderer
-            .as_mut()
-            .and_then(|renderer| match renderer.countdown_dim_source(Self::DIM_DIVISOR) {
+        let content = self.renderer.as_mut().and_then(|renderer| {
+            match renderer.countdown_dim_source(Self::DIM_DIVISOR) {
                 Ok(source) => Some(source),
                 Err(error) => {
                     eprintln!("[snapclip][capture] countdown dim source: {error}");
                     None
                 }
-            });
+            }
+        });
         let source_ms = started.elapsed();
         let started = Instant::now();
-        match self.dim_layer.show(monitor, selection, self.corner_radius_px as i32, content.as_ref()) {
+        match self.dim_layer.show(
+            monitor,
+            selection,
+            self.corner_radius_px as i32,
+            content.as_ref(),
+        ) {
             Ok(()) => eprintln!(
                 "[snapclip][capture] countdown dim shown: source_ms={} paint_ms={} {}",
                 source_ms.as_millis(),
@@ -194,16 +202,21 @@ impl OverlayController {
         if self.countdown.is_none() {
             return;
         }
-        let Some(monitor) = self.renderer.as_ref().map(|renderer| renderer.layout().bounds) else {
+        let Some(monitor) = self
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.layout().bounds)
+        else {
             return;
         };
         let selection = self.session.selection();
-        if let Err(error) = self.dim_layer.update(monitor, selection, self.corner_radius_px as i32) {
+        if let Err(error) = self
+            .dim_layer
+            .update(monitor, selection, self.corner_radius_px as i32)
+        {
             eprintln!("[snapclip][capture] countdown dim update: {error}");
         }
     }
-
-
 
     /// 倒计时里拖边框改大小之后，两样东西必须一起跟随新选区：
     ///
@@ -215,7 +228,8 @@ impl OverlayController {
         badge: Option<Rect>,
         dpi: u32,
     ) -> (Option<crate::region::Region>, Vec<WindowRegion>) {
-        let pin = (!selection.is_empty()).then(|| crate::region::Region::from_rect(selection, origin));
+        let pin =
+            (!selection.is_empty()).then(|| crate::region::Region::from_rect(selection, origin));
         (pin, countdown_window_pieces(selection, badge, dpi, 0))
     }
 
@@ -557,10 +571,11 @@ impl OverlayController {
             return;
         };
         let started_at = Instant::now();
-        match self
-            .service
-            .prepare_selection(&frozen.frame, selection, &FrozenFramePixels::new(frozen))
-        {
+        match self.service.prepare_selection(
+            &frozen.frame,
+            selection,
+            &FrozenFramePixels::new(frozen),
+        ) {
             Ok(prepared) => {
                 let readback_ms = started_at.elapsed().as_millis();
                 eprintln!(
@@ -720,7 +735,10 @@ impl OverlayController {
     /// a scroll session's long image alike.
     pub(super) fn export_executor(writer: Arc<dyn ArtifactWriter>) -> ExportExecutor {
         Box::new(move |job: &ExportJob| {
-            let source = job.source.lock().expect("the export source is never poisoned");
+            let source = job
+                .source
+                .lock()
+                .expect("the export source is never poisoned");
             let prepared = source.pixels().ok_or_else(|| {
                 CaptureError::EncodeFailed("a banded export needs the banded writer".into())
             })?;
@@ -1183,10 +1201,7 @@ pub(super) enum DelayOutcome {
 ///
 /// 去向是这张截图的规格之一：延时不再写死贴图，`复制` 与 `贴图` 各走各自现成的那条路
 /// （docs/23 §14.55.15）。
-pub(super) fn delay_outcome(
-    destination: Option<Destination>,
-    accepted: bool,
-) -> DelayOutcome {
+pub(super) fn delay_outcome(destination: Option<Destination>, accepted: bool) -> DelayOutcome {
     match (destination, accepted) {
         (None, _) => DelayOutcome::Show,
         (Some(_), false) => DelayOutcome::Refused,
@@ -1305,10 +1320,7 @@ pub(super) fn countdown_window_pieces(
             radius: radius + reach,
         }
     } else {
-        WindowRegion::Ring {
-            outer,
-            inner: hole,
-        }
+        WindowRegion::Ring { outer, inner: hole }
     }];
     // 角标在选区之外，单独留一块；否则倒计时期间它会消失。
     if let Some(badge) = badge.filter(|badge| !badge.is_empty()) {
@@ -1329,7 +1341,6 @@ pub(super) fn countdown_window_pieces(
 const COUNTDOWN_BOX_DIP: f32 = 168.0;
 /// 选框环的环宽（dip，单侧）：要盖住框线并让手柄圆点完整。
 const COUNTDOWN_RING_REACH_DIP: f32 = 8.0;
-
 
 /// 倒计时怎么退出。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1450,7 +1461,6 @@ pub(super) fn countdown_step(left: std::time::Duration) -> CountdownStep {
     }
 }
 
-
 #[cfg(test)]
 mod countdown_tests {
     use super::*;
@@ -1470,11 +1480,26 @@ mod countdown_tests {
         let start = Instant::now();
         let countdown = Countdown::start(start, 3);
         assert_eq!(countdown.step(start), CountdownStep::Show(3));
-        assert_eq!(countdown.step(start + Duration::from_millis(900)), CountdownStep::Show(3));
-        assert_eq!(countdown.step(start + Duration::from_millis(1100)), CountdownStep::Show(2));
-        assert_eq!(countdown.step(start + Duration::from_millis(2999)), CountdownStep::Show(1));
-        assert_eq!(countdown.step(start + Duration::from_secs(3)), CountdownStep::Fire);
-        assert_eq!(countdown.step(start + Duration::from_secs(9)), CountdownStep::Fire);
+        assert_eq!(
+            countdown.step(start + Duration::from_millis(900)),
+            CountdownStep::Show(3)
+        );
+        assert_eq!(
+            countdown.step(start + Duration::from_millis(1100)),
+            CountdownStep::Show(2)
+        );
+        assert_eq!(
+            countdown.step(start + Duration::from_millis(2999)),
+            CountdownStep::Show(1)
+        );
+        assert_eq!(
+            countdown.step(start + Duration::from_secs(3)),
+            CountdownStep::Fire
+        );
+        assert_eq!(
+            countdown.step(start + Duration::from_secs(9)),
+            CountdownStep::Fire
+        );
     }
 
     #[test]

@@ -10,20 +10,24 @@
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PixelFormat {
-    /// 8-bit BGRA, premultiplied alpha not implied, sRGB.
+    /// 8-bit BGRA. Color encoding and alpha belong to `PixelDescriptor`.
     Bgra8Unorm,
+    /// Little-endian IEEE 754 half-float RGBA; color encoding is explicit.
+    Rgba16Float,
 }
 
 impl PixelFormat {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bgra8Unorm => "bgra8_unorm",
+            Self::Rgba16Float => "rgba16_float",
         }
     }
 
     pub fn bytes_per_pixel(self) -> u32 {
         match self {
             Self::Bgra8Unorm => 4,
+            Self::Rgba16Float => 8,
         }
     }
 }

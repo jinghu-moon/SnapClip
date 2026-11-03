@@ -1028,7 +1028,10 @@ mod tests {
             Some(Action::LevelUp)
         );
         assert_eq!(
-            map.action_for(Context::Pick, &Chord::key(Key::ArrowDown, true, false, false)),
+            map.action_for(
+                Context::Pick,
+                &Chord::key(Key::ArrowDown, true, false, false)
+            ),
             Some(Action::LevelDown)
         );
         assert_eq!(pick(Key::Char('S')), Some(Action::ColorFormat));
@@ -1198,18 +1201,13 @@ mod tests {
         assert_eq!(names, ["吸附", "放大镜", "输出"]);
         let level = &guide[0].rows[0];
         assert_eq!(level.label, "选择上层或下层 UI 元素");
-        assert_eq!(level.chords, [vec!["滚轮"], vec!["Ctrl", "↑"], vec!["Ctrl", "↓"]]);
+        assert_eq!(
+            level.chords,
+            [vec!["滚轮"], vec!["Ctrl", "↑"], vec!["Ctrl", "↓"]]
+        );
         let cursor = &guide[0].rows[1];
         assert_eq!(cursor.label, "移动光标 1 像素");
-        assert_eq!(
-            cursor.chords,
-            [
-                vec!["↑"],
-                vec!["↓"],
-                vec!["←"],
-                vec!["→"],
-            ]
-        );
+        assert_eq!(cursor.chords, [vec!["↑"], vec!["↓"], vec!["←"], vec!["→"],]);
         let drag = guide[0]
             .rows
             .iter()
@@ -1299,4 +1297,3 @@ mod tests {
         );
     }
 }
-

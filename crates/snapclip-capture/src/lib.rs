@@ -41,8 +41,8 @@ pub mod preferences;
 pub mod region;
 pub mod ring_contrast;
 pub mod runtime;
-pub mod save_format;
 pub mod sampler;
+pub mod save_format;
 // Scroll capture's pure half (`docs/33`); the capture thread is `windows::scroll_worker`. Nothing
 // under `scroll/` references `windows`.
 pub mod scroll;

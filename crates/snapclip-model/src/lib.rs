@@ -19,6 +19,8 @@ pub mod geometry;
 pub mod history;
 pub mod ids;
 pub mod payload;
+pub mod pin;
+pub mod pixels;
 pub mod publication;
 pub mod recognition;
 pub mod time;

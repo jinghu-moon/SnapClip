@@ -1,5 +1,8 @@
 # 34 贴图窗口
 
+> 2026-11-03 范围说明：本文保留原生图片宿主的调研、算法和历史实测；下文 §2、§3 已按 F3 演进更新。F3图片/文档/文件使用GPUI窗口，图片接入YueImagePreview；F6原位截图仍为原生宿主。GPUI窗口不适用旧图片宿主的“不激活/无键盘”约束。当前公共 API 见 [docs/51](51-pin-crate.md)，F3 范围与验收记录见 [docs/52](52-clipboard-pin-design.md)。原始性能数值不是新版本桌面验收结论。
+
+
 > 2026-11-02 更新：贴图已独立为 `snapclip-pin`。当前 crate 边界、公开 API 与本轮验收以 [51 · 贴图能力独立](51-pin-crate.md) 为准。本文保留早期方案与故障记录；后文 P1/P2 和桌面测试状态是当时的阶段记录。
 
 贴图（pin / 钉图）：把一张图贴到屏幕上，无边框、置顶、不抢焦点。
@@ -60,47 +63,34 @@
 设计要维持的就是这五条；其余一切都是它们的结果。
 
 1. **像素只经 `Arc`，不经事件。** 事件传引用（路径或 `content_hash`），不传字节（F13）。任何"顺手把图放进事件里"的改动都违反这一条。
-2. **窗口只有一个所有者线程。** 所有贴图的 HWND 由**一个**专用线程创建、承载消息泵、并在退出时统一销毁；UI 线程只发命令。理由是"窗口过程必须在创建它的线程上执行"——这不是限制而是优势：命令天然串行，不需要 `AttachThreadInput`，没有跨线程的 z 序竞态。
+2. **窗口只有一个所有者线程。** 图片 HWND 由**一个**专用原生线程创建、承载消息泵、并在退出时统一销毁；文档/文件的 GPUI 窗口则由应用线程拥有，公共 `PinManager` 只协调注册表与命令。理由是"窗口过程必须在创建它的线程上执行"——这不是限制而是优势：命令天然串行，不需要 `AttachThreadInput`，没有跨线程的 z 序竞态。
 3. **提交是整个窗口，不存在部分提交。** 像素一变就重画整窗、整窗提交一次（F6）。局部更新只有在 `prcDirty` 被真机验证之后才允许讨论，届时它是一条**独立**的、有基准支撑的优化，而不是第一版的前提。
-4. **穿透由窗口过程决定，不由样式决定。** 回答 `HTTRANSPARENT` 是唯一机制（F4），按键期间必须拒绝穿透（F5），且退路必须存在——进得去就必须出得来。
-5. **一个内容，一份解码。** 同一张图被多个窗口引用时只解码一次；键是内容标识，不是路径字符串。
+4. **未来的穿透不能只改样式。** 原生图片宿主若实现穿透，需要窗口过程及可恢复入口；当前生产版本没有交付穿透，不能把历史机制调研当成已存在的功能。
+5. **一份快照共享不可变源。** 模式切换不替换原始内容，派生预览另计预算。F3 只对相同 sequence + fingerprint 的已打开快照去重，不维护全局图像缓存，也不承诺不同复制操作中的相同像素只解码一次。
 
 ## 3. 最小实现
 
-### 3.1 当前结构：独立能力，一个宿主线程
+### 3.1 当前结构：应用线程管理器与两类窗口宿主
+
+`snapclip-pin::PinManager` 是 GPUI 应用线程上的 entity：统一分配编号，管理 pending/open、准入、复制意图与撤销。原图片线程变为私有 `host::NativeImages`；文档/文件使用 `view::PinView`、Kit TextView/DataTable 与 Yue 菜单。
 
 ```text
-crates/snapclip-pin/
-  src/lib.rs       公开边界、PinHome、PinSelection
-  src/source.rs    ImageSource：已解码像素与尺寸
-  src/host.rs      PinManager、宿主线程、消息泵、分层窗口和内部窗口状态
-  tests/windows_host.rs  显式运行的真实 Windows 生命周期测试
-
-apps/snapclip/src/capture/pin_source.rs
-  PinSource / TakeSelection：应用对截图选区的接线
-
-crates/snapclip-ui/src/font.rs
-  共享字体子集、族序、进程内注册与倍数徽标字体度量
+snapclip-pin/src/
+  lib.rs / manager.rs  公共能力边界与生命周期
+  host.rs / source.rs  私有图片宿主与像素
+  view.rs / table.rs   文档、文件与表格
+  platform.rs          DPI、定位、置顶、显式打开
+  feedback.rs          无窗口读取反馈与撤销
+  image_preview.rs     有界本地图片准备
 ```
 
-- `PinManager` 直接持有宿主，不再叠一层 `PinWindowHost` 包装。克隆共享同一线程，最后一个管理器释放时关闭所有贴图并 join。
-- `PinHome` 由应用实现，F6 在宿主线程消费最近截图；`PinSelection` 保留屏幕物理坐标与拍摄时的圆角。
-- `ImageSource` 接收已解码像素。`create_pin(PinRequest)` 提交调用方准备好的图，宿主不读取截图或剪贴板。
-- F6 与直接创建共用编号器；调用方不能自行指定 ID。`PinHandle::id()` 与事件的 `id` 对应。
-- `PinPoster` 是弱句柄，投递与 F6 走同一取图处理逻辑；不延长宿主生命周期，宿主释放后投递报错。
-- `Created`、`Failed`、`Closed` 分开上报。创建返回句柄只表示已投递，真正上屏结果通过事件确认；无图的 F6 不发号，非法选区报 `Failed`。
-- 应用定期调用 `try_recv_event()` 或 `drain_events()`；有界 64 条队列满时记日志，不阻塞窗口线程。
+`PinHome`、`PinPoster` 和 `PinManager::start` 已删除。F3/F6 在应用托盘消息线程注册；应用负责来源，管理器不读剪贴板或截图槽位。图片创建完成事件可靠送达，GPUI `on_window_closed` 清注册表，不再依赖可丢弃的 64 条事件队列。
 
 ### 3.2 归属与依赖
 
-```text
-snapclip-app ──→ snapclip-pin ──→ snapclip-model
-                         └───→ snapclip-ui
-```
+`snapclip-pin` 依赖 `snapclip-model / snapclip-ui / gpui-kit / yue-component`，不依赖 capture/history/clipboard；系统剪贴板由独立 `snapclip-clipboard` 同时服务 history 与显式 F3。应用是能力协调者。共享图片徽标字体仍由 `snapclip-ui::font` 提供。
 
-`snapclip-pin` 使用既有 `windows-sys 0.59` 实现分层窗口，不依赖 capture、history、app、GPUI 或 Yue。共享字体只有一份，位于 `snapclip-ui/assets/`；截图覆盖层与贴图均通过 `snapclip_ui::font` 使用它。`PinSource` 仍由应用实现，因为连接截图与贴图是应用的职责。
-
-详细接口、迁移前后行为与测试边界见 [51 · 贴图能力独立](51-pin-crate.md)。
+详细接口与现行测试命令见 [51 · 独立贴图能力](51-pin-crate.md)。以下图片呈现章节仅针对私有原生宿主。
 
 ### 3.3 呈现：分层窗口，整窗提交
 
@@ -138,7 +128,8 @@ F5 确认选区（拖拽抬手 或 吸附确认）
   → CaptureService::prepare_selection(frozen, selection, FrozenFramePixels)
      （与导出是同一套裁剪/校验，这时冻结帧还活着）
   → shared.selection = Some(Arc<SelectionPixels>)   // 槽位留在覆盖层，活过会话
-F6 → 宿主线程经 PinHome::take_selection 取走槽位里的那一张
+F6 → 托盘线程发送应用命令，应用经 PinSource::take_selection 取走槽位里的那一张
+   → PinManager::open_selection 提交给私有图片宿主
    → ImageSource::from_bgra_bytes(…)（逐 4 字节重解释成 u32，并强制 alpha 不透明）
    → 窗口落在选区自己的屏幕坐标上（region 的左上角）
 F9（可选）→ confirm() 重新读一次（此时可能已带注解）
@@ -159,19 +150,17 @@ F9（可选）→ confirm() 重新读一次（此时可能已带注解）
 
 **已知代价**：`prepare_selection` 会新建一个缓冲区（回读的结果，不是 `prepared.bgra` 的副本——它由 `CaptureService` 从冻结帧裁剪出来）。4K 全屏选区约 33 MB，每次 F5 提交一次；它与贴图窗口自己那份 `u32` DIB 是两笔不同的分配，都记进 §7 的账，第一版先量不猜。F6 真正贴出去时 `PinSource::take_selection` 还会把这段像素复制成 `PinSelection` 自己那份 `Arc<Vec<u8>>`（贴图窗口要独立的生命周期），那是第二笔，只在按 F6 时发生。
 
-**仍然不做的**：
+**F6 路径仍保持的边界**：
 
 - **不做内容缓存**。每次 F5 覆盖槽位，每次 F6 取走并清空；不存在"同一张图被两个窗口引用"（不变量 5 因此暂时是空的）。
-- **不做来源生命周期管理**。`Artifact`/`Blob` 两条路径等真有"从剪贴板贴"/"从历史贴"的需求再补；`PinRequest::Image` 已经留着，接口在那儿。
+- **pin 不接管来源存储**。F3 现已通过应用提交不可变 `PinSnapshot`，不让图片宿主直接读 `Artifact`/`Blob`、剪贴板或历史数据库。
 - **不做"最近一帧"旁路**。槽位里的就是**这一帧的选区**（已裁剪、已验证、已交给导出路径），不是覆盖层内存里那整帧。
 
-### 3.5 准入：第一版先量，不设限
+### 3.5 当前准入与记账
 
-**原计划是"一个硬上限"**（`DECODED_LIMIT` / `WINDOW_LIMIT` + 用户可见的拒绝）。它**没有实现**，因为它依赖两个至今没有的数字：一个分层窗口的 USER/GDI 成本、以及典型贴图的字节数。在§6.2 的四项实测量出来之前写这两个常量，就是拿猜的数字当保护——而猜错的保护比没有保护更糟：它会让用户在完全正常的用量下撞墙。
+F3 引入任意文档、图片和文件列表后，不再沿用旧版“只记账不拦截”。公共管理器现行保护为 **32 张窗口（含 pending）和 256 MiB 保留内容**，撤销最多 8 张，原始像素、编码源和派生预览纳入计数。关闭、隐藏覆盖 pending，后台结果通过弱 entity 更新，不复活已关闭窗口。
 
-第一版因此**只做记账，不做拦截**：`PinManager` 记着屏幕上还有几张、宿主线程记着每张的尺寸。撞墙的真实代价（USER 对象耗尽）在下一次 F6 上表现为**创建失败**，而创建失败是一条已经实现的、带错误信息的路径（`Create` 同步返回 `Result`），不是静默损坏。
-
-这仍然是**有意的推迟，不是遗忘**：`DECODED_LIMIT` 与 `WINDOW_LIMIT` 在 P3 拿数字后补齐，补的时候连测量条件一起记录。
+这些常量是首版防止无界增长的保护策略，不是 USER/GDI 容量实测；原生窗口、GPU 和字体缓存还有额外占用，不声称总进程内存严格等于该预算。§6 的历史性能记录保留，后续容量调整应带上真实压力数据。
 
 ## 4. 窗口与交互
 

@@ -24,10 +24,14 @@ use std::thread::{self, JoinHandle};
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_F3, VK_F6,
+};
 use windows_sys::Win32::UI::Shell::{
     ExtractIconExW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
     Shell_NotifyIconW,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::WM_HOTKEY;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, HICON, IDI_APPLICATION, LoadIconW,
@@ -39,6 +43,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// Menu item identity. `TrackPopupMenuEx` answers with these, and nothing else.
 const MENU_TOGGLE: u32 = 1;
 const MENU_QUIT: u32 = 2;
+const MENU_PIN_CLIPBOARD: u32 = 3;
+const MENU_PIN_SELECTION: u32 = 4;
+const MENU_SHOW_PINS: u32 = 5;
+const MENU_HIDE_PINS: u32 = 6;
+const MENU_CLOSE_PINS: u32 = 7;
+const MENU_UNDO_PIN: u32 = 8;
+const HOTKEY_CLIPBOARD: i32 = 0x5350;
+const HOTKEY_SELECTION: i32 = 0x5351;
 /// The icon's callback message, and the message that ends the loop.
 const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 1;
 const WM_STOP_TRAY: u32 = WM_APP + 2;
@@ -51,6 +63,33 @@ pub enum TrayCommand {
     ToggleWindow,
     /// Leave the application.
     Quit,
+    PinClipboard,
+    PinLastSelection,
+    ShowPins,
+    HidePins,
+    ClosePins,
+    UndoPin,
+}
+
+/// Origin recorded when the application command enters, before GPUI gets a chance to handle it.
+#[derive(Debug, Clone, Copy)]
+pub struct TrayMessage {
+    pub command: TrayCommand,
+    pub sequence: u32,
+    pub position: (i32, i32),
+}
+impl TrayMessage {
+    pub fn new(command: TrayCommand) -> Self {
+        let mut point = POINT { x: 0, y: 0 };
+        unsafe {
+            GetCursorPos(&mut point);
+        }
+        Self {
+            command,
+            sequence: snapclip_clipboard::windows::reader::sequence(),
+            position: (point.x, point.y),
+        }
+    }
 }
 
 /// Menu item id → command. Split out so the mapping is testable without a message loop.
@@ -58,18 +97,24 @@ fn command_for_menu_id(id: u32) -> Option<TrayCommand> {
     match id {
         MENU_TOGGLE => Some(TrayCommand::ToggleWindow),
         MENU_QUIT => Some(TrayCommand::Quit),
+        MENU_PIN_CLIPBOARD => Some(TrayCommand::PinClipboard),
+        MENU_PIN_SELECTION => Some(TrayCommand::PinLastSelection),
+        MENU_SHOW_PINS => Some(TrayCommand::ShowPins),
+        MENU_HIDE_PINS => Some(TrayCommand::HidePins),
+        MENU_CLOSE_PINS => Some(TrayCommand::ClosePins),
+        MENU_UNDO_PIN => Some(TrayCommand::UndoPin),
         _ => None,
     }
 }
 
 /// What the window procedure needs to reach the shell.
 struct WndContext {
-    commands: async_channel::Sender<TrayCommand>,
+    commands: async_channel::Sender<TrayMessage>,
+    hotkeys: [bool; 2],
 }
 
 /// A running tray icon and the commands it produces.
 pub struct Tray {
-    commands: async_channel::Receiver<TrayCommand>,
     thread_id: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -77,8 +122,7 @@ pub struct Tray {
 
 impl Tray {
     /// Create the icon. Fails when Windows refuses the window or the icon slot.
-    pub fn start() -> Result<Self, String> {
-        let (commands_tx, commands_rx) = async_channel::unbounded();
+    pub fn start(commands_tx: async_channel::Sender<TrayMessage>) -> Result<Self, String> {
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_id = Arc::new(AtomicU32::new(0));
@@ -92,7 +136,6 @@ impl Tray {
         };
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
-                commands: commands_rx,
                 thread_id,
                 stop,
                 thread: Some(thread),
@@ -106,11 +149,6 @@ impl Tray {
                 Err("the tray thread stopped before it reported readiness".into())
             }
         }
-    }
-
-    /// The commands the icon produced; the shell drains this on its own thread.
-    pub fn commands(&self) -> async_channel::Receiver<TrayCommand> {
-        self.commands.clone()
     }
 
     /// Remove the icon and join the message loop. Safe to call more than once.
@@ -162,8 +200,10 @@ extern "system" fn tray_wndproc(
                 if !context.is_null() {
                     // SAFETY: put straight back, and the context lives until WM_DESTROY.
                     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, context as isize) };
-                    if let Some(command) = unsafe { show_menu(hwnd) } {
-                        let _ = unsafe { &*context }.commands.try_send(command);
+                    if let Some(command) = unsafe { show_menu(hwnd, (&*context).hotkeys) } {
+                        let _ = unsafe { &*context }
+                            .commands
+                            .try_send(TrayMessage::new(command));
                     }
                 }
             }
@@ -174,13 +214,33 @@ extern "system" fn tray_wndproc(
 }
 
 /// Track the popup menu and report the chosen item.
-unsafe fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
+unsafe fn show_menu(hwnd: HWND, hotkeys: [bool; 2]) -> Option<TrayCommand> {
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return None;
     }
     for (id, label) in [
         (MENU_TOGGLE, wide("显示 / 隐藏窗口")),
+        (
+            MENU_PIN_CLIPBOARD,
+            wide(if hotkeys[0] {
+                "贴出剪贴板\tF3"
+            } else {
+                "贴出剪贴板（F3 不可用）"
+            }),
+        ),
+        (
+            MENU_PIN_SELECTION,
+            wide(if hotkeys[1] {
+                "贴出最近截图\tF6"
+            } else {
+                "贴出最近截图（F6 不可用）"
+            }),
+        ),
+        (MENU_SHOW_PINS, wide("显示全部贴图")),
+        (MENU_HIDE_PINS, wide("隐藏全部贴图")),
+        (MENU_CLOSE_PINS, wide("关闭全部贴图")),
+        (MENU_UNDO_PIN, wide("撤销关闭贴图")),
         (MENU_QUIT, wide("退出 SnapClip")),
     ] {
         // SAFETY: `menu` is alive for this function; the label lives until the call returns.
@@ -217,7 +277,7 @@ unsafe fn show_menu(hwnd: HWND) -> Option<TrayCommand> {
 
 /// Create the hidden window, add the icon, and pump messages until asked to stop.
 fn run_message_loop(
-    commands: async_channel::Sender<TrayCommand>,
+    commands: async_channel::Sender<TrayMessage>,
     ready: mpsc::SyncSender<Result<(), String>>,
     thread_id: Arc<AtomicU32>,
     _stop: Arc<AtomicBool>,
@@ -256,7 +316,27 @@ fn run_message_loop(
         return;
     }
     // SAFETY: the pointer is handed to the window and freed in `WM_DESTROY`.
-    let context = Box::into_raw(Box::new(WndContext { commands }));
+    let hotkeys = unsafe {
+        [
+            RegisterHotKey(
+                std::ptr::null_mut(),
+                HOTKEY_CLIPBOARD,
+                MOD_NOREPEAT,
+                VK_F3 as u32,
+            ) != 0,
+            RegisterHotKey(
+                std::ptr::null_mut(),
+                HOTKEY_SELECTION,
+                MOD_NOREPEAT,
+                VK_F6 as u32,
+            ) != 0,
+        ]
+    };
+    for (label, ok) in [("F3", hotkeys[0]), ("F6", hotkeys[1])] {
+        eprintln!("[snapclip-app] hotkey {label} available={ok}");
+    }
+    let command_sender = commands.clone();
+    let context = Box::into_raw(Box::new(WndContext { commands, hotkeys }));
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, context as isize);
     }
@@ -274,6 +354,12 @@ fn run_message_loop(
     if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
         // No icon slot: undo the window rather than leaving an invisible one behind.
         unsafe {
+            if hotkeys[0] {
+                UnregisterHotKey(std::ptr::null_mut(), HOTKEY_CLIPBOARD);
+            }
+            if hotkeys[1] {
+                UnregisterHotKey(std::ptr::null_mut(), HOTKEY_SELECTION);
+            }
             DestroyWindow(hwnd);
         }
         let _ = ready.send(Err("Windows refused the notification-area icon".into()));
@@ -296,12 +382,29 @@ fn run_message_loop(
         if message.message == WM_STOP_TRAY {
             break;
         }
+        if message.message == WM_HOTKEY {
+            let command = match message.wParam as i32 {
+                HOTKEY_CLIPBOARD => Some(TrayCommand::PinClipboard),
+                HOTKEY_SELECTION => Some(TrayCommand::PinLastSelection),
+                _ => None,
+            };
+            if let Some(command) = command {
+                _ = command_sender.try_send(TrayMessage::new(command));
+            }
+            continue;
+        }
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
     unsafe {
+        if hotkeys[0] {
+            UnregisterHotKey(std::ptr::null_mut(), HOTKEY_CLIPBOARD);
+        }
+        if hotkeys[1] {
+            UnregisterHotKey(std::ptr::null_mut(), HOTKEY_SELECTION);
+        }
         Shell_NotifyIconW(NIM_DELETE, &data);
         // The window owns the context box, so destroying it is also what frees the sender.
         DestroyWindow(hwnd);
@@ -382,7 +485,8 @@ mod tests {
     #[test]
     #[ignore = "shows a real tray icon; run on a desktop session"]
     fn the_icon_can_be_created_and_taken_away() {
-        let mut tray = super::Tray::start().expect("the tray should start on a desktop session");
+        let mut tray = super::Tray::start(async_channel::unbounded().0)
+            .expect("the tray should start on a desktop session");
         assert!(tray.thread_id.load(std::sync::atomic::Ordering::SeqCst) != 0);
         // Two shutdowns: the second must be a no-op rather than a double join or double
         // `NIM_DELETE`.

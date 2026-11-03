@@ -162,8 +162,7 @@ pub fn round_corners(bgra: &mut [u8], width: u32, height: u32, radius: u32) {
                     }
                 }
             }
-            coverage[(y * radius + x) as usize] =
-                ((inside * 255) / (samples * samples)) as u8;
+            coverage[(y * radius + x) as usize] = ((inside * 255) / (samples * samples)) as u8;
         }
     }
     let mut apply = |x: u32, y: u32, cov: u8| {
@@ -377,5 +376,4 @@ mod tests {
         let centre = (((h / 2) * w + w / 2) * 4 + 3) as usize;
         assert_eq!(pixels[centre], 255, "夹到短边一半后中心仍在圆内");
     }
-
 }

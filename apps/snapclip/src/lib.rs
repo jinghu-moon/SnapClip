@@ -23,6 +23,7 @@ pub mod adapters;
 pub mod capture;
 pub mod clipboard;
 pub mod clipboard_ingest;
+pub mod clipboard_pin;
 pub mod events;
 pub mod history;
 pub mod save;
@@ -71,23 +72,14 @@ fn nav_item(active: bool, accent: Hsla, border: Hsla, content: AnyElement) -> An
 /// The tray thread never touches a window; this task is the only place a [`tray::TrayCommand`]
 /// becomes a window action. `spawn_in` is what makes that possible: the task can reach the
 /// window it was created from.
-fn spawn_tray_commands(tray: &tray::Tray, window: &mut Window, cx: &mut Context<Shell>) {
-    let commands = tray.commands();
+fn spawn_tray_commands(
+    commands: async_channel::Receiver<tray::TrayMessage>,
+    window: &mut Window,
+    cx: &mut Context<Shell>,
+) {
     cx.spawn_in(window, async move |shell, cx| {
-        while let Some(command) = commands.recv().await.ok() {
-            let acted = shell.update_in(cx, |_shell, window, cx| match command {
-                // Windows has no "hide a window" in GPUI's portable surface, and minimising is
-                // what a tray user means by "put it away": the taskbar button goes with it.
-                tray::TrayCommand::ToggleWindow => {
-                    if window.is_window_active() {
-                        window.minimize_window();
-                    } else {
-                        window.activate_window();
-                    }
-                    cx.notify();
-                }
-                tray::TrayCommand::Quit => cx.quit(),
-            });
+        while let Ok(message) = commands.recv().await {
+            let acted = shell.update_in(cx, |shell, window, cx| shell.command(message, window, cx));
             if acted.is_err() {
                 // The shell is gone; there is nothing left to command.
                 break;
@@ -97,45 +89,14 @@ fn spawn_tray_commands(tray: &tray::Tray, window: &mut Window, cx: &mut Context<
     .detach();
 }
 
-/// Drain what the pin host reports back.
-///
-/// The pin host owns every pin window and handles F6 on its own thread, so the shell never
-/// sees a pin as a command. The only thing the host has to say is "a pin I was asked for did
-/// not appear", and it has to be said even though nothing user-visible depends on it yet: the
-/// channel is bounded, so an undrained one would eventually report "queue full" for a
-/// perfectly healthy system.
-///
-/// A 50 ms poll is deliberate. This loop costs one timer wake-up every 50 ms on the
-/// background executor, and the alternative (a Windows message to the shell's window) would
-/// add a second way to reach this state for no behavioural gain.
-fn spawn_pin_events(pins: &PinManager, window: &mut Window, cx: &mut Context<Shell>) {
-    let pins = pins.clone();
-    cx.spawn_in(window, async move |shell, cx| {
+/// Poll the private native image host through the same registry as GPUI windows.
+fn spawn_pin_events(pins: &Entity<PinManager>, cx: &mut Context<Shell>) {
+    let pins = pins.downgrade();
+    cx.spawn(async move |_shell, cx| {
         loop {
-            let report = pins.drain_events();
-            if report.any() {
-                // 说人话：创建、关闭、没能创建是三件事。只有第三件需要担心
-                //（"F6 没反应"的那种失败），前两件是正常生命周期（docs/23 §14.55.9.6）。
-                let mut parts = Vec::new();
-                if report.created > 0 {
-                    parts.push(format!("创建 {} 张", report.created));
-                }
-                if report.closed > 0 {
-                    parts.push(format!("已关闭 {} 张", report.closed));
-                }
-                if report.failed > 0 {
-                    parts.push(format!("{} 张没能创建", report.failed));
-                }
-                eprintln!("[snapclip-app] pin: {}", parts.join("、"));
-                let acted = shell.update_in(cx, |_shell, _window, cx| cx.notify());
-                if acted.is_err() {
-                    // The shell is gone; nothing left to report to.
-                    return;
-                }
+            if pins.update(cx, |pins, cx| pins.poll(cx)).is_err() {
+                break;
             }
-            // `BackgroundExecutor::timer` is the sleep this crate has access to: GPUI's
-            // `Timer` is not re-exported through `gpui_kit`, and pulling `gpui` in as a
-            // second direct dependency for one sleep is not worth it.
             cx.background_executor()
                 .timer(Duration::from_millis(50))
                 .await;
@@ -164,10 +125,11 @@ pub struct Shell {
     /// The clipboard pipeline. Holding this is what keeps it running; dropping it stops the
     /// listener and joins the worker, so it must live as long as the shell.
     clipboard: Option<snapclip_history::ingest::ClipboardIngestHandle>,
-    /// The pin host: one thread that owns every pinned-image window. `None` when that
-    /// thread could not be started, which is reported and survived — F5 capture does not
-    /// depend on it.
-    pins: Option<PinManager>,
+    /// The UI-thread pin registry and its private native image host. Failure to
+    /// start this feature does not disable F5 capture or clipboard history.
+    pins: Option<Entity<PinManager>>,
+    pin_source: Option<Arc<capture::PinSource>>,
+    clipboard_pins: Option<Entity<clipboard_pin::ClipboardPins>>,
     /// Drains the capture events the overlay publishes, so a display setting changed on the size
     /// badge reaches the settings file (docs/23 §14.53). Held because dropping the task stops it.
     _label_sync: Task<()>,
@@ -273,41 +235,46 @@ impl Shell {
         };
         // The shell's windows are reachable from here on: the tray is the entry point that
         // T4.1.1 recorded as missing, and its commands arrive on their own thread.
-        let tray = match tray::Tray::start() {
-            Ok(tray) => {
-                spawn_tray_commands(&tray, window, cx);
-                Some(tray)
-            }
+        let (command_sender, command_receiver) = async_channel::unbounded();
+        spawn_tray_commands(command_receiver, window, cx);
+        let tray = match tray::Tray::start(command_sender.clone()) {
+            Ok(tray) => Some(tray),
             Err(error) => {
                 eprintln!("[snapclip-app] tray unavailable: {error}");
                 None
             }
         };
-        // Pinned images outlive any screen: F6 is handled entirely on the pin host's own
-        // thread, so the shell only owns the host and drains the events it reports back.
-        //
-        // Without a capture there is no source, so pinning is not started at all: a host that
-        // could never be given a picture is a thread and a hotkey that do nothing.
-        let pins = match pin_source {
-            Some(pin_source) => match PinManager::start(pin_source) {
-                Ok(pins) => {
-                    spawn_pin_events(&pins, window, cx);
-                    Some(pins)
-                }
+        // Clipboard pins do not depend on a capture source, store or history listener.
+        let pins = match PinManager::new() {
+            Ok((manager, commands)) => {
+                let pins = cx.new(|_| manager);
+                clipboard_pin::drain_copies(&pins, commands, cx);
+                spawn_pin_events(&pins, cx);
+                Some(pins)
+            }
+            Err(error) => {
+                eprintln!("[snapclip-app] pin unavailable: {error}");
+                None
+            }
+        };
+        let clipboard_pins = pins.as_ref().and_then(|manager| {
+            match clipboard_pin::ClipboardPins::start(manager.clone(), cx) {
+                Ok(reader) => Some(reader),
                 Err(error) => {
-                    eprintln!("[snapclip-app] pin unavailable: {error}");
+                    eprintln!("[snapclip-app] clipboard pin unavailable: {error}");
                     None
                 }
-            },
-            None => None,
-        };
-        // 延时截图到点要贴图：把那件事接到与 `F6` **完全相同**的一条路上——往贴图宿主
-        // 线程投一条 `WM_HOTKEY`。捕获侧只说"请贴图"，怎么贴由这里决定（docs/23 §14.55.8）。
+            }
+        });
+        // Delayed capture uses the same application command as F6. Capture only
+        // requests pinning; this application thread consumes the selection.
         if let Some(events) = capture_events.as_ref() {
-            if let Some(pins) = pins.as_ref() {
-                let poster = pins.pin_poster();
-                events.set_pin_poster(std::sync::Arc::new(move || {
-                    poster.post().map_err(|error| error.to_string())
+            {
+                let commands = command_sender;
+                events.set_pin_poster(Arc::new(move || {
+                    commands
+                        .try_send(tray::TrayMessage::new(tray::TrayCommand::PinLastSelection))
+                        .map_err(|error| error.to_string())
                 }));
             }
             // Capture hands pixels to the application. The Yue panel lives on the GPUI thread.
@@ -347,7 +314,73 @@ impl Shell {
             capture,
             clipboard,
             pins,
+            pin_source,
+            clipboard_pins,
             _label_sync,
+        }
+    }
+
+    fn command(&mut self, message: tray::TrayMessage, window: &mut Window, cx: &mut Context<Self>) {
+        match message.command {
+            // Windows has no "hide a window" in GPUI's portable surface, and minimising is
+            // what a tray user means by "put it away": the taskbar button goes with it.
+            tray::TrayCommand::ToggleWindow => {
+                if window.is_window_active() {
+                    window.minimize_window();
+                } else {
+                    window.activate_window();
+                }
+                cx.notify();
+            }
+            tray::TrayCommand::Quit => cx.quit(),
+            tray::TrayCommand::PinClipboard => {
+                if let Some(reader) = &self.clipboard_pins {
+                    reader.update(cx, |reader, cx| {
+                        reader.request(message.sequence, message.position, cx)
+                    });
+                } else {
+                    snapclip_pin::show_feedback("剪贴板贴图暂不可用", message.position, cx);
+                }
+            }
+            tray::TrayCommand::PinLastSelection => self.pin_last_selection(message.position, cx),
+            tray::TrayCommand::ShowPins | tray::TrayCommand::HidePins => {
+                if let Some(pins) = &self.pins {
+                    pins.update(cx, |pins, cx| {
+                        pins.set_visible(message.command == tray::TrayCommand::ShowPins, cx)
+                    });
+                }
+            }
+            tray::TrayCommand::ClosePins => {
+                if let Some(reader) = &self.clipboard_pins {
+                    reader.update(cx, |reader, _| reader.cancel());
+                }
+                if let Some(pins) = &self.pins {
+                    pins.update(cx, |pins, cx| pins.close_all(cx));
+                }
+            }
+            tray::TrayCommand::UndoPin => {
+                if let Some(pins) = &self.pins
+                    && let Err(error) = PinManager::undo(pins, message.position, cx)
+                {
+                    snapclip_pin::show_feedback(error.to_string(), message.position, cx);
+                }
+            }
+        }
+    }
+
+    fn pin_last_selection(&mut self, position: (i32, i32), cx: &mut Context<Self>) {
+        let Some(selection) = self
+            .pin_source
+            .as_ref()
+            .and_then(|source| source.take_selection())
+        else {
+            snapclip_pin::show_feedback("还没有可贴的截图，请先按 F5 框选", position, cx);
+            return;
+        };
+        if let Some(pins) = &self.pins
+            && let Err(error) = PinManager::open_selection(selection, pins, cx)
+        {
+            snapclip_pin::show_feedback(error.to_string(), position, cx);
         }
     }
 
@@ -402,7 +435,7 @@ impl Shell {
     ///
     /// Read by whoever needs to know pins are reachable at all; holding the value is what
     /// keeps the pin host thread alive, the same way [`Self::tray`] keeps the icon alive.
-    pub fn pins(&self) -> Option<&PinManager> {
+    pub fn pins(&self) -> Option<&Entity<PinManager>> {
         self.pins.as_ref()
     }
 }
@@ -442,7 +475,19 @@ impl Render for Shell {
                         cx.notify();
                     }))
                     .into_any_element(),
-            ));
+            ))
+            .child(div().flex_1())
+            .child(
+                Button::new("pin-clipboard")
+                    .label("贴出剪贴板")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.command(
+                            tray::TrayMessage::new(tray::TrayCommand::PinClipboard),
+                            window,
+                            cx,
+                        );
+                    })),
+            );
 
         let body = match self.page {
             Page::Settings => self.settings.clone().into_any_element(),
@@ -530,6 +575,7 @@ pub fn run(options: StartupOptions) {
             }
             let dark = cx.theme().mode == ThemeMode::Dark;
             save_panel::init(cx, dark);
+            snapclip_pin::init(cx);
 
             cx.spawn(async move |cx| {
                 if preview {

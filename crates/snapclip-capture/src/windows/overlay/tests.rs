@@ -285,10 +285,7 @@ fn the_level_hint_counts_the_way_the_confirm_line_does() {
     let reach = super::level_badge_reach(Some(chain), &path).expect("a walked chain has stops");
     assert_eq!(reach, crate::geometry::LevelReach { up: 7, down: 1 });
     // …and the sentence that explains the chip quotes those same two numbers.
-    assert_eq!(
-        level_hint(reach),
-        "↑7 ↓1 · ↑ = 窗口 · 滚轮 / Ctrl+↑↓ 切换"
-    );
+    assert_eq!(level_hint(reach), "↑7 ↓1 · ↑ = 窗口 · 滚轮 / Ctrl+↑↓ 切换");
     // The label says nothing about the level any more, so its text cannot drift from the badge.
     assert_eq!(
         preview_label(Rect::new(0, 0, 100, 50), false, None, true, false),
@@ -705,7 +702,10 @@ fn the_countdown_keeps_only_the_ui_that_is_on_screen() {
     // 环的内孔里、且离小框足够远的一点（小框以选区中心为中心）。
     let probe = Point::new(selection.right - 40, selection.bottom - 30);
     assert!(
-        probe.x > inner.left && probe.x < inner.right && probe.y > inner.top && probe.y < inner.bottom,
+        probe.x > inner.left
+            && probe.x < inner.right
+            && probe.y > inner.top
+            && probe.y < inner.bottom,
         "探针点落在环的内孔里"
     );
     assert!(!number.contains(probe), "探针点不应当落在倒计时小框里");
@@ -745,8 +745,15 @@ fn the_countdown_only_offers_a_resize_cursor_on_the_frame() {
     let arrow = countdown_cursor(SelectionGeometry::Move);
     // HUD 里：边框/手柄沿用普通状态那套映射，且都不等于箭头。
     for handle in Handle::ALL {
-        assert_eq!(countdown_cursor(resize(handle)), selection_cursor(resize(handle)));
-        assert_ne!(countdown_cursor(resize(handle)), arrow, "{handle:?} 该是改大小光标");
+        assert_eq!(
+            countdown_cursor(resize(handle)),
+            selection_cursor(resize(handle))
+        );
+        assert_ne!(
+            countdown_cursor(resize(handle)),
+            arrow,
+            "{handle:?} 该是改大小光标"
+        );
     }
     // 边框之外的三种命中在 HUD 里都是箭头（窗口只在环上，那里已经不属于它）。
     for other in [
@@ -754,19 +761,50 @@ fn the_countdown_only_offers_a_resize_cursor_on_the_frame() {
         SelectionGeometry::Create,
         SelectionGeometry::Outside,
     ] {
-        assert_eq!(countdown_cursor(other), arrow, "{other:?} 在 HUD 里该是普通箭头");
+        assert_eq!(
+            countdown_cursor(other),
+            arrow,
+            "{other:?} 在 HUD 里该是普通箭头"
+        );
     }
     // 普通状态那套映射的结构原样保留（回归）：方位相同→同一种，方位不同→不同种，
     // 空白与新建都是十字，移动是四向箭头。
-    assert_eq!(selection_cursor(resize(Handle::TopLeft)), selection_cursor(resize(Handle::BottomRight)));
-    assert_eq!(selection_cursor(resize(Handle::TopRight)), selection_cursor(resize(Handle::BottomLeft)));
-    assert_eq!(selection_cursor(resize(Handle::Top)), selection_cursor(resize(Handle::Bottom)));
-    assert_eq!(selection_cursor(resize(Handle::Left)), selection_cursor(resize(Handle::Right)));
-    assert_ne!(selection_cursor(resize(Handle::TopLeft)), selection_cursor(resize(Handle::TopRight)));
-    assert_ne!(selection_cursor(resize(Handle::Left)), selection_cursor(resize(Handle::Top)));
-    assert_eq!(selection_cursor(SelectionGeometry::Create), selection_cursor(SelectionGeometry::Outside));
-    assert_ne!(selection_cursor(SelectionGeometry::Move), selection_cursor(SelectionGeometry::Outside));
-    assert_ne!(selection_cursor(SelectionGeometry::Move), selection_cursor(resize(Handle::Left)));
+    assert_eq!(
+        selection_cursor(resize(Handle::TopLeft)),
+        selection_cursor(resize(Handle::BottomRight))
+    );
+    assert_eq!(
+        selection_cursor(resize(Handle::TopRight)),
+        selection_cursor(resize(Handle::BottomLeft))
+    );
+    assert_eq!(
+        selection_cursor(resize(Handle::Top)),
+        selection_cursor(resize(Handle::Bottom))
+    );
+    assert_eq!(
+        selection_cursor(resize(Handle::Left)),
+        selection_cursor(resize(Handle::Right))
+    );
+    assert_ne!(
+        selection_cursor(resize(Handle::TopLeft)),
+        selection_cursor(resize(Handle::TopRight))
+    );
+    assert_ne!(
+        selection_cursor(resize(Handle::Left)),
+        selection_cursor(resize(Handle::Top))
+    );
+    assert_eq!(
+        selection_cursor(SelectionGeometry::Create),
+        selection_cursor(SelectionGeometry::Outside)
+    );
+    assert_ne!(
+        selection_cursor(SelectionGeometry::Move),
+        selection_cursor(SelectionGeometry::Outside)
+    );
+    assert_ne!(
+        selection_cursor(SelectionGeometry::Move),
+        selection_cursor(resize(Handle::Left))
+    );
 }
 
 /// 倒计时里拖完边框：**到点贴图用的区域必须是新选区**，不是点「确定」那一刻的旧区域。
@@ -780,7 +818,8 @@ fn resizing_during_the_countdown_moves_the_pin_region_with_the_frame() {
     let new = Rect::new(40, 500, 1200, 1400);
 
     let (pin, pieces) = OverlayController::countdown_after_resize(old, origin, None, 96);
-    let (pin_after, pieces_after) = OverlayController::countdown_after_resize(new, origin, None, 96);
+    let (pin_after, pieces_after) =
+        OverlayController::countdown_after_resize(new, origin, None, 96);
 
     assert_eq!(
         pin.map(|region| region.to_rect(origin)),
@@ -816,10 +855,7 @@ fn the_cursor_stays_on_the_dragged_direction_while_dragging() {
     use super::input::{countdown_cursor_while, selection_cursor};
     use crate::geometry::{Handle, SelectionGeometry};
 
-    let dragged = countdown_cursor_while(
-        Some(Handle::Left),
-        SelectionGeometry::Outside,
-    );
+    let dragged = countdown_cursor_while(Some(Handle::Left), SelectionGeometry::Outside);
     assert_eq!(
         dragged,
         selection_cursor(SelectionGeometry::Resize(Handle::Left)),
@@ -894,7 +930,11 @@ fn leaving_the_countdown_hides_the_window_before_it_stops_the_hud() {
         "取消也要先清状态、再还原区域：{steps:?}"
     );
     // 遮罩层也必须跟着"退出可见状态"一起收，不能留到最后（否则它会盖着下一个会话）。
-    for exit in [CountdownExit::Fire, CountdownExit::Cancel, CountdownExit::Fail] {
+    for exit in [
+        CountdownExit::Fire,
+        CountdownExit::Cancel,
+        CountdownExit::Fail,
+    ] {
         let steps = countdown_exit_steps(exit);
         assert!(
             steps.contains(&ExitStep::HideDim),
@@ -964,18 +1004,21 @@ fn entering_the_countdown_paints_the_hud_before_it_reshapes_the_window() {
 /// 这一帧直接压掉 —— "先画一帧再隐藏"就是用户看到的那下灰底。
 #[test]
 fn the_countdown_gate_never_paints_a_normal_frame() {
-    use super::render_submit::{frame_kind, FrameKind};
+    use super::render_submit::{FrameKind, frame_kind};
 
     assert_eq!(frame_kind(false, None), FrameKind::Normal, "平时就是普通帧");
     assert_eq!(frame_kind(false, Some(3)), FrameKind::Hud, "在数就是 HUD");
-    assert_eq!(frame_kind(true, Some(3)), FrameKind::Hud, "在数且闸生效：HUD");
+    assert_eq!(
+        frame_kind(true, Some(3)),
+        FrameKind::Hud,
+        "在数且闸生效：HUD"
+    );
     assert_eq!(
         frame_kind(true, None),
         FrameKind::Suppressed,
         "闸还生效、倒计时已结束（窗口未隐藏）⇒ 压掉"
     );
 }
-
 
 // ─── 倒计时遮罩层：带正向对照的活桌面回归（docs/23 §14.55.9.8）────────────────
 
@@ -986,7 +1029,7 @@ fn the_countdown_gate_never_paints_a_normal_frame() {
 /// 就是这么来的，§14.55.9.8 的差分实验纠正了它）。
 fn dim_test_be_dpi_aware() {
     use windows_sys::Win32::UI::HiDpi::{
-        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
@@ -996,8 +1039,9 @@ fn dim_test_be_dpi_aware() {
 /// 观测遮罩层时必须先临时摘掉它的"排除出截图"，否则这里永远看不到它。
 fn dim_test_screen_bgra(rect: Rect) -> (Vec<u8>, u32) {
     use windows_sys::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, SRCCOPY,
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC,
+        CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, ReleaseDC, SRCCOPY,
+        SelectObject,
     };
     let width = rect.width().max(1) as u32;
     let height = rect.height().max(1) as u32;
@@ -1019,8 +1063,14 @@ fn dim_test_screen_bgra(rect: Rect) -> (Vec<u8>, u32) {
         let screen = GetDC(std::ptr::null_mut());
         let memory = CreateCompatibleDC(screen);
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let bitmap =
-            CreateDIBSection(memory, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+        let bitmap = CreateDIBSection(
+            memory,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
         assert!(!bitmap.is_null() && !bits.is_null(), "观测用 DIB 创建失败");
         SelectObject(memory, bitmap as _);
         let ok = BitBlt(
@@ -1067,7 +1117,11 @@ fn dim_test_checkerboard(width: u32, height: u32, cell: u32) -> Vec<u8> {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
-            let value: u8 = if ((x / cell) + (y / cell)) % 2 == 0 { 230 } else { 26 };
+            let value: u8 = if ((x / cell) + (y / cell)) % 2 == 0 {
+                230
+            } else {
+                26
+            };
             let at = ((y * width + x) * 4) as usize;
             pixels[at] = value;
             pixels[at + 1] = value;
@@ -1278,9 +1332,7 @@ fn the_countdown_dim_layer_actually_darkens_outside_the_selection() {
     // 6b) 圆角（docs/23 §14.55.23）：洞必须跟着弧走 —— 弧与方角之间的楔形也要算在区域里，
     // 否则遮罩在那里留白。半径 30 时，(left+3, top+3) 到弧心 (left+30, top+30) 约 38 > 30
     // ⇒ 在弧外、但在选区矩形内 = 楔形。
-    layer
-        .update(monitor, selection, 30)
-        .expect("换洞应当成功");
+    layer.update(monitor, selection, 30).expect("换洞应当成功");
     let rgn = unsafe { windows_sys::Win32::Graphics::Gdi::CreateRectRgn(0, 0, 0, 0) };
     let copied = unsafe { GetWindowRgn(hwnd, rgn) };
     assert!(copied != 0, "换洞后窗口应当仍有区域");
@@ -1331,7 +1383,10 @@ fn a_rounded_selection_narrows_the_countdown_region_to_a_rounded_ring() {
     use crate::windows::win::window::WindowRegion;
     let selection = Rect::new(100, 100, 500, 400);
     let square = super::session::countdown_window_pieces(selection, None, 96, 0);
-    assert!(matches!(square[0], WindowRegion::Ring { .. }), "半径 0 仍走矩形环");
+    assert!(
+        matches!(square[0], WindowRegion::Ring { .. }),
+        "半径 0 仍走矩形环"
+    );
     let rounded = super::session::countdown_window_pieces(selection, None, 96, 20);
     match rounded[0] {
         WindowRegion::RoundRing { radius, .. } => {

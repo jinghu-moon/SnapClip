@@ -45,6 +45,11 @@ apps/*/docs/Temp/
 OCR-Model/
 Formula-TestSet/
 OCR-test-image/
+# Local full-resolution HDR fixtures; metadata and hash manifest stay trackable.
+/HDR-IMAGES/1A_PNG_HDR.png
+/HDR-IMAGES/1B_PNG_SDR.png
+/HDR-IMAGES/2A_AVIF_HDR.avif
+/HDR-IMAGES/2B_AVIF_SDR.avif
 .comparison-old/
 comparison-*/
 

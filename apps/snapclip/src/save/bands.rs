@@ -26,7 +26,8 @@ pub fn save_bands(
 ) -> Result<SaveOutcome, SaveError> {
     let rows = bands.rows();
     // The size question first, for the same reason it comes first in `service::save` (`caps`).
-    caps::check(request.format, u64::from(width), u64::from(rows)).map_err(SaveError::Capability)?;
+    caps::check(request.format, u64::from(width), u64::from(rows))
+        .map_err(SaveError::Capability)?;
     if request.format != SaveFormat::Png {
         return Err(SaveError::UnsupportedFormat(request.format));
     }
@@ -36,10 +37,7 @@ pub fn save_bands(
 
 /// Encodes a band source to PNG bytes without touching the disk. Separate from [`save_bands`] so
 /// the encoding can be compared with the whole-image path without a file in between.
-pub fn encode_png_bands(
-    bands: &mut dyn BandSource,
-    width: u32,
-) -> Result<Vec<u8>, SaveError> {
+pub fn encode_png_bands(bands: &mut dyn BandSource, width: u32) -> Result<Vec<u8>, SaveError> {
     let rows = bands.rows();
     let mut sink = PngRowBandSink::new();
     let mut writer = sink
@@ -153,7 +151,10 @@ mod tests {
         let mut rows = Rows::new(width, height);
         let banded = encode_png_bands(&mut rows, width).expect("banded encode");
 
-        assert_eq!(banded, whole, "a band boundary must not be visible in the file");
+        assert_eq!(
+            banded, whole,
+            "a band boundary must not be visible in the file"
+        );
     }
 
     /// A save writes exactly the bytes the encoder produced, and commits atomically.
@@ -172,7 +173,11 @@ mod tests {
 
         assert_eq!(outcome.path, dir.join("long.png"));
         let on_disk = std::fs::read(&outcome.path).expect("written file");
-        assert_eq!(on_disk, write_whole(7, 11), "the file is the encoder's bytes");
+        assert_eq!(
+            on_disk,
+            write_whole(7, 11),
+            "the file is the encoder's bytes"
+        );
         assert_eq!(outcome.bytes, on_disk.len() as u64);
         assert!(
             std::fs::read_dir(&dir)
@@ -220,7 +225,10 @@ mod tests {
         // The size question comes before anything touches the disk, so a refusal leaves the
         // directory exactly as it found it: no `.partial`, no half written file.
         let leftovers: Vec<_> = match std::fs::read_dir(&request.directory) {
-            Ok(entries) => entries.filter_map(|e| e.ok()).map(|e| e.file_name()).collect(),
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(error) => panic!("the directory cannot be read: {error}"),
         };
@@ -231,7 +239,8 @@ mod tests {
     }
 
     fn scratch(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("snapclip-save-{}-{label}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("snapclip-save-{}-{label}", std::process::id()));
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

@@ -7,7 +7,7 @@
 //! 确认）——那时冻结帧还活着，是这些像素唯一的完整副本。
 //!
 //! 本模块的 [`PinSource`] 只是把那个槽位接成贴图线程能调用的
-//! [`PinHome`]：`take_selection` 时向捕获侧要一次，不复制、不缓存、不留第二份。
+//! [`PinSource`]：`take_selection` 时向捕获侧要一次，不复制、不缓存、不留第二份。
 //!
 //! # 为什么曾经不是这样
 //!
@@ -21,7 +21,7 @@
 //! 槽位被更新的覆盖掉是正确行为：F6 贴的是「我刚截的那张」，不是「第一张」；旧的被
 //! 覆盖时它的 `Arc` 一起释放，所以同时最多只多留一张图的内存。
 //!
-//! 取走语义见 [`PinHome::take_selection`]：贴出去之后槽位就空了，想再贴一次要重新截。
+//! 取走语义见 [`PinSource::take_selection`]：贴出去之后槽位就空了，想再贴一次要重新截。
 //!
 //! # 拼接长图被跳过
 //!
@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use snapclip_capture::artifact::SelectionPixels;
 
-use snapclip_pin::{PinHome, PinSelection};
+use snapclip_pin::PinSelection;
 
 /// 捕获侧「刚提交的选区」槽位，贴图只需要这一个能力。
 ///
@@ -69,12 +69,15 @@ impl PinSource {
 
     /// 把捕获运行时接上。外壳在拿到 [`CaptureRuntime`] 之后调用一次。
     pub fn set_home(&self, home: Arc<dyn TakeSelection>) {
-        *self.home.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(home);
+        *self
+            .home
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(home);
     }
 }
 
-impl PinHome for PinSource {
-    fn take_selection(&self) -> Option<PinSelection> {
+impl PinSource {
+    pub fn take_selection(&self) -> Option<PinSelection> {
         let home = self
             .home
             .lock()
@@ -147,7 +150,10 @@ mod tests {
     fn taking_a_selection_leaves_the_slot_empty() {
         // 取走语义：槽位不是「最近一次」的缓存，而是「还没被贴的那一张」。
         let home = Arc::new(FakeHome::default());
-        home.put(prepared(Some(Point::new(1000, 500)), Rect::new(10, 20, 40, 50)));
+        home.put(prepared(
+            Some(Point::new(1000, 500)),
+            Rect::new(10, 20, 40, 50),
+        ));
         let source = PinSource::new();
         source.set_home(home);
         let taken = source.take_selection().expect("槽位里有东西");
@@ -162,7 +168,10 @@ mod tests {
         source.set_home(home.clone());
         home.put(prepared(Some(Point::new(0, 1)), Rect::new(0, 0, 4, 4)));
         home.put(prepared(Some(Point::new(0, 1)), Rect::new(8, 8, 12, 12)));
-        assert_eq!(source.take_selection().unwrap().region(), Rect::new(8, 9, 12, 13));
+        assert_eq!(
+            source.take_selection().unwrap().region(),
+            Rect::new(8, 9, 12, 13)
+        );
     }
 
     #[test]
@@ -182,7 +191,10 @@ mod tests {
     #[test]
     fn a_monitor_selection_keeps_its_pixels_and_screen_position() {
         let home = Arc::new(FakeHome::default());
-        home.put(prepared(Some(Point::new(1000, 500)), Rect::new(10, 20, 40, 50)));
+        home.put(prepared(
+            Some(Point::new(1000, 500)),
+            Rect::new(10, 20, 40, 50),
+        ));
         let source = PinSource::new();
         source.set_home(home);
         let taken = source.take_selection().expect("显示器选区必须能贴");

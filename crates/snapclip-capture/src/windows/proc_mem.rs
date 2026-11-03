@@ -78,7 +78,10 @@ mod tests {
     #[test]
     fn the_query_returns_this_process_working_set() {
         let bytes = working_set_bytes().expect("the query must succeed for this process");
-        assert!(bytes > 1024 * 1024, "working set {bytes} is implausibly small");
+        assert!(
+            bytes > 1024 * 1024,
+            "working set {bytes} is implausibly small"
+        );
         assert!(
             bytes < 1024usize * 1024 * 1024 * 1024,
             "working set {bytes} is implausibly large"

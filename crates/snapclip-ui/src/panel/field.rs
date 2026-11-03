@@ -339,7 +339,10 @@ mod face_tests {
                 assert_eq!(edit_font_height_for(scale, face.font_dip()), expected);
             }
         }
-        assert_eq!(edit_font_height(1.5), edit_font_height_for(1.5, EDIT_FONT_DIP));
+        assert_eq!(
+            edit_font_height(1.5),
+            edit_font_height_for(1.5, EDIT_FONT_DIP)
+        );
     }
 }
 
@@ -400,7 +403,14 @@ impl FieldStates {
         if self.state_of(id).is_message() {
             return;
         }
-        self.set(id, if focused { FieldState::Focused } else { FieldState::Idle });
+        self.set(
+            id,
+            if focused {
+                FieldState::Focused
+            } else {
+                FieldState::Idle
+            },
+        );
     }
 
     /// Put a message on one field. Returns whether anything was there to clear afterwards.
@@ -475,15 +485,30 @@ pub fn field_colours(state: FieldState, surface: [u8; 4]) -> FieldColours {
 
     let fill = fill_over_surface(surface);
     match state {
-        FieldState::Idle => FieldColours { fill, border: CLEAR, inset: None, text: TEXT },
+        FieldState::Idle => FieldColours {
+            fill,
+            border: CLEAR,
+            inset: None,
+            text: TEXT,
+        },
         FieldState::Focused => FieldColours {
             fill,
             border: ACCENT,
             inset: Some(ACCENT),
             text: TEXT,
         },
-        FieldState::Error => FieldColours { fill, border: DANGER, inset: None, text: TEXT },
-        FieldState::Warning => FieldColours { fill, border: WARNING, inset: None, text: TEXT },
+        FieldState::Error => FieldColours {
+            fill,
+            border: DANGER,
+            inset: None,
+            text: TEXT,
+        },
+        FieldState::Warning => FieldColours {
+            fill,
+            border: WARNING,
+            inset: None,
+            text: TEXT,
+        },
     }
 }
 
@@ -492,9 +517,7 @@ pub fn field_colours(state: FieldState, surface: [u8; 4]) -> FieldColours {
 /// The key travels from the save service, so this is the one place that decides where a sentence
 /// appears. A message with no field is still said on the status line — the mapping returning `None`
 /// means "the row is fine, the attempt is not", not "say nothing".
-pub fn problem_of(
-    copy: crate::copy::ValidationCopy,
-) -> Option<(FieldId, FieldState)> {
+pub fn problem_of(copy: crate::copy::ValidationCopy) -> Option<(FieldId, FieldState)> {
     use crate::copy::{Level, ValidationCopy};
     let field = match copy {
         ValidationCopy::PathEmpty
@@ -874,7 +897,8 @@ pub fn label_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: R
 /// after-save row — have no box here; ask `Row::has_content` before using the result.
 pub fn field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, row: Row) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
-    let top = row_label_top(metrics, rects, scale, row) + px(metrics.row_label_height + metrics.row_gap);
+    let top =
+        row_label_top(metrics, rects, scale, row) + px(metrics.row_label_height + metrics.row_gap);
     Rect {
         left: rects.form.left,
         top,
@@ -1195,10 +1219,7 @@ pub fn size_preset_contains(
 ) -> Option<usize> {
     (0..SIZE_PRESET_WORDS.len()).find(|index| {
         let rect = size_preset_rect(metrics, rects, scale, widths, *index);
-        point.0 >= rect.left
-            && point.0 < rect.right
-            && point.1 >= rect.top
-            && point.1 < rect.bottom
+        point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
     })
 }
 
@@ -1313,11 +1334,7 @@ pub const NAME_TEXT_ROOM_DIP: i32 = 34;
 /// the second reduction impossible to forget — the box used to be the row less the wand only, which
 /// left the edit control running underneath the eighty dip format button, where a child window both
 /// hides what the frame draws and eats the clicks meant for it.
-pub fn name_text_rect(
-    metrics: &FrameMetrics,
-    rects: &FrameRects,
-    scale: f32,
-) -> Rect {
+pub fn name_text_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     let field = name_field_rect(metrics, rects, scale);
     Rect {
@@ -1327,11 +1344,7 @@ pub fn name_text_rect(
 }
 
 /// The wand's own box, inset four dip from the field's top and right edges (`:213`).
-pub fn name_wand_rect(
-    metrics: &FrameMetrics,
-    rects: &FrameRects,
-    scale: f32,
-) -> Rect {
+pub fn name_wand_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     // The wand sits inside `.name-wrap`, not inside the row: the format button owns the row's right
     // end, and a wand placed against the row's edge would be drawn under that button.
@@ -1347,11 +1360,7 @@ pub fn name_wand_rect(
 }
 
 /// The wand's graphic, centred in its box: 16 dip in 24 (`:558` in a `:213` button).
-pub fn name_wand_icon_rect(
-    metrics: &FrameMetrics,
-    rects: &FrameRects,
-    scale: f32,
-) -> Rect {
+pub fn name_wand_icon_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     let wand = name_wand_rect(metrics, rects, scale);
     let side = px(NAME_WAND_ICON_DIP);
@@ -1396,7 +1405,10 @@ pub fn close_icon_rect(_metrics: &FrameMetrics, rects: &FrameRects, scale: f32) 
 pub fn close_button_contains(rects: &FrameRects, scale: f32, point: (i32, i32)) -> bool {
     let _ = scale;
     let button = rects.close;
-    point.0 >= button.left && point.0 < button.right && point.1 >= button.top && point.1 < button.bottom
+    point.0 >= button.left
+        && point.0 < button.right
+        && point.1 >= button.top
+        && point.1 < button.bottom
 }
 
 /// The drawn minimize glyph, centred in `rects.minimize`.
@@ -1423,7 +1435,10 @@ pub fn minimize_icon_rect(_metrics: &FrameMetrics, rects: &FrameRects, scale: f3
 pub fn minimize_button_contains(rects: &FrameRects, scale: f32, point: (i32, i32)) -> bool {
     let _ = scale;
     let button = rects.minimize;
-    point.0 >= button.left && point.0 < button.right && point.1 >= button.top && point.1 < button.bottom
+    point.0 >= button.left
+        && point.0 < button.right
+        && point.1 >= button.top
+        && point.1 < button.bottom
 }
 
 /// `.size-mode { padding: 2px; border: 1px solid var(--line-soft); border-radius: var(--r-input) }`
@@ -1588,10 +1603,7 @@ pub fn size_mode_contains(
 ) -> Option<usize> {
     (0..SIZE_MODE_WORDS.len()).find(|index| {
         let rect = size_mode_button_rect(metrics, rects, scale, widths, *index);
-        point.0 >= rect.left
-            && point.0 < rect.right
-            && point.1 >= rect.top
-            && point.1 < rect.bottom
+        point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
     })
 }
 
@@ -1780,7 +1792,11 @@ pub fn chosen_quality(state: &SegmentState) -> usize {
 /// Feed one pointer event to the quality control and report the newly chosen option, if the event
 /// changed it. A press that is released on a different option changes nothing, which is what the
 /// press-and-release pairing in `segmented` exists to express.
-pub fn quality_pointer(state: &mut SegmentState, event: PointerEvent, point: Point) -> Option<usize> {
+pub fn quality_pointer(
+    state: &mut SegmentState,
+    event: PointerEvent,
+    point: Point,
+) -> Option<usize> {
     let before = chosen_quality(state);
     let activated = state.pointer_event(event, point)?;
     (chosen_quality(state) != before).then_some(activated)
@@ -2036,7 +2052,12 @@ pub fn limit_knob_rect(track: Rect, scale: f32, on: bool) -> Rect {
 /// The `不超过` word, on the quality line where the segment would be.
 pub fn limit_label_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> Rect {
     let line = field_rect(metrics, rects, scale, Row::Quality);
-    Rect::new(line.left, line.top, line.left + limit_label_width(scale), line.bottom)
+    Rect::new(
+        line.left,
+        line.top,
+        line.left + limit_label_width(scale),
+        line.bottom,
+    )
 }
 
 /// The reserved label width, in pixels at this scale.
@@ -2085,7 +2106,12 @@ pub fn auto_shrink_rect(
     word_width_px: i32,
 ) -> Rect {
     let note = limit_note_rect(metrics, rects, scale);
-    Rect::new(note.right - word_width_px, note.top, note.right, note.bottom)
+    Rect::new(
+        note.right - word_width_px,
+        note.top,
+        note.right,
+        note.bottom,
+    )
 }
 
 /// Where the estimate row's number goes: the row's content band, which `.est-size` fills
@@ -2111,9 +2137,13 @@ pub fn encode_state_rect(
     fill_row: bool,
 ) -> Rect {
     let band = estimate_label_rect(metrics, rects, scale, fill_row);
-    Rect::new(band.right - word_width_px, band.top, band.right, band.bottom)
+    Rect::new(
+        band.right - word_width_px,
+        band.top,
+        band.right,
+        band.bottom,
+    )
 }
-
 
 /// One swatch. `.fill-row { justify-content: space-between }` (`:315`) puts the group against the
 /// column's right edge, and `.bg-switch { gap: 8px }` (`:149`) spaces the swatches apart; the row is
@@ -2234,11 +2264,8 @@ pub enum FooterButton {
 
 /// Right to left, which is also the order they are laid out in: the status text takes whatever is
 /// left (`:275`, `flex: 1`), so everything else is anchored to the right edge.
-pub const FOOTER_BUTTONS: [FooterButton; 3] = [
-    FooterButton::Save,
-    FooterButton::Cancel,
-    FooterButton::Copy,
-];
+pub const FOOTER_BUTTONS: [FooterButton; 3] =
+    [FooterButton::Save, FooterButton::Cancel, FooterButton::Copy];
 
 /// The word on a footer button, once.
 ///
@@ -2394,10 +2421,7 @@ pub fn footer_button_contains(
     point: (i32, i32),
 ) -> bool {
     let rect = footer_button_rect(metrics, scale, widths, button);
-    point.0 >= rect.left
-        && point.0 < rect.right
-        && point.1 >= rect.top
-        && point.1 < rect.bottom
+    point.0 >= rect.left && point.0 < rect.right && point.1 >= rect.top && point.1 < rect.bottom
 }
 
 /// The footer's status line: the strip's left padding, up to one gap before the copy button.
@@ -2557,12 +2581,7 @@ pub fn fmt_button_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -
 }
 
 /// The name field's rect inside a row band: everything left of the gap and the button (`:555`).
-fn fmt_name_field_rect(
-    metrics: &FrameMetrics,
-    rects: &FrameRects,
-    scale: f32,
-    band: Rect,
-) -> Rect {
+fn fmt_name_field_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, band: Rect) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     let button = fmt_button_rect(metrics, rects, scale);
     Rect {
@@ -2720,8 +2739,12 @@ pub fn fmt_item_at(
     if !open {
         return None;
     }
-    (0..FMT_OPTIONS.len())
-        .find(|index| fmt_contains(fmt_item_rect(metrics, rects, scale, window_height, *index), point))
+    (0..FMT_OPTIONS.len()).find(|index| {
+        fmt_contains(
+            fmt_item_rect(metrics, rects, scale, window_height, *index),
+            point,
+        )
+    })
 }
 
 /// Whether a point is anywhere in the open menu, padding included — the region that keeps a click
@@ -2822,9 +2845,8 @@ pub fn context_item_rects(menu: Rect, scale: f32) -> [Rect; CONTEXT_ITEMS.len()]
 
 /// Which command a point lands on, if any.
 pub fn context_item_at(menu: Rect, scale: f32, point: (i32, i32)) -> Option<usize> {
-    (0..CONTEXT_ITEMS.len()).find(|index| {
-        rect_contains(context_item_rect(menu, scale, *index), point)
-    })
+    (0..CONTEXT_ITEMS.len())
+        .find(|index| rect_contains(context_item_rect(menu, scale, *index), point))
 }
 
 /// Which commands can do anything right now.
@@ -2832,7 +2854,10 @@ pub fn context_item_at(menu: Rect, scale: f32, point: (i32, i32)) -> Option<usiz
 /// Cutting and copying need a selection, because a box with nothing selected has nothing to put on
 /// the clipboard and an item that cannot act must not look like one that can. Pasting needs the
 /// clipboard to hold text. Selecting everything always works.
-pub fn context_enabled(has_selection: bool, clipboard_has_text: bool) -> [bool; CONTEXT_ITEMS.len()] {
+pub fn context_enabled(
+    has_selection: bool,
+    clipboard_has_text: bool,
+) -> [bool; CONTEXT_ITEMS.len()] {
     [has_selection, has_selection, clipboard_has_text, true]
 }
 
@@ -2884,10 +2909,7 @@ pub fn path_change_contains(
     change_width: i32,
     point: (i32, i32),
 ) -> bool {
-    rect_contains(
-        path_change_rect(metrics, rects, scale, change_width),
-        point,
-    )
+    rect_contains(path_change_rect(metrics, rects, scale, change_width), point)
 }
 
 /// The square folder button beside it (`:546`), which opens the folder the path names.
@@ -2911,7 +2933,6 @@ pub fn path_chip_at(
     (0..widths.len())
         .find(|index| rect_contains(path_chip_rect(metrics, rects, scale, widths, *index), point))
 }
-
 
 /// The variable button inside the name field (`:213`), which opens the token menu./// The after-save switches' geometry (`:573`, `:574`): the label's width and each switch's
 /// width, measured by the code that draws them so that the rectangle drawn is the rectangle hit.
@@ -2998,12 +3019,7 @@ pub fn var_menu_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32) -> 
 }
 
 /// One token's row inside the menu, after the menu's own padding (`:217`, `:219`).
-pub fn var_item_rect(
-    metrics: &FrameMetrics,
-    rects: &FrameRects,
-    scale: f32,
-    index: usize,
-) -> Rect {
+pub fn var_item_rect(metrics: &FrameMetrics, rects: &FrameRects, scale: f32, index: usize) -> Rect {
     let px = |dip: i32| (dip as f32 * scale).round() as i32;
     let menu = var_menu_rect(metrics, rects, scale);
     let pad = px(VAR_MENU_PAD_DIP);
@@ -3104,7 +3120,10 @@ mod tests {
         let mixed = selection_over_field([41, 41, 46, 255], [31, 117, 219, 255]);
         assert_eq!(mixed, [37, 67, 106, 255]);
         // The ends of the range, both of them written out: no accent at all, and all of it.
-        assert_eq!(selection_over_field([10, 20, 30, 255], [10, 20, 30, 255]), [10, 20, 30, 255]);
+        assert_eq!(
+            selection_over_field([10, 20, 30, 255], [10, 20, 30, 255]),
+            [10, 20, 30, 255]
+        );
         assert_eq!(
             selection_over_field([0, 0, 0, 255], [255, 255, 255, 255]),
             [89, 89, 89, 255],
@@ -3148,15 +3167,35 @@ mod tests {
             let row = field_rect(&demo, &rects, scale, Row::Size);
             let hint = warn_hint_rect(&demo, &rects, scale);
             let px = |dip: i32| (dip as f32 * scale).round() as i32;
-            assert_eq!(hint.top, presets.bottom + px(6), "one row gap under the shortcuts");
-            assert_eq!(hint.left, row.left + px(28), "indented like the shortcuts (:254)");
-            assert_eq!(hint.height(), px(10), "as tall as the sentence its own size (:254)");
+            assert_eq!(
+                hint.top,
+                presets.bottom + px(6),
+                "one row gap under the shortcuts"
+            );
+            assert_eq!(
+                hint.left,
+                row.left + px(28),
+                "indented like the shortcuts (:254)"
+            );
+            assert_eq!(
+                hint.height(),
+                px(10),
+                "as tall as the sentence its own size (:254)"
+            );
             assert_eq!(hint.right, row.right, "the line runs to the column's edge");
             let icon = warn_hint_icon_rect(&demo, &rects, scale);
-            assert_eq!((icon.width(), icon.height()), (px(12), px(12)), "the icon is 12 square");
+            assert_eq!(
+                (icon.width(), icon.height()),
+                (px(12), px(12)),
+                "the icon is 12 square"
+            );
             assert_eq!(icon.left, hint.left, "the icon starts the line");
             let text = warn_hint_text_rect(&demo, &rects, scale);
-            assert_eq!(text.left, icon.right + px(4), "the sentence follows a four dip gap");
+            assert_eq!(
+                text.left,
+                icon.right + px(4),
+                "the sentence follows a four dip gap"
+            );
         }
     }
 
@@ -3167,10 +3206,22 @@ mod tests {
     /// answer reaches the window and the frame.
     #[test]
     fn the_hint_appears_only_when_a_side_grows() {
-        assert!(!warn_hint_shown((10, 10), (10, 10)), "the capture itself is not a warning");
-        assert!(!warn_hint_shown((8, 6), (10, 10)), "shrinking is not a warning either");
-        assert!(warn_hint_shown((11, 10), (10, 10)), "wider than the capture warns");
-        assert!(warn_hint_shown((10, 11), (10, 10)), "taller than the capture warns");
+        assert!(
+            !warn_hint_shown((10, 10), (10, 10)),
+            "the capture itself is not a warning"
+        );
+        assert!(
+            !warn_hint_shown((8, 6), (10, 10)),
+            "shrinking is not a warning either"
+        );
+        assert!(
+            warn_hint_shown((11, 10), (10, 10)),
+            "wider than the capture warns"
+        );
+        assert!(
+            warn_hint_shown((10, 11), (10, 10)),
+            "taller than the capture warns"
+        );
     }
 
     /// `--warning` (`:23`) is one value for the border (`:334`), the status line (`:327`) and the
@@ -3179,7 +3230,11 @@ mod tests {
     #[test]
     fn the_field_warning_is_the_designs_warning() {
         let border = field_colours(FieldState::Warning, SURFACE).border;
-        assert_eq!(border, [240, 179, 90, 255], "warning border is --warning (:334, :23)");
+        assert_eq!(
+            border,
+            [240, 179, 90, 255],
+            "warning border is --warning (:334, :23)"
+        );
         assert_eq!(
             crate::panel::frame::DEMO_PALETTE.warning,
             border,
@@ -3212,7 +3267,10 @@ mod tests {
                 | ValidationCopy::DirectoryMissing
                 | ValidationCopy::PathTooLong => FieldId::Path,
             };
-            assert_eq!(field, expected_field, "{copy:?} belongs to {expected_field:?}");
+            assert_eq!(
+                field, expected_field,
+                "{copy:?} belongs to {expected_field:?}"
+            );
             let expected_state = match copy.level() {
                 Level::Warn => FieldState::Warning,
                 Level::Error => FieldState::Error,
@@ -3271,17 +3329,32 @@ mod tests {
         // :167 idle has a transparent border, so nothing is drawn.
         assert_eq!(idle.border[3], 0, "idle must not paint a border (:167)");
         // :169 focus is the accent border plus a one dip inset ring.
-        assert_eq!(focused.border, [31, 117, 219, 255], "focus border is --accent (:169)");
-        assert_eq!(focused.inset, Some([31, 117, 219, 255]), "focus adds the inset ring (:169)");
+        assert_eq!(
+            focused.border,
+            [31, 117, 219, 255],
+            "focus border is --accent (:169)"
+        );
+        assert_eq!(
+            focused.inset,
+            Some([31, 117, 219, 255]),
+            "focus adds the inset ring (:169)"
+        );
         // :333 error recolours the border and adds nothing else.
-        assert_eq!(error.border, [255, 123, 123, 255], "error border is --danger (:333)");
+        assert_eq!(
+            error.border,
+            [255, 123, 123, 255],
+            "error border is --danger (:333)"
+        );
         assert_eq!(error.inset, None, "error is a border only (:333)");
 
         // The background and text colour do not depend on the state.
         assert_eq!(idle.fill, focused.fill);
         assert_eq!(idle.fill, error.fill);
         assert_eq!(idle.fill, warning.fill);
-        assert_eq!(idle.text, focused.text, "--text does not change with state (:24)");
+        assert_eq!(
+            idle.text, focused.text,
+            "--text does not change with state (:24)"
+        );
     }
 
     /// `--fill` is white at eight percent over the surface (:26), and a native edit cannot be
@@ -3290,8 +3363,15 @@ mod tests {
     fn the_fill_is_white_at_eight_percent_over_the_surface() {
         let fill = field_colours(FieldState::Idle, SURFACE).fill;
         // 23*0.92 + 255*0.08 = 41.56 -> 41; 28*0.92 + 20.4 = 46.16 -> 46.
-        assert_eq!(fill, [41, 41, 46, 255], "eight percent white over the surface (:26)");
-        assert_eq!(fill[3], 255, "the child cannot be transparent, so the fill is opaque");
+        assert_eq!(
+            fill,
+            [41, 41, 46, 255],
+            "eight percent white over the surface (:26)"
+        );
+        assert_eq!(
+            fill[3], 255,
+            "the child cannot be transparent, so the fill is opaque"
+        );
     }
 
     /// The slot is derived from the design's own arithmetic: label row, its gap, then the field.
@@ -3302,7 +3382,10 @@ mod tests {
             let rects = metrics.rects(scale);
             let field = name_field_rect(&metrics, &rects, scale);
             let px = |dip: i32| (dip as f32 * scale).round() as i32;
-            assert_eq!(field.left, rects.form.left, "the field starts at the form column");
+            assert_eq!(
+                field.left, rects.form.left,
+                "the field starts at the form column"
+            );
             // The name row shares its width with the format button (`:554`–`:561`): the field is the
             // mockup's `.name-wrap` (`flex: 1`), so it stops one gap short of the button rather than
             // at the column's edge. The button and the field together still fill the column.
@@ -3312,7 +3395,10 @@ mod tests {
                 button.left - px(FMT_GAP_DIP),
                 "the name field gives up the gap and the format button's width (:171, :561)"
             );
-            assert_eq!(button.right, rects.form.right, "the button ends at the form's right edge");
+            assert_eq!(
+                button.right, rects.form.right,
+                "the button ends at the form's right edge"
+            );
             // The path row is taller than a text row: its content is the input (32) and the chips
             // under it (24 plus the 6 gap), so from the form's top to the name field there is the
             // path row's own label and gap, its two-part content, the gap to the next row, then the
@@ -3330,7 +3416,11 @@ mod tests {
                 metrics.row_label_height,
                 metrics.row_gap
             );
-            assert_eq!(field.bottom - field.top, px(metrics.field_height), "field height 32 (:167)");
+            assert_eq!(
+                field.bottom - field.top,
+                px(metrics.field_height),
+                "field height 32 (:167)"
+            );
         }
     }
 
@@ -3344,10 +3434,7 @@ mod tests {
             "only the name is a native control, so only it can hold the keyboard"
         );
         assert_eq!(
-            FieldId::ALL
-                .iter()
-                .filter(|id| id.is_focusable())
-                .count(),
+            FieldId::ALL.iter().filter(|id| id.is_focusable()).count(),
             FORM_FIELD_TAB_STOPS,
             "every focusable field is a tab stop, and nothing else is"
         );
@@ -3507,8 +3594,14 @@ mod tests {
             let name = label_rect(&metrics(), &rects, scale, Row::Name);
             let saved = label_rect(&metrics(), &rects, scale, Row::Saved);
             let size = label_rect(&metrics(), &rects, scale, Row::Size);
-            assert!(name.top < saved.top, "the after-save row is below the name row (:568)");
-            assert!(saved.top < size.top, "the after-save row is above the size row (:579)");
+            assert!(
+                name.top < saved.top,
+                "the after-save row is below the name row (:568)"
+            );
+            assert!(
+                saved.top < size.top,
+                "the after-save row is above the size row (:579)"
+            );
             let one_row = (metrics().text_row_pitch() as f32 * scale).round() as i32;
             assert_eq!(
                 saved.top - name.top,
@@ -3550,7 +3643,8 @@ mod tests {
             "the quality row's content is .quality-line, whose min-height is --row (:306, :47)"
         );
         assert_ne!(
-            ROW_DIP, metrics().field_height,
+            ROW_DIP,
+            metrics().field_height,
             "if these ever become equal this test stops meaning anything"
         );
     }
@@ -3609,7 +3703,8 @@ mod tests {
             ".seg has width 108px (:263)"
         );
         assert_eq!(
-            (QUALITY_OPTION_WIDTH_DIP * QUALITY_OPTIONS as f32 + 2.0 * QUALITY_SEG_INSET_DIP) as i32,
+            (QUALITY_OPTION_WIDTH_DIP * QUALITY_OPTIONS as f32 + 2.0 * QUALITY_SEG_INSET_DIP)
+                as i32,
             QUALITY_SEG_WIDTH_DIP as i32,
             "3 x 34 + 2 x 3 must be the 108 dip track (:263, :264)"
         );
@@ -3638,7 +3733,10 @@ mod tests {
                 track.right, rects.form.right,
                 "the segmented control ends at the form column's right edge at {scale} (:306)"
             );
-            assert!(track.left > rects.form.left, "the track is narrower than the column");
+            assert!(
+                track.left > rects.form.left,
+                "the track is narrower than the column"
+            );
         }
     }
 
@@ -3731,10 +3829,7 @@ mod tests {
         let metrics = metrics();
         let rects = metrics.rects(scale);
         let rect = quality_option_rect(&metrics, &rects, scale, index);
-        Point::new(
-            (rect.left + rect.right) / 2,
-            (rect.top + rect.bottom) / 2,
-        )
+        Point::new((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2)
     }
 
     /// The hit rectangles are the drawn rectangles, because the state is built from the same
@@ -3779,7 +3874,11 @@ mod tests {
         let metrics = metrics();
         let rects = metrics.rects(1.0);
         let mut state = quality_segment_state(&metrics, &rects, 1.0, 0);
-        assert_eq!(chosen_quality(&state), 0, "the panel opens on the first option");
+        assert_eq!(
+            chosen_quality(&state),
+            0,
+            "the panel opens on the first option"
+        );
 
         let second = option_centre(1.0, 1);
         assert_eq!(
@@ -3792,7 +3891,11 @@ mod tests {
             Some(1),
             "releasing on the same option chooses it"
         );
-        assert_eq!(chosen_quality(&state), 1, "the chosen option moved to the second");
+        assert_eq!(
+            chosen_quality(&state),
+            1,
+            "the chosen option moved to the second"
+        );
         assert!(
             !state.segments[0].selected,
             "and only one option is chosen at a time"
@@ -3814,7 +3917,11 @@ mod tests {
             None,
             "a release over a different option chooses nothing"
         );
-        assert_eq!(chosen_quality(&state), 0, "and the chosen option does not move");
+        assert_eq!(
+            chosen_quality(&state),
+            0,
+            "and the chosen option does not move"
+        );
 
         quality_pointer(&mut state, PointerEvent::Down, option_centre(1.0, 2));
         assert_eq!(
@@ -3871,12 +3978,16 @@ mod tests {
             let metrics = crate::panel::DEMO;
             let strip = footer_rect(&metrics, scale);
             let px = |dip: i32| (dip as f32 * scale).round() as i32;
-            assert_eq!(strip.top, px(metrics.panel_height() - metrics.footer_height));
+            assert_eq!(
+                strip.top,
+                px(metrics.panel_height() - metrics.footer_height)
+            );
             assert_eq!(strip.bottom, px(metrics.panel_height()));
             assert_eq!(strip.left, 0);
             assert_eq!(strip.right, px(metrics.panel_width));
             // The body's preview column ends where the footer begins, so nothing overlaps.
-            let preview_bottom = px(metrics.header_height + metrics.body_pad_top + metrics.preview_height);
+            let preview_bottom =
+                px(metrics.header_height + metrics.body_pad_top + metrics.preview_height);
             assert!(
                 preview_bottom <= strip.top,
                 "the preview must end above the footer at {scale}"
@@ -4035,7 +4146,10 @@ mod tests {
             let copy = footer_button_rect(&metrics, scale, widths, FooterButton::Copy);
             let cancel = footer_button_rect(&metrics, scale, widths, FooterButton::Cancel);
             assert!(separator.left >= copy.right, "the separator follows copy");
-            assert!(separator.right <= cancel.left, "the separator precedes cancel");
+            assert!(
+                separator.right <= cancel.left,
+                "the separator precedes cancel"
+            );
             assert_eq!(
                 separator.right - separator.left,
                 (FOOTER_SEP_WIDTH_DIP as f32 * scale).round() as i32
@@ -4116,13 +4230,19 @@ mod tests {
                 px(metrics.field_height),
                 "and as tall as a field, so the row is one band (scale {scale})"
             );
-            assert_eq!(button.top, field_rect(&metrics, &rects, scale, Row::Name).top);
+            assert_eq!(
+                button.top,
+                field_rect(&metrics, &rects, scale, Row::Name).top
+            );
 
             // The chevron sits at the right padding and the label starts at the left one.
             let chev = fmt_chev_rect(&metrics, &rects, scale);
             assert_eq!(chev.right, button.right - px(FMT_PAD_RIGHT_DIP));
             assert_eq!(chev.right - chev.left, px(FMT_CHEV_DIP), ":176");
-            assert_eq!(fmt_label_rect(&metrics, &rects, scale).left, button.left + px(10));
+            assert_eq!(
+                fmt_label_rect(&metrics, &rects, scale).left,
+                button.left + px(10)
+            );
         }
     }
 
@@ -4132,7 +4252,11 @@ mod tests {
     fn the_format_menu_hangs_from_the_button_and_holds_three_items() {
         let metrics = crate::panel::DEMO;
         let px = |dip: i32| dip as i32;
-        assert_eq!(fmt_menu_height_dip(), 100, "two five dip paddings and three 30 dip items (:180, :182)");
+        assert_eq!(
+            fmt_menu_height_dip(),
+            100,
+            "two five dip paddings and three 30 dip items (:180, :182)"
+        );
         assert_eq!(FMT_OPTIONS, [".PNG", ".JPG", ".WebP"], "逐字 (:717)");
 
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
@@ -4140,7 +4264,10 @@ mod tests {
             let window_height = (metrics.panel_height() as f32 * scale).round() as i32;
             let button = fmt_button_rect(&metrics, &rects, scale);
             let menu = fmt_menu_rect(&metrics, &rects, scale, window_height);
-            assert_eq!(menu.right, button.right, "right-aligned to the button (:901)");
+            assert_eq!(
+                menu.right, button.right,
+                "right-aligned to the button (:901)"
+            );
             assert_eq!(
                 menu.right - menu.left,
                 (FMT_MENU_DIP as f32 * scale).round() as i32,
@@ -4167,7 +4294,13 @@ mod tests {
                 let item = fmt_item_rect(&metrics, &rects, scale, window_height, index);
                 assert_eq!(item.top, previous.bottom, "items touch (index {index})");
             }
-            let last = fmt_item_rect(&metrics, &rects, scale, window_height, FMT_OPTIONS.len() - 1);
+            let last = fmt_item_rect(
+                &metrics,
+                &rects,
+                scale,
+                window_height,
+                FMT_OPTIONS.len() - 1,
+            );
             assert_eq!(last.bottom + (5.0 * scale).round() as i32, menu.bottom);
             assert_eq!(px(0), 0);
         }
@@ -4190,7 +4323,11 @@ mod tests {
             // Room below: hangs below, as the panel it is in always has.
             let roomy = button.bottom + offset + height;
             let below = fmt_menu_rect(&metrics, &rects, scale, roomy);
-            assert_eq!(below.top, button.bottom + offset, "room below ⇔ below (scale {scale})");
+            assert_eq!(
+                below.top,
+                button.bottom + offset,
+                "room below ⇔ below (scale {scale})"
+            );
 
             // One pixel less: it would leave the window, so it flips above.
             let tight = fmt_menu_rect(&metrics, &rects, scale, roomy - 1);
@@ -4232,12 +4369,26 @@ mod tests {
             // The item's own edges: left and top answer, right and bottom do not.
             let item = fmt_item_rect(&metrics, &rects, scale, window_height, 1);
             assert_eq!(
-                fmt_item_at(&metrics, &rects, scale, window_height, true, (item.left, item.top)),
+                fmt_item_at(
+                    &metrics,
+                    &rects,
+                    scale,
+                    window_height,
+                    true,
+                    (item.left, item.top)
+                ),
                 Some(1),
                 "half-open on the leading edge"
             );
             assert_eq!(
-                fmt_item_at(&metrics, &rects, scale, window_height, true, (item.right, item.top)),
+                fmt_item_at(
+                    &metrics,
+                    &rects,
+                    scale,
+                    window_height,
+                    true,
+                    (item.right, item.top)
+                ),
                 None,
                 "half-open on the trailing edge"
             );
@@ -4250,12 +4401,33 @@ mod tests {
                 &metrics,
                 &rects,
                 scale,
-                ((button.left + button.right) / 2, (button.top + button.bottom) / 2)
+                (
+                    (button.left + button.right) / 2,
+                    (button.top + button.bottom) / 2
+                )
             ));
-            assert!(!fmt_button_contains(&metrics, &rects, scale, (menu.left, menu.top)));
-            assert!(fmt_menu_contains(&metrics, &rects, scale, window_height, (menu.left, menu.top)));
+            assert!(!fmt_button_contains(
+                &metrics,
+                &rects,
+                scale,
+                (menu.left, menu.top)
+            ));
+            assert!(fmt_menu_contains(
+                &metrics,
+                &rects,
+                scale,
+                window_height,
+                (menu.left, menu.top)
+            ));
             assert_eq!(
-                fmt_item_at(&metrics, &rects, scale, window_height, true, (menu.left, menu.top)),
+                fmt_item_at(
+                    &metrics,
+                    &rects,
+                    scale,
+                    window_height,
+                    true,
+                    (menu.left, menu.top)
+                ),
                 None,
                 "the padding is the menu but not an option"
             );
@@ -4301,7 +4473,10 @@ mod tests {
             "one key per command, in the same order"
         );
         for key in CONTEXT_SHORTCUTS {
-            assert!(key.starts_with("Ctrl+"), "{key} is a control-key combination");
+            assert!(
+                key.starts_with("Ctrl+"),
+                "{key} is a control-key combination"
+            );
             assert_eq!(
                 key.rsplit('+').next().map(str::len),
                 Some(1),
@@ -4314,7 +4489,11 @@ mod tests {
     /// the format menu's own padding and row height rather than from numbers of its own.
     #[test]
     fn the_context_menu_lists_the_four_commands_a_text_box_has() {
-        assert_eq!(CONTEXT_ITEMS, ["剪切", "复制", "粘贴", "全选"], "four commands, in order");
+        assert_eq!(
+            CONTEXT_ITEMS,
+            ["剪切", "复制", "粘贴", "全选"],
+            "four commands, in order"
+        );
         assert_eq!(
             context_menu_height_dip(),
             5 * 2 + 30 * CONTEXT_ITEMS.len() as i32,
@@ -4328,7 +4507,11 @@ mod tests {
             let width = (120.0 * scale).round() as i32;
             let menu = context_menu_rect((300, 200), scale, width, window_height, window_width);
 
-            assert_eq!(menu.right - menu.left, width, "the width is the measurement it was given");
+            assert_eq!(
+                menu.right - menu.left,
+                width,
+                "the width is the measurement it was given"
+            );
             assert_eq!(
                 menu.bottom - menu.top,
                 (context_menu_height_dip() as f32 * scale).round() as i32,
@@ -4347,14 +4530,22 @@ mod tests {
             }
             // Rows touch but do not overlap: the bottom of one is the top of the next.
             for index in 1..items.len() {
-                assert_eq!(items[index].top, items[index - 1].bottom, "rows are contiguous");
+                assert_eq!(
+                    items[index].top,
+                    items[index - 1].bottom,
+                    "rows are contiguous"
+                );
             }
             assert_eq!(items[0].top, menu.top + (5.0 * scale).round() as i32);
 
             // Exactly one row answers for any point inside it, and the padding answers for none.
             for index in 0..items.len() {
-                let centre = |rect: Rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
-                assert_eq!(context_item_at(menu, scale, centre(items[index])), Some(index));
+                let centre =
+                    |rect: Rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+                assert_eq!(
+                    context_item_at(menu, scale, centre(items[index])),
+                    Some(index)
+                );
             }
             assert_eq!(
                 context_item_at(menu, scale, (menu.left + 1, menu.top + 1)),
@@ -4458,9 +4649,20 @@ mod tests {
 
             // Absolute numbers, because a relation between constants that move together would agree
             // with itself whatever they were.
-            assert_eq!(change, measured + 2 * round(12), "the ghost is its word plus 12 either side (:189)");
-            assert_eq!(open.right - open.left, round(32), "the square button is 32 wide (:205)");
-            assert_eq!(open.right, rects.form.right, "it ends at the column's right edge (:546)");
+            assert_eq!(
+                change,
+                measured + 2 * round(12),
+                "the ghost is its word plus 12 either side (:189)"
+            );
+            assert_eq!(
+                open.right - open.left,
+                round(32),
+                "the square button is 32 wide (:205)"
+            );
+            assert_eq!(
+                open.right, rects.form.right,
+                "it ends at the column's right edge (:546)"
+            );
             assert_eq!(
                 change_rect.right,
                 open.left - round(8),
@@ -4471,13 +4673,19 @@ mod tests {
                 change_rect.left - round(8),
                 "and one between the input and the first button (:188)"
             );
-            assert_eq!(input.left, row.left, "the input starts at the column's left edge");
+            assert_eq!(
+                input.left, row.left,
+                "the input starts at the column's left edge"
+            );
             assert_eq!(
                 input.bottom - input.top,
                 round(32),
                 "the input keeps the text field's height (:167), not the row's"
             );
-            assert_eq!(change_rect.top, row.top, "both buttons sit on the input's line");
+            assert_eq!(
+                change_rect.top, row.top,
+                "both buttons sit on the input's line"
+            );
         }
     }
 
@@ -4494,7 +4702,11 @@ mod tests {
             let round = |dip: i32| (dip as f32 * scale).round() as i32;
             let input = path_field_rect(&metrics, &rects, scale, 56);
             let row = field_rect(&metrics, &rects, scale, Row::Path);
-            let widths = [path_chip_width(scale, 20), path_chip_width(scale, 20), path_chip_width(scale, 20)];
+            let widths = [
+                path_chip_width(scale, 20),
+                path_chip_width(scale, 20),
+                path_chip_width(scale, 20),
+            ];
 
             assert_eq!(
                 row.bottom - row.top,
@@ -4508,16 +4720,35 @@ mod tests {
                     input.bottom + round(6),
                     "chips start one form gap under the input (:164)"
                 );
-                assert_eq!(chip.bottom - chip.top, round(24), "a chip is 24 high (:192)");
+                assert_eq!(
+                    chip.bottom - chip.top,
+                    round(24),
+                    "a chip is 24 high (:192)"
+                );
                 if index == 0 {
-                    assert_eq!(chip.left, row.left, "the first chip starts at the column's edge");
+                    assert_eq!(
+                        chip.left, row.left,
+                        "the first chip starts at the column's edge"
+                    );
                 } else {
                     let before = path_chip_rect(&metrics, &rects, scale, &widths, index - 1);
-                    assert_eq!(chip.left, before.right + round(6), "chips are six apart (:191)");
+                    assert_eq!(
+                        chip.left,
+                        before.right + round(6),
+                        "chips are six apart (:191)"
+                    );
                 }
                 let icon = path_chip_icon_rect(&metrics, &rects, scale, &widths, index);
-                assert_eq!(icon.right - icon.left, round(12), "the chip's folder is 12 (:195)");
-                assert_eq!(icon.left, chip.left + round(10), "after the chip's padding (:192)");
+                assert_eq!(
+                    icon.right - icon.left,
+                    round(12),
+                    "the chip's folder is 12 (:195)"
+                );
+                assert_eq!(
+                    icon.left,
+                    chip.left + round(10),
+                    "after the chip's padding (:192)"
+                );
             }
         }
     }
@@ -4550,7 +4781,11 @@ mod tests {
                 row.top + round(32 + 6 + 2),
                 "the shortcuts start under the cells, past the form gap and their own margin"
             );
-            assert_eq!(line.bottom - line.top, round(24), "a chip is 24 high (:192)");
+            assert_eq!(
+                line.bottom - line.top,
+                round(24),
+                "a chip is 24 high (:192)"
+            );
             assert_eq!(
                 line.left,
                 row.left + round(28),
@@ -4579,7 +4814,11 @@ mod tests {
     fn the_shortcut_percentages_and_their_words_agree() {
         assert_eq!(SIZE_PRESET_PCT, [100, 75, 50, 25]);
         for (pct, word) in SIZE_PRESET_PCT.iter().zip(SIZE_PRESET_WORDS) {
-            assert_eq!(word, format!("{pct}%"), "the word is the number it scales by");
+            assert_eq!(
+                word,
+                format!("{pct}%"),
+                "the word is the number it scales by"
+            );
         }
     }
 
@@ -4587,13 +4826,29 @@ mod tests {
     #[test]
     fn a_shortcut_scales_the_capture_to_its_percentage() {
         let capture = (1440, 900);
-        assert_eq!(size_preset_size(100, capture), capture, "100% is the capture itself");
+        assert_eq!(
+            size_preset_size(100, capture),
+            capture,
+            "100% is the capture itself"
+        );
         assert_eq!(size_preset_size(50, capture), (720, 450), "half is half");
-        assert_eq!(size_preset_size(25, capture), (360, 225), "a quarter is a quarter");
+        assert_eq!(
+            size_preset_size(25, capture),
+            (360, 225),
+            "a quarter is a quarter"
+        );
         // Rounded to nearest rather than truncated, so 75% of an odd width keeps its pixel.
-        assert_eq!(size_preset_size(75, (1441, 901)), (1081, 676), "75% rounds to nearest");
+        assert_eq!(
+            size_preset_size(75, (1441, 901)),
+            (1081, 676),
+            "75% rounds to nearest"
+        );
         // A scale that would leave no pixels cannot: an image with a zero side is not an image.
-        assert_eq!(size_preset_size(25, (2, 3)), (1, 1), "never below one pixel");
+        assert_eq!(
+            size_preset_size(25, (2, 3)),
+            (1, 1),
+            "never below one pixel"
+        );
     }
 
     /// A click is answered by the shortcut it landed on and by no other.
@@ -4634,8 +4889,14 @@ mod tests {
     /// drawn cannot be clicked either.
     #[test]
     fn the_quality_control_is_hidden_for_png_and_the_hint_takes_its_place() {
-        assert!(!quality_segment_shown(FMT_PNG_INDEX), "PNG hides the control (:639)");
-        assert_eq!(FMT_OPTIONS[FMT_PNG_INDEX], ".PNG", "index zero is PNG (:717)");
+        assert!(
+            !quality_segment_shown(FMT_PNG_INDEX),
+            "PNG hides the control (:639)"
+        );
+        assert_eq!(
+            FMT_OPTIONS[FMT_PNG_INDEX], ".PNG",
+            "index zero is PNG (:717)"
+        );
         for (index, word) in FMT_OPTIONS.iter().enumerate().skip(1) {
             assert!(
                 quality_segment_shown(index),
@@ -4704,7 +4965,10 @@ mod tests {
             let rects = crate::panel::DEMO.rects(scale);
             let widths = [52, 64];
             let reset = size_mode_reset_rect(&crate::panel::DEMO, &rects, scale);
-            let centre = ((reset.left + reset.right) / 2, (reset.top + reset.bottom) / 2);
+            let centre = (
+                (reset.left + reset.right) / 2,
+                (reset.top + reset.bottom) / 2,
+            );
             assert!(
                 size_reset_contains(&crate::panel::DEMO, &rects, scale, centre),
                 "the reset answers its own centre at {scale}"
@@ -4715,7 +4979,12 @@ mod tests {
                 "a click on the reset is not a click on a mode at {scale}"
             );
             assert!(
-                !size_reset_contains(&crate::panel::DEMO, &rects, scale, (reset.left - 1, centre.1)),
+                !size_reset_contains(
+                    &crate::panel::DEMO,
+                    &rects,
+                    scale,
+                    (reset.left - 1, centre.1)
+                ),
                 "one pixel to the left is outside the reset at {scale}"
             );
         }
@@ -4727,8 +4996,14 @@ mod tests {
     #[test]
     fn the_fill_row_is_shown_for_jpg_and_nothing_else() {
         assert!(!fill_row_shown(FMT_PNG_INDEX), "PNG has an alpha channel");
-        assert!(fill_row_shown(FMT_JPG_INDEX), "JPG has no alpha, so it needs a fill");
-        assert!(!fill_row_shown(2), "this project's WebP is lossless and keeps alpha");
+        assert!(
+            fill_row_shown(FMT_JPG_INDEX),
+            "JPG has no alpha, so it needs a fill"
+        );
+        assert!(
+            !fill_row_shown(2),
+            "this project's WebP is lossless and keeps alpha"
+        );
     }
 
     /// The three swatches sit against the row's right edge, sixteen dip square, eight apart, in the
@@ -4742,14 +5017,25 @@ mod tests {
 
             let row = fill_row_rect(&metrics, &rects, scale);
             let last = fill_swatch_rect(&metrics, &rects, scale, FILL_SWATCHES - 1);
-            assert_eq!(last.right, row.right, "the group ends at the column's right edge at {scale}");
+            assert_eq!(
+                last.right, row.right,
+                "the group ends at the column's right edge at {scale}"
+            );
 
             // Absolute numbers rather than the constants: both sides would move together with a
             // wrong constant and the assertion would agree with itself.
             for index in 0..FILL_SWATCHES {
                 let swatch = fill_swatch_rect(&metrics, &rects, scale, index);
-                assert_eq!(swatch.width(), round(16), "`.bg-opt` is 16 dip wide (:150) at {scale}");
-                assert_eq!(swatch.height(), round(16), "`.bg-opt` is 16 dip tall (:150) at {scale}");
+                assert_eq!(
+                    swatch.width(),
+                    round(16),
+                    "`.bg-opt` is 16 dip wide (:150) at {scale}"
+                );
+                assert_eq!(
+                    swatch.height(),
+                    round(16),
+                    "`.bg-opt` is 16 dip tall (:150) at {scale}"
+                );
                 if index > 0 {
                     let previous = fill_swatch_rect(&metrics, &rects, scale, index - 1);
                     assert_eq!(
@@ -4778,9 +5064,17 @@ mod tests {
     /// colour to the one that opens the picker.
     #[test]
     fn the_marked_swatch_is_the_one_the_colour_belongs_to() {
-        assert_eq!(fill_swatch_selected(FILL_WHITE), 0, "white has a swatch of its own");
+        assert_eq!(
+            fill_swatch_selected(FILL_WHITE),
+            0,
+            "white has a swatch of its own"
+        );
         assert_eq!(fill_swatch_selected(FILL_BLACK), 1, "so does black");
-        assert_eq!(fill_swatch_selected([12, 34, 56]), 2, "anything else is the custom one");
+        assert_eq!(
+            fill_swatch_selected([12, 34, 56]),
+            2,
+            "anything else is the custom one"
+        );
     }
 
     /// The estimate is the only row below the quality row, and `:1102` shows the fill row per
@@ -4800,8 +5094,15 @@ mod tests {
                 round(28),
                 "the fill row and its gap are 28 dip at {scale}"
             );
-            assert_eq!(shifted.bottom - plain.bottom, round(28), "the label moves as a whole");
-            assert_eq!(shifted.left, plain.left, "only the vertical position changes at {scale}");
+            assert_eq!(
+                shifted.bottom - plain.bottom,
+                round(28),
+                "the label moves as a whole"
+            );
+            assert_eq!(
+                shifted.left, plain.left,
+                "only the vertical position changes at {scale}"
+            );
         }
     }
 
@@ -4862,10 +5163,7 @@ mod tests {
                     "the change button",
                     path_change_rect(&metrics, &rects, scale, change),
                 ),
-                (
-                    "the folder button",
-                    path_open_rect(&metrics, &rects, scale),
-                ),
+                ("the folder button", path_open_rect(&metrics, &rects, scale)),
                 (
                     "the size cells' link hub",
                     link_hub_rect(&metrics, &rects, scale),

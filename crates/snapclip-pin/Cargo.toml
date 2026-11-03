@@ -8,6 +8,11 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+gpui-kit = "0.8"
+yue-component = { path = "../../../GPUI-Yue-Component/crates/yue-component", default-features = false }
+async-channel = "2.5"
+raw-window-handle = "0.6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
 snapclip-model = { path = "../snapclip-model" }
 snapclip-ui = { path = "../snapclip-ui" }
 
@@ -20,6 +25,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Performance",
     "Win32_System_Threading",
     "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Dwm",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -27,3 +35,6 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 # The existing opt-in filter-comparison test writes PNG sheets.
 png = "0.18"
+
+[features]
+headless-tests = ["gpui-kit/test-support"]

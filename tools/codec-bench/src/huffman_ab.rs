@@ -55,7 +55,10 @@ fn segments(bytes: &[u8]) -> Vec<Segment> {
         let length = usize::from(bytes[length_index]) << 8 | usize::from(bytes[length_index + 1]);
         let payload_start = length_index + 2;
         let payload_end = (length_index + length).min(bytes.len());
-        out.push(Segment { marker, payload: bytes[payload_start..payload_end].to_vec() });
+        out.push(Segment {
+            marker,
+            payload: bytes[payload_start..payload_end].to_vec(),
+        });
         // Start of scan: entropy-coded data follows, so stop before trying to walk it.
         if marker == 0xDA {
             break;
@@ -84,7 +87,11 @@ fn segment_diff(left: &[Segment], right: &[Segment]) -> String {
     for index in 0..count {
         let name = match (left.get(index), right.get(index)) {
             (Some(a), Some(b)) if a.marker == b.marker => marker_name(a.marker),
-            (Some(a), b) => format!("{} vs {}", marker_name(a.marker), b.map_or("-".to_string(), |s| marker_name(s.marker))),
+            (Some(a), b) => format!(
+                "{} vs {}",
+                marker_name(a.marker),
+                b.map_or("-".to_string(), |s| marker_name(s.marker))
+            ),
             (None, Some(b)) => format!("- vs {}", marker_name(b.marker)),
             (None, None) => unreachable!(),
         };
@@ -139,7 +146,11 @@ fn difference(left: &[u8], right: &[u8]) -> (f64, u8, f64) {
             equal += 1;
         }
     }
-    (total as f64 / left.len() as f64, max, equal as f64 / left.len() as f64)
+    (
+        total as f64 / left.len() as f64,
+        max,
+        equal as f64 / left.len() as f64,
+    )
 }
 
 fn encode(asset: &synthetic::Asset, optimize_huffman: bool) -> Result<Vec<u8>, String> {
@@ -183,7 +194,10 @@ pub fn report() -> String {
         "optimize_huffman A/B (only change: optimize_huffman true vs false; q92, 4:4:4, baseline, BGRA, {BAND_ROWS}-row bands)\n"
     );
 
-    for asset in synthetic::corpus().into_iter().filter(|a| a.name == "ui-1080" || a.name == "scroll-tall") {
+    for asset in synthetic::corpus()
+        .into_iter()
+        .filter(|a| a.name == "ui-1080" || a.name == "scroll-tall")
+    {
         let _ = writeln!(text, "{} ({}x{})", asset.name, asset.width, asset.height);
         let plain = match encode(&asset, false) {
             Ok(bytes) => bytes,
@@ -207,14 +221,23 @@ pub fn report() -> String {
             huffman.len()
         );
         let _ = writeln!(text, "  segments:");
-        let _ = write!(text, "{}", segment_diff(&segments(&plain), &segments(&huffman)));
+        let _ = write!(
+            text,
+            "{}",
+            segment_diff(&segments(&plain), &segments(&huffman))
+        );
 
         let plain_image = decode_with_image(&plain);
         let huffman_image = decode_with_image(&huffman);
         let plain_zen = decode_with_zenjpeg(&plain);
         let huffman_zen = decode_with_zenjpeg(&huffman);
         match (plain_image, huffman_image, plain_zen, huffman_zen) {
-            (Ok((pw, ph, p_img)), Ok((hw, hh, h_img)), Ok((pzw, pzh, p_zen)), Ok((hzw, hzh, h_zen))) => {
+            (
+                Ok((pw, ph, p_img)),
+                Ok((hw, hh, h_img)),
+                Ok((pzw, pzh, p_zen)),
+                Ok((hzw, hzh, h_zen)),
+            ) => {
                 let (mean, max, equal) = difference(&p_img, &h_img);
                 let _ = writeln!(
                     text,
@@ -246,7 +269,9 @@ pub fn report() -> String {
                         let _ = writeln!(
                             text,
                             "  banding only, huffman arm: whole-frame {} B vs {BAND_ROWS}-row bands · pixels mean |Δ| {mean:.4} · max {max} · equal {:.4}% ({ww}x{wh})",
-                            encode_whole_frame(&asset, true).map(|b| b.len()).unwrap_or(0),
+                            encode_whole_frame(&asset, true)
+                                .map(|b| b.len())
+                                .unwrap_or(0),
                             equal * 100.0
                         );
                     }
@@ -277,10 +302,16 @@ mod tests {
 
     #[test]
     fn the_segment_walk_finds_the_headers_of_a_real_jpeg() {
-        let asset = synthetic::corpus().into_iter().find(|a| a.name == "ui-1080").unwrap();
+        let asset = synthetic::corpus()
+            .into_iter()
+            .find(|a| a.name == "ui-1080")
+            .unwrap();
         let bytes = encode(&asset, false).unwrap();
         let found = segments(&bytes);
-        assert!(found.iter().any(|s| matches!(s.marker, 0xC0 | 0xC1 | 0xC2)), "SOF");
+        assert!(
+            found.iter().any(|s| matches!(s.marker, 0xC0 | 0xC1 | 0xC2)),
+            "SOF"
+        );
         assert!(found.iter().any(|s| s.marker == 0xDB), "DQT");
         assert!(found.iter().any(|s| s.marker == 0xC4), "DHT");
         assert_eq!(found.last().map(|s| s.marker), Some(0xDA), "SOS last");

@@ -101,7 +101,11 @@ impl ExportSource {
             origin: None,
             corner_radius: 0,
         };
-        Self::Bands { bands: Some(bands), pixels: None, spec }
+        Self::Bands {
+            bands: Some(bands),
+            pixels: None,
+            spec,
+        }
     }
 
     /// The pixels when they exist as a whole picture, either from the start or after
@@ -144,12 +148,19 @@ impl ExportSource {
         if matches!(self, Self::Whole(_)) {
             return Ok(self.pixels().expect("a whole source has pixels"));
         }
-        let Self::Bands { bands, pixels, spec } = self else {
+        let Self::Bands {
+            bands,
+            pixels,
+            spec,
+        } = self
+        else {
             unreachable!("the whole case returned above")
         };
         if pixels.is_none() {
             let Some(bands) = bands.take() else {
-                return Err(CaptureError::EncodeFailed("the bands were already taken".into()));
+                return Err(CaptureError::EncodeFailed(
+                    "the bands were already taken".into(),
+                ));
             };
             let (width, height, bgra) = bands.into_image().map_err(|error| {
                 // The clipboard is the one consumer that materialises the whole picture, so this is
@@ -494,10 +505,9 @@ fn delete_quietly(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedExport, EXPORT_READY_MESSAGE, ExportFailure, ExportJob, ExportSource, ExportWorker,
-        Mailbox, WorkerEvent,
+        CompletedExport, EXPORT_READY_MESSAGE, ExportFailure, ExportJob, ExportSource,
+        ExportWorker, Mailbox, WorkerEvent,
     };
-    use std::sync::Mutex;
     use crate::artifact::SelectionPixels;
     use crate::geometry::Rect;
     use crate::session::CapturedFrame;
@@ -505,6 +515,7 @@ mod tests {
     use snapclip_model::{CaptureArtifact, CapturePayload, PixelFormat};
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A 4x4 selection of an 8x8 frame. The worker never inspects the bytes, so a
@@ -761,8 +772,12 @@ mod tests {
             ));
             Err(CaptureError::InvalidState("stop here".into()))
         });
-        job.source.lock().expect("unlocked").pixels_mut().expect("a whole source").region =
-            Rect::new(2, 3, 9, 11);
+        job.source
+            .lock()
+            .expect("unlocked")
+            .pixels_mut()
+            .expect("a whole source")
+            .region = Rect::new(2, 3, 9, 11);
         job.dpi = 144;
         job.monitor_device_name = Some(r"\\.\DISPLAY3".into());
         job.session_id = "session-metadata".into();

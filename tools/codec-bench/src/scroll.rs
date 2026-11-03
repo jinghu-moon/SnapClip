@@ -76,8 +76,12 @@ pub struct Stitched {
 pub fn run(view: usize, step: usize) -> Stitched {
     let page = page(WIDTH, ROWS);
     let first = frame(&page, WIDTH, 0, view);
-    let mut probe =
-        snapclip_capture::scroll::probe::ScrollProbe::new(&first, WIDTH as u32, view as u32, WIDTH as u32 / 8);
+    let mut probe = snapclip_capture::scroll::probe::ScrollProbe::new(
+        &first,
+        WIDTH as u32,
+        view as u32,
+        WIDTH as u32 / 8,
+    );
     // The measured window covers only what capture holds: pushing frames, the edge buffers and the
     // tile file. Gathering the finished image is the export path's cost (docs/35 §5.3), and the
     // whole point of the backing store is that the two are no longer the same number.
@@ -184,12 +188,15 @@ fn megabytes(bytes: usize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-
 /// The three sequences whose products must be the page itself (docs/35 §5).
 ///
 /// Each returns `(name, matched)` so a caller can print all three before failing on any of them.
 pub fn sequences_exact() -> [(&'static str, bool); 3] {
-    [("down", down_only_exact()), ("down up down", down_up_down_exact()), ("upward first", upward_first_exact())]
+    [
+        ("down", down_only_exact()),
+        ("down up down", down_up_down_exact()),
+        ("upward first", upward_first_exact()),
+    ]
 }
 
 fn down_only_exact() -> bool {
@@ -274,20 +281,15 @@ pub fn report() -> String {
     out.push_str("scroll capture pipeline (docs/34 §12)\n");
     out.push_str(&format!(
         "page {}x{} · viewport {}x{} · {} px per frame\n\n",
-        WIDTH,
-        ROWS,
-        WIDTH,
-        VIEW,
-        STEP
+        WIDTH, ROWS, WIDTH, VIEW, STEP
     ));
 
     // The cap is a function of the viewport, and that is a product fact worth printing: with the
     // 32-screen cap, an 800-row viewport stops at 25 600 rows and cannot reach this page.
     let cap_for = |view: usize| {
-        snapclip_capture::scroll::probe::ScrollProbe::row_cap(WIDTH as u32, view as u32)
-            .min(snapclip_capture::scroll::probe::ScrollProbe::screen_cap(
-                view as u32,
-            ))
+        snapclip_capture::scroll::probe::ScrollProbe::row_cap(WIDTH as u32, view as u32).min(
+            snapclip_capture::scroll::probe::ScrollProbe::screen_cap(view as u32),
+        )
     };
     out.push_str(&format!(
         "canvas cap: {} rows at a {}-row viewport, {} rows at a {}-row one (MAX_SCREENS x view, and MAX_BYTES)\n\n",
@@ -338,7 +340,11 @@ pub fn report() -> String {
         let (result, peak) = alloc_probe::peak_extra(|| {
             codecs::png_row_band(&canvas, width as usize, height as usize)
         });
-        (result.ok().map(|bytes| bytes.len()), started.elapsed(), peak)
+        (
+            result.ok().map(|bytes| bytes.len()),
+            started.elapsed(),
+            peak,
+        )
     };
     out.push_str(&format!(
         "PNG | {} | {:.1} | {:.1} | row band streaming\n",
@@ -359,7 +365,11 @@ pub fn report() -> String {
         let (result, peak) = alloc_probe::peak_extra(|| {
             codecs::zenjpeg(&canvas, width as usize, height as usize, options)
         });
-        (result.ok().map(|bytes| bytes.len()), started.elapsed(), peak)
+        (
+            result.ok().map(|bytes| bytes.len()),
+            started.elapsed(),
+            peak,
+        )
     };
     out.push_str(&format!(
         "JPG | {} | {:.1} | {:.1} | baseline 4:4:4 q92, plain, 64-row bands\n",
@@ -424,7 +434,10 @@ mod tests {
     /// estimator refuses (its own tests move 1 to 90 rows upward against a 600-row step down).
     #[test]
     fn a_down_up_down_scroll_reproduces_the_page() {
-        assert!(down_up_down_exact(), "a down-up-down sequence changed the image");
+        assert!(
+            down_up_down_exact(),
+            "a down-up-down sequence changed the image"
+        );
     }
 
     /// Starting mid page and scrolling up first is the only sequence that reaches `Prepended`:

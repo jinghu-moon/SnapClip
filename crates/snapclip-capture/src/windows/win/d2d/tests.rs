@@ -1964,9 +1964,7 @@ fn the_cost_of_publishing_a_thumbnail() {
     let mut upload_us = Vec::with_capacity(ROUNDS as usize);
     for _ in 0..ROUNDS {
         let at = Instant::now();
-        renderer
-            .update_scroll_preview(&preview)
-            .expect("an upload");
+        renderer.update_scroll_preview(&preview).expect("an upload");
         upload_us.push(at.elapsed().as_nanos() as u64);
     }
     upload_us.sort_unstable();
@@ -2271,9 +2269,7 @@ fn render_panel_frame_with_slide(
     let (width, height) = (520u32, 380u32);
     let mut renderer = OverlayRenderer::new(std::sync::Arc::new(device), 96)
         .expect("this test needs a Direct2D overlay renderer (docs/31 D-14)");
-    renderer
-        .update_frame(width, height, frame_pixels)
-        .unwrap();
+    renderer.update_frame(width, height, frame_pixels).unwrap();
     renderer.ensure_back_buffer(width, height).unwrap();
     // 面板的图形现在由控制器在帧之前准备；直接驱动渲染器的测试要自己来。
     renderer.prepare_panel_icons().unwrap();
@@ -2423,8 +2419,7 @@ fn the_glyph_tint_follows_the_colour_it_is_given() {
     let box_pixels = |pixels: &[u8]| -> Vec<[u8; 4]> {
         (rect.top..rect.bottom)
             .flat_map(|y| {
-                (rect.left..rect.right)
-                    .map(move |x| pixel_at(pixels, width, x as u32, y as u32))
+                (rect.left..rect.right).map(move |x| pixel_at(pixels, width, x as u32, y as u32))
             })
             .collect()
     };
@@ -2469,7 +2464,10 @@ fn the_cost_of_the_panel_icons() {
         .unwrap();
     renderer.ensure_back_buffer(width, height).unwrap();
     let d2d = renderer.device().create_d2d_context().unwrap();
-    let target = renderer.device().create_render_target_texture(width, height).unwrap();
+    let target = renderer
+        .device()
+        .create_render_target_texture(width, height)
+        .unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
         &d2d,
         &target.texture,
@@ -2478,9 +2476,24 @@ fn the_cost_of_the_panel_icons() {
     )
     .unwrap();
     let colours = [
-        D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-        D2D1_COLOR_F { r: 0.91, g: 0.93, b: 0.95, a: 0.62 },
-        D2D1_COLOR_F { r: 0.18, g: 0.44, b: 0.92, a: 1.0 },
+        D2D1_COLOR_F {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        },
+        D2D1_COLOR_F {
+            r: 0.91,
+            g: 0.93,
+            b: 0.95,
+            a: 0.62,
+        },
+        D2D1_COLOR_F {
+            r: 0.18,
+            g: 0.44,
+            b: 0.92,
+            a: 1.0,
+        },
     ];
 
     // 预烘要在有 target 的上下文上做（effect 渲染需要 target），所以先设目标
@@ -2511,7 +2524,9 @@ fn the_cost_of_the_panel_icons() {
     unsafe { d2d.BeginDraw() };
     for _ in 0..runs {
         for (i, glyph) in snapclip_ui::panel::Glyph::ALL.iter().enumerate() {
-            icons.draw(&d2d, *glyph, rects[i], colours[0], false).unwrap();
+            icons
+                .draw(&d2d, *glyph, rects[i], colours[0], false)
+                .unwrap();
         }
     }
     unsafe { d2d.EndDraw(None, None).unwrap() };
@@ -2546,7 +2561,11 @@ fn the_cost_of_the_panel_icons() {
     );
     eprintln!(
         "PANEL_ICONS vram: 源位图 {} KB + 色表 {} KB",
-        (snapclip_ui::panel::ICON_COUNT as u32 * snapclip_ui::panel::ICON_BAKED_PX * snapclip_ui::panel::ICON_BAKED_PX * 4) / 1024,
+        (snapclip_ui::panel::ICON_COUNT as u32
+            * snapclip_ui::panel::ICON_BAKED_PX
+            * snapclip_ui::panel::ICON_BAKED_PX
+            * 4)
+            / 1024,
         (3 * 9 * snapclip_ui::panel::ICON_BAKED_PX * snapclip_ui::panel::ICON_BAKED_PX * 4) / 1024
     );
 }
@@ -2556,7 +2575,11 @@ fn checkerboard(width: u32, height: u32) -> Vec<u8> {
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
         for x in 0..width {
-            let value = if ((x / 4) + (y / 4)) % 2 == 0 { 230 } else { 24 };
+            let value = if ((x / 4) + (y / 4)) % 2 == 0 {
+                230
+            } else {
+                24
+            };
             pixels.extend_from_slice(&[value, value, value, 255]);
         }
     }
@@ -2596,7 +2619,12 @@ fn the_panel_backdrop_blurs_what_is_behind_it() {
     let panel = layout.panel;
     // 面板左内沿的一条窄带：在卡片左侧的留白里，没有文字、没有图形。
     // 取样带收在卡片那一行里：再往下会穿过页脚的分隔线，那点结构两种帧都有，只会稀释判据。
-    let strip = Rect::new(panel.left + 3, panel.top + 50, panel.left + 9, panel.top + 140);
+    let strip = Rect::new(
+        panel.left + 3,
+        panel.top + 50,
+        panel.left + 9,
+        panel.top + 140,
+    );
     let pattern = variance(&over_checker, width, strip);
     let baseline = variance(&over_flat, width, strip);
     eprintln!(
@@ -2692,17 +2720,13 @@ fn the_caret_can_be_switched_off_and_on() {
     let mut count = 0;
     for y in row.top..row.bottom {
         for x in row.left..row.right {
-            if pixel_at(&on, width, x as u32, y as u32)
-                != pixel_at(&off, width, x as u32, y as u32)
+            if pixel_at(&on, width, x as u32, y as u32) != pixel_at(&off, width, x as u32, y as u32)
             {
                 count += 1;
             }
         }
     }
-    assert!(
-        count > 0,
-        "caret_visible 开关没有改变任何像素：光标不可闪"
-    );
+    assert!(count > 0, "caret_visible 开关没有改变任何像素：光标不可闪");
 }
 
 /// 分段器选中块的平移：同一分段器在**进度 0** 与**进度 1** 各渲一次，第一段必须是"被块盖住 / 没被
@@ -2779,7 +2803,10 @@ fn the_countdown_number_paints_inside_the_selection() {
             }
         }
     }
-    assert!(ink > 50, "选区正中只有 {ink} 个主题色像素：倒计时数字没画在那里（或颜色不对）");
+    assert!(
+        ink > 50,
+        "选区正中只有 {ink} 个主题色像素：倒计时数字没画在那里（或颜色不对）"
+    );
     // 选区里除了这个数字不该多出别的东西：四角仍是原始底色。
     for (x, y) in [
         (selection.left + 8, selection.top + 8),
@@ -3150,7 +3177,6 @@ fn the_mask_ring_cache_does_not_keep_a_stale_shape() {
     }
 }
 
-
 /// 倒计时 HUD 的一帧：背景用棋盘（高频细节），这样任何多余的"冻结画面/遮罩"都会留下灰块。
 fn render_countdown_hud() -> (Vec<u8>, u32, Rect) {
     let device =
@@ -3208,15 +3234,34 @@ fn the_countdown_hud_paints_only_the_frame_the_badge_and_the_number() {
             }
         }
     }
-    assert!(accent > 50, "倒计时数字没画出来：只有 {accent} 个主题色像素");
+    assert!(
+        accent > 50,
+        "倒计时数字没画出来：只有 {accent} 个主题色像素"
+    );
 
     // 2) 环带里、但不在框线上的点：**完全透明**。这是这次的核心断言。
     let quarter_x = selection.left + selection.width() / 4;
     let quarter_y = selection.top + selection.height() / 4;
-    assert_eq!(alpha(quarter_x, selection.top - 4), 0, "环带上沿出现了半透明灰底");
-    assert_eq!(alpha(quarter_x, selection.bottom + 4), 0, "环带下沿出现了半透明灰底");
-    assert_eq!(alpha(selection.left - 4, quarter_y), 0, "环带左沿出现了半透明灰底");
-    assert_eq!(alpha(selection.right + 4, quarter_y), 0, "环带右沿出现了半透明灰底");
+    assert_eq!(
+        alpha(quarter_x, selection.top - 4),
+        0,
+        "环带上沿出现了半透明灰底"
+    );
+    assert_eq!(
+        alpha(quarter_x, selection.bottom + 4),
+        0,
+        "环带下沿出现了半透明灰底"
+    );
+    assert_eq!(
+        alpha(selection.left - 4, quarter_y),
+        0,
+        "环带左沿出现了半透明灰底"
+    );
+    assert_eq!(
+        alpha(selection.right + 4, quarter_y),
+        0,
+        "环带右沿出现了半透明灰底"
+    );
 
     // 3) 框线自己仍然画出来（环带里靠近选区边缘的那一条）。
     assert!(
@@ -3236,7 +3281,6 @@ fn the_countdown_hud_paints_only_the_frame_the_badge_and_the_number() {
         "选区内部还留着冻结画面/遮罩的底色"
     );
 }
-
 
 /// DIAGNOSTIC (docs/44, to keep or drop once the decision lands): what the overlay
 /// actually paints when every label item is switched off.

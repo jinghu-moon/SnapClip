@@ -33,7 +33,6 @@ const QUALITY_BAND_ROWS: usize = 64;
 /// Bits of zoom in the text-crop dump: enough to see 4:2:0 smear a one pixel stroke.
 const ZOOM: usize = 8;
 
-
 /// The stage 4 gate: the three targets from `docs/35 §16`, checked rather than described.
 ///
 /// Everything is measured and printed **before** anything is judged, so a failure comes with the
@@ -41,8 +40,10 @@ const ZOOM: usize = 8;
 /// which is what lets a release check fail the run.
 fn assert_targets() {
     let mut failures: Vec<String> = Vec::new();
-    println!("scroll capture targets (docs/35 §16)
-");
+    println!(
+        "scroll capture targets (docs/35 §16)
+"
+    );
 
     println!("product vs the page (pixel for pixel):");
     for (name, matched) in scroll::sequences_exact() {
@@ -96,15 +97,20 @@ assembly: banded {:.1} MB · whole {:.1} MB · {:.1}% (target <= {:.0}%, ceiling
     }
 
     if failures.is_empty() {
-        println!("
-all three targets hold");
+        println!(
+            "
+all three targets hold"
+        );
         return;
     }
     for failure in &failures {
         println!("  FAILED: {failure}");
     }
-    println!("
-{} target(s) missed", failures.len());
+    println!(
+        "
+{} target(s) missed",
+        failures.len()
+    );
     std::process::exit(1);
 }
 
@@ -135,7 +141,9 @@ fn main() {
         return;
     }
     if !arguments.iter().any(|argument| argument == "--report") {
-        println!("codec-bench: pass --report, --quality, --scroll, --transcode, --bands, --assert or --huffman-ab");
+        println!(
+            "codec-bench: pass --report, --quality, --scroll, --transcode, --bands, --assert or --huffman-ab"
+        );
         if arguments.is_empty() {
             return;
         }
@@ -166,30 +174,47 @@ fn run_report() {
             optimize_huffman: true,
             band_rows: 0,
         };
-        let banded = JpegOptions { band_rows: 64, ..full };
-        let plain = JpegOptions { trellis: false, optimize_huffman: false, ..full };
+        let banded = JpegOptions {
+            band_rows: 64,
+            ..full
+        };
+        let plain = JpegOptions {
+            trellis: false,
+            optimize_huffman: false,
+            ..full
+        };
 
         let (width, height, pixels) = (asset.width, asset.height, &asset.pixels);
         let candidates: Vec<(&str, Box<dyn Fn() -> Result<usize, String> + '_>)> = vec![
             (
                 "png row-band",
-                Box::new(move || codecs::png_row_band(pixels, width, height).map(|bytes| bytes.len())),
+                Box::new(move || {
+                    codecs::png_row_band(pixels, width, height).map(|bytes| bytes.len())
+                }),
             ),
             (
                 "zenjpeg 444 trellis+huffman",
-                Box::new(move || codecs::zenjpeg(pixels, width, height, full).map(|bytes| bytes.len())),
+                Box::new(move || {
+                    codecs::zenjpeg(pixels, width, height, full).map(|bytes| bytes.len())
+                }),
             ),
             (
                 "zenjpeg 444 trellis+huffman 64r",
-                Box::new(move || codecs::zenjpeg(pixels, width, height, banded).map(|bytes| bytes.len())),
+                Box::new(move || {
+                    codecs::zenjpeg(pixels, width, height, banded).map(|bytes| bytes.len())
+                }),
             ),
             (
                 "zenjpeg 444 plain",
-                Box::new(move || codecs::zenjpeg(pixels, width, height, plain).map(|bytes| bytes.len())),
+                Box::new(move || {
+                    codecs::zenjpeg(pixels, width, height, plain).map(|bytes| bytes.len())
+                }),
             ),
             (
                 "mozjpeg 444 trellis",
-                Box::new(move || codecs::mozjpeg(pixels, width, height, full).map(|bytes| bytes.len())),
+                Box::new(move || {
+                    codecs::mozjpeg(pixels, width, height, full).map(|bytes| bytes.len())
+                }),
             ),
         ];
         // WebP is only legal up to 16383 per side, and the tall asset is far past it.
@@ -197,7 +222,9 @@ fn run_report() {
         if width <= 16_383 && height <= 16_383 {
             candidates.push((
                 "zenwebp lossless",
-                Box::new(move || codecs::zenwebp_lossless(pixels, width, height).map(|bytes| bytes.len())),
+                Box::new(move || {
+                    codecs::zenwebp_lossless(pixels, width, height).map(|bytes| bytes.len())
+                }),
             ));
         }
 
@@ -214,7 +241,11 @@ fn run_report() {
                     rows.push((
                         asset.name,
                         label.to_string(),
-                        Outcome { bytes: 0, millis: f64::NAN, peak_extra: usize::MAX },
+                        Outcome {
+                            bytes: 0,
+                            millis: f64::NAN,
+                            peak_extra: usize::MAX,
+                        },
                     ));
                 }
             }
@@ -236,14 +267,50 @@ struct Variant {
 
 fn variants() -> Vec<Variant> {
     vec![
-        Variant { label: "q92 444 plain", quality: 92, subsample_444: true, trellis: false, optimize_huffman: false },
-        Variant { label: "q95 444 plain", quality: 95, subsample_444: true, trellis: false, optimize_huffman: false },
-        Variant { label: "q85 444 plain", quality: 85, subsample_444: true, trellis: false, optimize_huffman: false },
-        Variant { label: "q92 420 plain", quality: 92, subsample_444: false, trellis: false, optimize_huffman: false },
+        Variant {
+            label: "q92 444 plain",
+            quality: 92,
+            subsample_444: true,
+            trellis: false,
+            optimize_huffman: false,
+        },
+        Variant {
+            label: "q95 444 plain",
+            quality: 95,
+            subsample_444: true,
+            trellis: false,
+            optimize_huffman: false,
+        },
+        Variant {
+            label: "q85 444 plain",
+            quality: 85,
+            subsample_444: true,
+            trellis: false,
+            optimize_huffman: false,
+        },
+        Variant {
+            label: "q92 420 plain",
+            quality: 92,
+            subsample_444: false,
+            trellis: false,
+            optimize_huffman: false,
+        },
         // Same quantisation tables as plain: only the entropy coder changes, so the decoded pixels
         // must be identical and only the size may move.
-        Variant { label: "q92 444 huffman only", quality: 92, subsample_444: true, trellis: false, optimize_huffman: true },
-        Variant { label: "q92 444 preset(trellis)", quality: 92, subsample_444: true, trellis: true, optimize_huffman: true },
+        Variant {
+            label: "q92 444 huffman only",
+            quality: 92,
+            subsample_444: true,
+            trellis: false,
+            optimize_huffman: true,
+        },
+        Variant {
+            label: "q92 444 preset(trellis)",
+            quality: 92,
+            subsample_444: true,
+            trellis: true,
+            optimize_huffman: true,
+        },
     ]
 }
 
@@ -264,7 +331,10 @@ fn run_quality() {
 
     // The tall scroll strip is left out: its quality question is the same as ui-4k's, and a
     // 38-megapixel decode twice per variant would only slow the run down.
-    for asset in synthetic::corpus().into_iter().filter(|asset| asset.height <= 4_000) {
+    for asset in synthetic::corpus()
+        .into_iter()
+        .filter(|asset| asset.height <= 4_000)
+    {
         let png = match codecs::png_row_band(&asset.pixels, asset.width, asset.height) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -305,21 +375,36 @@ fn run_quality() {
             let (jpeg_width, jpeg_height, pixels) = match codecs::decode_jpeg(&encoded) {
                 Ok(decoded) => decoded,
                 Err(error) => {
-                    eprintln!("codec-bench: {} / {} decode: {error}", asset.name, variant.label);
+                    eprintln!(
+                        "codec-bench: {} / {} decode: {error}",
+                        asset.name, variant.label
+                    );
                     continue;
                 }
             };
             if (jpeg_width, jpeg_height) != (width, height) {
-                eprintln!("codec-bench: {} / {} decoded to {}x{}", asset.name, variant.label, jpeg_width, jpeg_height);
+                eprintln!(
+                    "codec-bench: {} / {} decoded to {}x{}",
+                    asset.name, variant.label, jpeg_width, jpeg_height
+                );
                 continue;
             }
             let all = quality::whole(&reference, &pixels, width, height);
             let text = quality::in_regions(&reference, &pixels, width, height, &asset.text_regions);
             println!(
                 "{:<10} {:<24} {:>10} {:>9.4} {:>9.2} {:>10.4} {:>10.2}",
-                asset.name, variant.label, encoded.len(), all.ssim, all.psnr, text.ssim, text.psnr
+                asset.name,
+                variant.label,
+                encoded.len(),
+                all.ssim,
+                all.psnr,
+                text.ssim,
+                text.psnr
             );
-            let decoded = Decoded { bytes: encoded.len(), pixels };
+            let decoded = Decoded {
+                bytes: encoded.len(),
+                pixels,
+            };
             if variant.label == "q92 444 plain" {
                 plain_444 = Some(decoded);
             }
@@ -363,13 +448,19 @@ fn huffman_only(asset: &synthetic::Asset, reference: &[u8]) -> Option<Decoded> {
     if pixels.len() != reference.len() {
         return None;
     }
-    Some(Decoded { bytes: encoded.len(), pixels })
+    Some(Decoded {
+        bytes: encoded.len(),
+        pixels,
+    })
 }
 
 /// Writes PNG / q92 4:4:4 / q92 4:2:0 crops of the first text region of `ui-1080`, side by side at
 /// `ZOOM`, so 4:2:0's smear can be seen instead of only scored.
 fn write_text_crop() {
-    let Some(asset) = synthetic::corpus().into_iter().find(|asset| asset.name == "ui-1080") else {
+    let Some(asset) = synthetic::corpus()
+        .into_iter()
+        .find(|asset| asset.name == "ui-1080")
+    else {
         return;
     };
     let Some(region) = asset.text_regions.first().copied() else {
@@ -377,7 +468,10 @@ fn write_text_crop() {
     };
     // A line box spans the panel's whole width; the dump takes a readable slice of it at 8x.
     const SLICE: usize = 160;
-    let region = TextRegion { x1: (region.x0 + SLICE).min(region.x1), ..region };
+    let region = TextRegion {
+        x1: (region.x0 + SLICE).min(region.x1),
+        ..region
+    };
     let Some(png) = codecs::png_row_band(&asset.pixels, asset.width, asset.height).ok() else {
         return;
     };
@@ -434,8 +528,12 @@ fn write_text_crop() {
         let mut encoder = png::Encoder::new(writer, strip_width as u32, strip_height as u32);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().map_err(|error| format!("header: {error}"))?;
-        writer.write_image_data(&strip).map_err(|error| format!("data: {error}"))
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| format!("header: {error}"))?;
+        writer
+            .write_image_data(&strip)
+            .map_err(|error| format!("data: {error}"))
     })();
     match result {
         Ok(()) => println!(
@@ -470,7 +568,10 @@ fn iterations_for(pixels: usize) -> usize {
 }
 
 /// Runs `encode` a few times and reports the median time and the largest peak it saw.
-fn measure(iterations: usize, mut encode: impl FnMut() -> Result<usize, String>) -> Result<Outcome, String> {
+fn measure(
+    iterations: usize,
+    mut encode: impl FnMut() -> Result<usize, String>,
+) -> Result<Outcome, String> {
     let mut times = Vec::with_capacity(iterations);
     let mut peak = 0usize;
     let mut bytes = 0usize;
@@ -494,7 +595,11 @@ fn measure(iterations: usize, mut encode: impl FnMut() -> Result<usize, String>)
     } else {
         times[middle]
     };
-    Ok(Outcome { bytes, millis, peak_extra: peak })
+    Ok(Outcome {
+        bytes,
+        millis,
+        peak_extra: peak,
+    })
 }
 
 fn megabytes(bytes: usize) -> f64 {

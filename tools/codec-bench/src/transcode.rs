@@ -128,9 +128,7 @@ pub fn report() -> String {
 
 /// Decodes the master and encodes it as JPEG, with the rows either streamed or gathered first.
 fn transcode_to_jpeg(master: &[u8], streamed: bool, huffman: bool) -> Result<Vec<u8>, String> {
-    use zenjpeg::encoder::{
-        ChromaSubsampling, EncoderConfig, PixelLayout, Unstoppable,
-    };
+    use zenjpeg::encoder::{ChromaSubsampling, EncoderConfig, PixelLayout, Unstoppable};
 
     let mut decoder = png::Decoder::new(std::io::Cursor::new(master));
     decoder.set_transformations(png::Transformations::IDENTITY);
@@ -228,7 +226,10 @@ fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
 }
 
 fn temp_path(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("snapclip-transcode-{}-{name}.png", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "snapclip-transcode-{}-{name}.png",
+        std::process::id()
+    ))
 }
 
 fn measure(body: impl FnOnce() -> Result<usize, String>) -> Measured {
@@ -332,14 +333,20 @@ mod tests {
         // Band shape first: it must not change anything.
         let whole = transcode_to_jpeg(&master, false, false).expect("whole");
         assert_eq!(plain, whole, "the band shape changed the encoded bytes");
-        assert!(huffman.len() < plain.len(), "optimising should not grow the file");
+        assert!(
+            huffman.len() < plain.len(),
+            "optimising should not grow the file"
+        );
 
         let segments_plain = segments(&plain);
         let segments_huffman = segments(&huffman);
         for name in ["SOF0", "DQT", "SOS"] {
             let a = payload(&segments_plain, name);
             let b = payload(&segments_huffman, name);
-            assert_eq!(a, b, "{name} differs between the two arms, so they are not one boolean apart");
+            assert_eq!(
+                a, b,
+                "{name} differs between the two arms, so they are not one boolean apart"
+            );
         }
         assert_ne!(
             payload(&segments_plain, "DHT"),
@@ -355,7 +362,9 @@ mod tests {
         // One decoder, both files: this is the comparison the old test trusted.
         let zenjpeg = |bytes: &[u8]| -> Vec<u8> {
             let rgba = codecs::decode_jpeg(bytes).expect("zenjpeg decodes").2;
-            rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect()
+            rgba.chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect()
         };
         let same_decoder = differing(&zenjpeg(&plain), &zenjpeg(&huffman));
 
@@ -447,9 +456,8 @@ mod tests {
 
         // And the same master the transcode path uses, to see what the round trip adds.
         let master = codecs::png_row_band(&pixels, PAGE_WIDTH, 64).expect("master");
-        let through_png = |huffman: bool| {
-            transcode_to_jpeg(&master, true, huffman).expect("transcode")
-        };
+        let through_png =
+            |huffman: bool| transcode_to_jpeg(&master, true, huffman).expect("transcode");
         let (plain_png, huffman_png) = (through_png(false), through_png(true));
         let differing_png = differing(&rgb(&plain_png), &rgb(&huffman_png));
         println!(
@@ -510,7 +518,10 @@ mod tests {
 
         for height in [16usize, 64, 65, 128, 960] {
             let pixels = scroll::page(PAGE_WIDTH, height);
-            let source: Vec<u8> = pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+            let source: Vec<u8> = pixels
+                .chunks_exact(4)
+                .flat_map(|p| [p[2], p[1], p[0]])
+                .collect();
             let arm = |huffman: bool| -> f64 {
                 let jpeg = codecs::zenjpeg_knobs(
                     &pixels, PAGE_WIDTH, height, 92, true, false, huffman, 64,
@@ -530,10 +541,21 @@ mod tests {
             .into_iter()
             .find(|asset| asset.name == "ui-1080")
             .expect("the corpus has ui-1080");
-        let source: Vec<u8> = asset.pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]).collect();
+        let source: Vec<u8> = asset
+            .pixels
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0]])
+            .collect();
         let arm = |huffman: bool| -> f64 {
             let jpeg = codecs::zenjpeg_knobs(
-                &asset.pixels, asset.width, asset.height, 92, true, false, huffman, 64,
+                &asset.pixels,
+                asset.width,
+                asset.height,
+                92,
+                true,
+                false,
+                huffman,
+                64,
             )
             .expect("encodes");
             error(&source, &rgb(&jpeg))
@@ -558,15 +580,16 @@ mod tests {
         let pixels = scroll::page(PAGE_WIDTH, VIEW_ROWS);
         let master = codecs::png_row_band(&pixels, PAGE_WIDTH, VIEW_ROWS).expect("master");
 
-        let (from_memory, memory_peak) = alloc_probe::peak_extra(|| {
-            transcode_to_jpeg(&master, true, true).expect("memory arm")
-        });
-        let (from_reader, reader_peak) = alloc_probe::peak_extra(|| {
-            transcode_to_jpeg(&master, true, true).expect("reader arm")
-        });
+        let (from_memory, memory_peak) =
+            alloc_probe::peak_extra(|| transcode_to_jpeg(&master, true, true).expect("memory arm"));
+        let (from_reader, reader_peak) =
+            alloc_probe::peak_extra(|| transcode_to_jpeg(&master, true, true).expect("reader arm"));
         drop(guard);
 
-        assert_eq!(from_memory, from_reader, "the two arms must encode identically");
+        assert_eq!(
+            from_memory, from_reader,
+            "the two arms must encode identically"
+        );
         println!(
             "streaming peak: from memory {:.1} MB, from the PNG reader {:.1} MB ({:.2}x)",
             memory_peak as f64 / (1024.0 * 1024.0),

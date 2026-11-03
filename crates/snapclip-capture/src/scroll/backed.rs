@@ -58,11 +58,7 @@ impl Ring {
 
     fn physical(&self, logical: u32) -> u32 {
         let sum = self.head + logical;
-        if sum >= self.cap {
-            sum - self.cap
-        } else {
-            sum
-        }
+        if sum >= self.cap { sum - self.cap } else { sum }
     }
 
     /// Copy `src` (whole rows) over logical rows `[first, first + rows)`.
@@ -137,7 +133,9 @@ struct Tile {
 /// The sweep that uses this lives in the platform layer, because `scroll/` stays free of
 /// platform calls (the dependency gate checks it).
 pub(crate) fn tile_owner(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix("snapclip-scroll-")?.strip_suffix(".tile")?;
+    let rest = name
+        .strip_prefix("snapclip-scroll-")?
+        .strip_suffix(".tile")?;
     rest.split('-').next()?.parse().ok()
 }
 
@@ -145,7 +143,12 @@ pub(crate) fn tile_owner(name: &str) -> Option<u32> {
 /// without waiting an hour or killing a process.
 ///
 /// `running` is injected rather than called, so this stays platform-free.
-pub(crate) fn tile_is_orphan(pid: u32, me: u32, age_secs: u64, running: impl Fn(u32) -> bool) -> bool {
+pub(crate) fn tile_is_orphan(
+    pid: u32,
+    me: u32,
+    age_secs: u64,
+    running: impl Fn(u32) -> bool,
+) -> bool {
     if pid == me {
         // Nothing of ours can exist before the first seal, so this is a pid reuse.
         return true;
@@ -309,11 +312,26 @@ impl SealFault {
 }
 
 impl BackedCanvas {
-    pub(crate) fn new(first: &[u8], width: u32, view: u32, max_rows: u32) -> Self {
-        let row = (width * 4) as usize;
-        debug_assert_eq!(first.len(), row * view as usize);
-        debug_assert!(view > 0);
-        let view = view.max(1).min(max_rows.max(1));
+    pub(crate) fn new(
+        first: &[u8],
+        width: u32,
+        view: u32,
+        max_rows: u32,
+        format: snapclip_model::PixelFormat,
+    ) -> Self {
+        // Storage is byte-lossless; the producer owns color interpretation. A
+        // half-float row must never be written with the four-byte row width.
+        let row = (width as usize)
+            .checked_mul(format.bytes_per_pixel() as usize)
+            .expect("canvas row size overflow");
+        assert!(width > 0 && view > 0, "canvas dimensions must be nonzero");
+        assert_eq!(
+            first.len(),
+            row.checked_mul(view as usize)
+                .expect("canvas size overflow")
+        );
+        // The cap limits later growth, never truncates the already supplied
+        // first frame. This matches the in-memory oracle's initial-frame rule.
         let mut back = Ring::new(row, view);
         back.grow_back(view);
         back.write(0, first);
@@ -368,7 +386,11 @@ impl BackedCanvas {
 
     /// Read `rows` whole rows starting at canvas row `first` into `out`.
     fn gather(&self, first: u32, rows: u32, out: &mut [u8]) -> Result<(), RowReadError> {
-        debug_assert_eq!(out.len(), rows as usize * self.row);
+        if (rows as usize).checked_mul(self.row) != Some(out.len())
+            || first.checked_add(rows).is_none_or(|end| end > self.rows)
+        {
+            return Err(RowReadError::OutOfRange);
+        }
         let mut done = 0;
         let front_rows = self.front_rows();
         let middle_first = self.middle_first();
@@ -473,7 +495,8 @@ impl BackedCanvas {
         }
         #[cfg(any(test, feature = "seal-faults"))]
         if let Some(index) = self.fault.take() {
-            let error = format!("the long image cannot seal a tile: injected seal fault at #{index}");
+            let error =
+                format!("the long image cannot seal a tile: injected seal fault at #{index}");
             return self.fail(error);
         }
         let mut bytes = vec![0u8; rows as usize * self.row];
@@ -512,7 +535,8 @@ impl BackedCanvas {
                     // One write_all per seal today; counted rather than inferred so splitting a
                     // seal into several writes later does not quietly break the report.
                     self.seal_writes += 1;
-                    self.seal_write_us.push(started.elapsed().as_micros() as u64);
+                    self.seal_write_us
+                        .push(started.elapsed().as_micros() as u64);
                 }
                 if ring_is_front {
                     if let Some(front) = self.front.as_mut() {
@@ -558,23 +582,16 @@ impl BackedCanvas {
                                 .seek(SeekFrom::Start(tile.offset))
                                 .and_then(|_| file.read_exact(&mut bytes))
                             {
-                                let why =
-                                    format!("{}: {error}", self.middle.path.display());
-                                eprintln!(
-                                    "[snapclip][scroll] unsealing a tile failed: {why}"
-                                );
+                                let why = format!("{}: {error}", self.middle.path.display());
+                                eprintln!("[snapclip][scroll] unsealing a tile failed: {why}");
                                 broken.get_or_insert(why);
                                 bytes.fill(0);
                             }
                         }
                         None => {
-                            let why = format!(
-                                "the tile file {} is gone",
-                                self.middle.path.display()
-                            );
-                            eprintln!(
-                                "[snapclip][scroll] unsealing a tile failed: {why}"
-                            );
+                            let why =
+                                format!("the tile file {} is gone", self.middle.path.display());
+                            eprintln!("[snapclip][scroll] unsealing a tile failed: {why}");
                             broken.get_or_insert(why);
                             bytes.fill(0);
                         }
@@ -630,7 +647,6 @@ impl BackedCanvas {
         }
     }
 
-
     /// Armed by the tests and the probe: the next seal behaves like a full disk (docs/35 §12.4).
     #[cfg(test)]
     pub(crate) fn fail_seals(&mut self) {
@@ -664,11 +680,20 @@ impl CanvasStore for BackedCanvas {
     }
 
     fn append(&mut self, growth: u32, band_src: &[u8]) -> bool {
-        if self.rows + growth > self.max_rows {
+        if self
+            .rows
+            .checked_add(growth)
+            .is_none_or(|rows| rows > self.max_rows)
+            || !band_src.len().is_multiple_of(self.row)
+        {
             return false;
         }
-        let band = (band_src.len() / self.row) as u32;
-        debug_assert!(band <= self.view && band >= growth, "{band} {growth}");
+        let Ok(band) = u32::try_from(band_src.len() / self.row) else {
+            return false;
+        };
+        if band > self.view || band < growth {
+            return false;
+        }
         // A downward step ends any upward episode: the front ring's rows are final until a prepend
         // unseals them again, so the memory goes back now (docs/35 §5.2).
         if self.front.is_some() {
@@ -708,11 +733,20 @@ impl CanvasStore for BackedCanvas {
     }
 
     fn prepend(&mut self, growth: u32, band_src: &[u8]) -> bool {
-        if self.rows + growth > self.max_rows {
+        if self
+            .rows
+            .checked_add(growth)
+            .is_none_or(|rows| rows > self.max_rows)
+            || !band_src.len().is_multiple_of(self.row)
+        {
             return false;
         }
-        let band = (band_src.len() / self.row) as u32;
-        debug_assert!(band <= self.view && band >= growth, "{band} {growth}");
+        let Ok(band) = u32::try_from(band_src.len() / self.row) else {
+            return false;
+        };
+        if band > self.view || band < growth {
+            return false;
+        }
         // The band covers the `growth` new top rows plus the `band - growth` rows that were already
         // the top, so those have to be unsealed from the middle before the prepend can write.
         let existing = band - growth;
@@ -753,8 +787,6 @@ impl CanvasStore for BackedCanvas {
     }
 
     fn read_rows(&self, first_row: u32, rows: u32, out: &mut [u8]) -> Result<(), RowReadError> {
-        debug_assert_eq!(out.len(), rows as usize * self.row);
-        debug_assert!(first_row + rows <= self.rows);
         self.gather(first_row, rows, out)
     }
 
@@ -770,7 +802,10 @@ impl CanvasStore for BackedCanvas {
     }
 
     fn budgets(&self) -> Budgets {
-        let front = self.front.as_ref().map_or(0, |front| front.pixels.len() as u64);
+        let front = self
+            .front
+            .as_ref()
+            .map_or(0, |front| front.pixels.len() as u64);
         let back = self.back.pixels.len() as u64;
         Budgets {
             pixel_rows: self.rows,
@@ -784,6 +819,64 @@ impl CanvasStore for BackedCanvas {
 #[cfg(test)]
 mod tests {
     use super::BackedCanvas;
+
+    #[test]
+    fn fp16_tiles_preserve_raw_bits_across_sealing_reverse_growth_and_drop() {
+        use super::super::store::CanvasStore;
+        use snapclip_model::PixelFormat;
+        let row = 3 * 8;
+        let pixels = |seed: u8, rows: usize| -> Vec<u8> {
+            (0..rows * 3)
+                .flat_map(|i| {
+                    let words = [
+                        0xb400u16,
+                        0x4a40,
+                        0x8000 | ((i + seed as usize) as u16 & 0xff),
+                        0x3c00,
+                    ];
+                    words.into_iter().flat_map(u16::to_le_bytes)
+                })
+                .collect()
+        };
+        let mut expected = pixels(1, 4);
+        let mut store = BackedCanvas::new(&expected, 3, 4, 100, PixelFormat::Rgba16Float);
+        for seed in 2..10 {
+            let band = pixels(seed, 2);
+            assert!(store.append(2, &band));
+            expected.extend(band);
+        }
+        assert!(store.budgets().temp_bytes > 0);
+        let path = store.middle.path.clone();
+        assert!(path.exists());
+        for seed in 10..15 {
+            let mut band = pixels(seed, 2);
+            assert!(store.prepend(2, &band));
+            band.extend(expected);
+            expected = band;
+            assert_eq!(store.take_all().unwrap(), expected);
+        }
+        assert_eq!(store.budgets().pixel_bytes as usize, expected.len());
+        assert!(!store.append(1, &[0; 7]));
+        assert!(!store.prepend(u32::MAX, &[]));
+        assert_eq!(store.take_all().unwrap(), expected);
+        let mut band = vec![0; row * 5];
+        store.read_rows(1, 5, &mut band).unwrap();
+        assert_eq!(band, expected[row..row * 6]);
+        assert!(store.read_rows(u32::MAX, 2, &mut band).is_err());
+        drop(store);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_small_row_cap_keeps_the_entire_first_frame() {
+        use super::super::store::CanvasStore;
+        let source = vec![23; 3 * 4 * 8];
+        let mut store =
+            BackedCanvas::new(&source, 3, 4, 1, snapclip_model::PixelFormat::Rgba16Float);
+        assert_eq!(store.rows(), 4);
+        assert_eq!(store.take_all().unwrap(), source);
+        assert!(!store.append(1, &[0; 24]));
+    }
 
     /// The feature arms from `SEAL_FAULT_AT`, so only the parse is testable here: the environment
     /// is process-global and the tests run in parallel (docs/35 §19).
@@ -818,7 +911,13 @@ mod tests {
     #[test]
     fn a_prepend_over_a_broken_tile_still_writes_its_band() {
         let first = frame(1);
-        let mut backed = BackedCanvas::new(&first, W, VIEW, 64 * VIEW);
+        let mut backed = BackedCanvas::new(
+            &first,
+            W,
+            VIEW,
+            64 * VIEW,
+            snapclip_model::PixelFormat::Bgra8Unorm,
+        );
         let growth = 90;
         let band = (VIEW / 2).max(growth + VIEW / 4).min(VIEW);
         for step in 0..6u32 {
@@ -829,12 +928,18 @@ mod tests {
         // middle, which is the only path that reads tiles back.
         let down = band_src(8, band);
         assert!(backed.append(growth, &down), "the downward step");
-        assert!(backed.budgets().temp_bytes > 0, "the run must have sealed tiles");
+        assert!(
+            backed.budgets().temp_bytes > 0,
+            "the run must have sealed tiles"
+        );
 
         backed.break_tile_file();
 
         let src = band_src(9, band);
-        assert!(backed.prepend(growth, &src), "the prepend still has to work");
+        assert!(
+            backed.prepend(growth, &src),
+            "the prepend still has to work"
+        );
 
         // The top two rows live in the front ring, so they can be read without the file.
         let row = (W * 4) as usize;
@@ -864,7 +969,13 @@ mod tests {
     #[test]
     fn unsealing_reports_a_broken_tile_instead_of_pretending() {
         let first = frame(1);
-        let mut backed = BackedCanvas::new(&first, W, VIEW, 64 * VIEW);
+        let mut backed = BackedCanvas::new(
+            &first,
+            W,
+            VIEW,
+            64 * VIEW,
+            snapclip_model::PixelFormat::Bgra8Unorm,
+        );
         let growth = 90;
         let band = (VIEW / 2).max(growth + VIEW / 4).min(VIEW);
         for step in 0..6u32 {
@@ -873,7 +984,10 @@ mod tests {
         }
         let down = band_src(8, band);
         assert!(backed.append(growth, &down), "the downward step");
-        assert!(backed.budgets().temp_bytes > 0, "the run must have sealed tiles");
+        assert!(
+            backed.budgets().temp_bytes > 0,
+            "the run must have sealed tiles"
+        );
 
         backed.break_tile_file();
 
@@ -892,7 +1006,13 @@ mod tests {
     fn appends_land_in_the_same_place_as_one_buffer() {
         let first = frame(1);
         let mut memory = MemoryCanvas::new(&first, W, VIEW, 64 * VIEW);
-        let mut backed = BackedCanvas::new(&first, W, VIEW, 64 * VIEW);
+        let mut backed = BackedCanvas::new(
+            &first,
+            W,
+            VIEW,
+            64 * VIEW,
+            snapclip_model::PixelFormat::Bgra8Unorm,
+        );
         let mut value = 2u8;
         for step in 0..8u32 {
             let growth = 90;
@@ -908,7 +1028,8 @@ mod tests {
             backed.read_rows(0, rows, &mut b).expect("backed rows");
             if a != b {
                 let row = (W * 4) as usize;
-                let bad = (0..rows as usize).find(|r| a[r * row..(r + 1) * row] != b[r * row..(r + 1) * row]);
+                let bad = (0..rows as usize)
+                    .find(|r| a[r * row..(r + 1) * row] != b[r * row..(r + 1) * row]);
                 panic!(
                     "step {step}: first differing row {:?} of {rows} (memory {:?}, backed {:?})",
                     bad,
@@ -937,7 +1058,13 @@ mod budget_tests {
     /// which, because they are not interchangeable (docs/35 §5.1).
     #[test]
     fn the_budgets_separate_working_memory_from_temporary_storage() {
-        let mut store = BackedCanvas::new(&frame(1), W, VIEW, 16 * VIEW);
+        let mut store = BackedCanvas::new(
+            &frame(1),
+            W,
+            VIEW,
+            16 * VIEW,
+            snapclip_model::PixelFormat::Bgra8Unorm,
+        );
         let start = store.budgets();
         assert_eq!(start.pixel_rows, VIEW);
         assert_eq!(start.temp_bytes, 0, "a short session writes nothing");
@@ -948,7 +1075,10 @@ mod budget_tests {
         assert!(store.append(2, &band));
         let grown = store.budgets();
         assert_eq!(grown.pixel_rows, VIEW + 2);
-        assert_eq!(grown.working_bytes, start.working_bytes, "the ring is fixed");
+        assert_eq!(
+            grown.working_bytes, start.working_bytes,
+            "the ring is fixed"
+        );
         // The ring only ever holds one viewport, so this growth pushes two rows out of it and into
         // the tile file: the image grew by two rows and memory did not.
         assert_eq!(grown.temp_bytes, 2 * row as u64, "{grown:?}");
@@ -981,16 +1111,33 @@ mod budget_tests {
     fn dropping_the_store_removes_its_tile_file() {
         // It checks its **own** path rather than every file carrying this pid: tests run in
         // parallel, and a sibling store's live file is not this test's business.
-        let mut store = BackedCanvas::new(&frame(1), W, VIEW, 64 * VIEW);
+        let mut store = BackedCanvas::new(
+            &frame(1),
+            W,
+            VIEW,
+            64 * VIEW,
+            snapclip_model::PixelFormat::Bgra8Unorm,
+        );
         let row = (W * 4) as usize;
         for step in 0..6u32 {
             let band = vec![step as u8 + 2; 2 * row];
             assert!(store.append(2, &band), "step {step}");
         }
-        assert!(store.budgets().temp_bytes > 0, "rows left the ring: {:?}", store.budgets());
+        assert!(
+            store.budgets().temp_bytes > 0,
+            "rows left the ring: {:?}",
+            store.budgets()
+        );
         let path = store.tile_path().to_path_buf();
-        assert!(path.exists(), "the tile file should exist while the store lives");
+        assert!(
+            path.exists(),
+            "the tile file should exist while the store lives"
+        );
         drop(store);
-        assert!(!path.exists(), "the tile file outlived its store: {}", path.display());
+        assert!(
+            !path.exists(),
+            "the tile file outlived its store: {}",
+            path.display()
+        );
     }
 }

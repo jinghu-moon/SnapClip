@@ -97,7 +97,12 @@ pub(crate) fn drawn_strings() -> Vec<String> {
     drawn.push(size_text(1234, 56789));
     drawn.push(status_text(None, false));
     drawn.push(status_text(None, true));
-    for status in [Status::Tracking, Status::Lost, Status::Full, Status::Storage] {
+    for status in [
+        Status::Tracking,
+        Status::Lost,
+        Status::Full,
+        Status::Storage,
+    ] {
         drawn.push(status_text(Some(status), false));
     }
     drawn
@@ -298,7 +303,10 @@ mod tests {
         assert_eq!(placed.panel.width(), 240);
         assert_eq!(placed.well.width(), thumb_width(144));
         // The badge keeps its distance from the panel's top-right corner.
-        assert_eq!(placed.badge.right, placed.panel.right - px(10, 144) - px(6, 144));
+        assert_eq!(
+            placed.badge.right,
+            placed.panel.right - px(10, 144) - px(6, 144)
+        );
         assert_eq!(placed.badge.top, placed.panel.top + px(6, 144));
         assert_eq!(placed.badge.height(), px(24, 144));
     }
@@ -351,7 +359,10 @@ mod tests {
         assert_eq!(status_text(Some(Status::Tracking), false), "");
         assert_eq!(status_text(Some(Status::Lost), false), "跟丢了，请往回滚");
         assert_eq!(status_text(Some(Status::Full), false), "已达上限");
-        assert_eq!(status_text(Some(Status::Tracking), true), "截图失败，见日志");
+        assert_eq!(
+            status_text(Some(Status::Tracking), true),
+            "截图失败，见日志"
+        );
         // Whatever the session is doing, a failure outranks it.
         assert_eq!(status_text(Some(Status::Full), true), "截图失败，见日志");
         assert_eq!(Button::Auto.label(true), "停止");

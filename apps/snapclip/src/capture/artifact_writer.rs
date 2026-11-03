@@ -273,7 +273,10 @@ mod tests {
             "the error should name the read, not the encoder: {error}"
         );
         let written = fs::read_dir(&path).map(|dir| dir.count()).unwrap_or(0);
-        assert_eq!(written, 0, "an artifact was written for a picture that could not be read");
+        assert_eq!(
+            written, 0,
+            "an artifact was written for a picture that could not be read"
+        );
     }
 
     fn root(name: &str) -> PathBuf {

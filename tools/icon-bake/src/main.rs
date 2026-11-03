@@ -51,14 +51,32 @@ pub const BAKED_COLOUR: &str = "#ffffff";
 /// because the committed-asset test compares this machine against itself.
 const BLOCKED_TAGS: &[(&str, &str)] = &[
     ("text", "<text> is laid out with fonts that vary by machine"),
-    ("tspan", "<tspan> is laid out with fonts that vary by machine"),
-    ("textPath", "<textPath> is laid out with fonts that vary by machine"),
+    (
+        "tspan",
+        "<tspan> is laid out with fonts that vary by machine",
+    ),
+    (
+        "textPath",
+        "<textPath> is laid out with fonts that vary by machine",
+    ),
     ("mask", "<mask> is implemented differently across renderers"),
     ("foreignObject", "<foreignObject> is arbitrary markup"),
-    ("image", "<image> would load a file that is not in the repository"),
-    ("animate", "<animate> makes the frozen frame depend on timing"),
-    ("animateTransform", "<animateTransform> makes the frozen frame depend on timing"),
-    ("animateMotion", "<animateMotion> makes the frozen frame depend on timing"),
+    (
+        "image",
+        "<image> would load a file that is not in the repository",
+    ),
+    (
+        "animate",
+        "<animate> makes the frozen frame depend on timing",
+    ),
+    (
+        "animateTransform",
+        "<animateTransform> makes the frozen frame depend on timing",
+    ),
+    (
+        "animateMotion",
+        "<animateMotion> makes the frozen frame depend on timing",
+    ),
     ("set", "<set> makes the frozen frame depend on timing"),
 ];
 
@@ -98,7 +116,8 @@ pub fn bake_all() -> Result<Vec<PathBuf>, String> {
     let mut written = Vec::new();
     for svg in svg_paths()? {
         let png = svg.with_extension("png");
-        std::fs::write(&png, render(&svg)?).map_err(|error| format!("{}: {error}", png.display()))?;
+        std::fs::write(&png, render(&svg)?)
+            .map_err(|error| format!("{}: {error}", png.display()))?;
         written.push(png);
         let rgba = svg.with_extension("rgba");
         std::fs::write(&rgba, render_rgba(&svg)?)
@@ -162,8 +181,13 @@ fn render_pixmap(svg: &Path) -> Result<resvg::tiny_skia::Pixmap, String> {
     let dx = (ICON_BAKED_PX as f32 - size.width() * scale) / 2.0;
     let dy = (ICON_BAKED_PX as f32 - size.height() * scale) / 2.0;
 
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(ICON_BAKED_PX, ICON_BAKED_PX)
-        .ok_or_else(|| format!("{}: cannot allocate a {ICON_BAKED_PX}px pixmap", svg.display()))?;
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(ICON_BAKED_PX, ICON_BAKED_PX).ok_or_else(|| {
+            format!(
+                "{}: cannot allocate a {ICON_BAKED_PX}px pixmap",
+                svg.display()
+            )
+        })?;
     // A fresh pixmap is fully transparent, which is the background the icons want.
     resvg::render(
         &tree,
@@ -219,7 +243,10 @@ fn preflight(source: &str) -> Result<(), String> {
     if complaints.is_empty() {
         Ok(())
     } else {
-        Err(format!("not predictable enough to bake: {}", complaints.join("; ")))
+        Err(format!(
+            "not predictable enough to bake: {}",
+            complaints.join("; ")
+        ))
     }
 }
 
@@ -306,7 +333,11 @@ mod tests {
             .chunks_exact(4)
             .find(|pixel| pixel[3] == 255)
             .expect("an icon has some fully opaque ink");
-        assert_eq!(&opaque[..3], &[255, 255, 255], "ink is white before tinting");
+        assert_eq!(
+            &opaque[..3],
+            &[255, 255, 255],
+            "ink is white before tinting"
+        );
         assert!(
             pixels.chunks_exact(4).any(|pixel| pixel[3] == 0),
             "an icon has transparent surroundings"
@@ -355,7 +386,10 @@ mod tests {
         assert!(preflight(with_text).is_err(), "<text> must be refused");
 
         let with_link = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><image href="https://example.com/a.png"/></svg>"#;
-        assert!(preflight(with_link).is_err(), "an external href must be refused");
+        assert!(
+            preflight(with_link).is_err(),
+            "an external href must be refused"
+        );
 
         let with_filter = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M2 2h20v20H2z" filter="url(#f)"/></svg>"#;
         assert!(preflight(with_filter).is_err(), "a filter must be refused");

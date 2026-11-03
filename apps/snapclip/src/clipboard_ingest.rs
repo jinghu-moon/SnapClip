@@ -13,15 +13,13 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use snapclip_history::clipboard::{ClipboardEvent, ClipboardUpdateListener, source_app};
 use snapclip_history::ingest::{
     ClipboardEventBridge, ClipboardEventSink, ClipboardIngest, ClipboardIngestHandle,
     ClipboardSignal, ClipboardSnapshot, ClipboardSource, OcrQueue, ReadWindow, SourceAppResolver,
     StopSignal,
 };
 use snapclip_history::store::Store;
-use snapclip_history::windows::{
-    ClipboardEvent, ClipboardUpdateListener, formats, reader, source_app,
-};
 
 use crate::adapters::ClipboardEvents;
 use crate::events::EventBus;
@@ -31,7 +29,7 @@ struct Win32ClipboardSource;
 
 impl ClipboardSource for Win32ClipboardSource {
     fn read(&mut self, _signal: ClipboardSignal) -> Result<ClipboardSnapshot, String> {
-        let snapshot = reader::read_snapshot(formats::formats())?;
+        let snapshot = snapclip_history::clipboard::read_snapshot()?;
         Ok(ClipboardSnapshot {
             sequence: snapshot.sequence,
             owner: snapshot.owner,

@@ -9,26 +9,24 @@
 
 use super::d2d::PanelPainter;
 use snapclip_model::geometry::Rect;
+use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-    D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1CreateFactory, ID2D1Factory,
-    ID2D1RenderTarget, ID2D1SolidColorBrush,
-    ID2D1Bitmap,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_ISOLATED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory,
-    IDWriteTextFormat,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory,
+    IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::HDC;
-use windows::Win32::Foundation::RECT;
 use windows::core::Result;
 
 use crate::panel::theme::FAMILY;
@@ -295,9 +293,11 @@ impl FrameBrushes {
         // The field's own colours, resolved once here rather than at every paint: they are pure
         // functions of the state and the surface.
         let idle = crate::panel::field_colours(crate::panel::FieldState::Idle, palette.surface);
-        let focused = crate::panel::field_colours(crate::panel::FieldState::Focused, palette.surface);
+        let focused =
+            crate::panel::field_colours(crate::panel::FieldState::Focused, palette.surface);
         let error = crate::panel::field_colours(crate::panel::FieldState::Error, palette.surface);
-        let warning = crate::panel::field_colours(crate::panel::FieldState::Warning, palette.surface);
+        let warning =
+            crate::panel::field_colours(crate::panel::FieldState::Warning, palette.surface);
         Ok(Self {
             surface: brush(target, palette.surface)?,
             line: brush(target, palette.line)?,
@@ -589,12 +589,7 @@ impl Frame<'_> {
         let edge = (PANEL_INNER_STROKE_DIP * self.scale).round() as i32;
         let stroke = PANEL_INNER_STROKE_DIP * self.scale;
         painter.stroke_round(
-            Rect::new(
-                edge,
-                edge,
-                canvas.right - edge,
-                canvas.bottom - edge,
-            ),
+            Rect::new(edge, edge, canvas.right - edge, canvas.bottom - edge),
             (PANEL_CORNER_APPROX_DIP as f32 * self.scale).round() as i32,
             &self.brushes.line,
             stroke,
@@ -714,14 +709,13 @@ impl Frame<'_> {
         // One answer to "which line the quality row is showing", asked by the field loop below and
         // by the line itself. The limit's box is drawn only while its line is: its input used to be
         // a control that was hidden when the switch was off, which left the frame's own box behind.
-        let limit_line = crate::panel::quality_line(
-            self.format,
-            self.limit.map_or(false, |limit| limit.on),
-        );
+        let limit_line =
+            crate::panel::quality_line(self.format, self.limit.map_or(false, |limit| limit.on));
         // The states come from the field list, one per field: a field that is added later is drawn
         // from its own entry rather than from whatever state the window tracked before.
         for (id, state) in self.fields.iter() {
-            if id == crate::panel::FieldId::Limit && limit_line != crate::panel::QualityLine::Limit {
+            if id == crate::panel::FieldId::Limit && limit_line != crate::panel::QualityLine::Limit
+            {
                 continue;
             }
             let field = id.frame_rect(self.metrics, self.rects, self.scale, self.path_change);
@@ -733,13 +727,7 @@ impl Frame<'_> {
             if id == crate::panel::FieldId::Name {
                 eprintln!(
                     "[save-panel] box fill field={:?} state={:?} rect=({},{},{},{}) rgba={:?}",
-                    id,
-                    state,
-                    field.left,
-                    field.top,
-                    field.right,
-                    field.bottom,
-                    colours.fill
+                    id, state, field.left, field.top, field.right, field.bottom, colours.fill
                 );
             }
             // The fill has to be the state's own, because the native control inside this frame is
@@ -820,17 +808,32 @@ impl Frame<'_> {
         // the child window draws, and a `px` unit (`:237`, `:242`, `:244`, `:595`, `:605`). The
         // wrapper is painted by the loop above, which is why the cell's frame rectangle and the
         // control's rectangle are two different things here and the same thing everywhere else.
-        if let (Some(word_format), Some(unit_format)) = (self.row_label, self.number.or(self.chip)) {
+        if let (Some(word_format), Some(unit_format)) = (self.row_label, self.number.or(self.chip))
+        {
             for (cell, word) in [
-                (crate::panel::SizeCell::Width, crate::panel::field::SIZE_CELL_WORDS[0]),
-                (crate::panel::SizeCell::Height, crate::panel::field::SIZE_CELL_WORDS[1]),
+                (
+                    crate::panel::SizeCell::Width,
+                    crate::panel::field::SIZE_CELL_WORDS[0],
+                ),
+                (
+                    crate::panel::SizeCell::Height,
+                    crate::panel::field::SIZE_CELL_WORDS[1],
+                ),
             ] {
-                let label =
-                    crate::panel::field::size_cell_label_rect(self.metrics, self.rects, self.scale, cell);
+                let label = crate::panel::field::size_cell_label_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    cell,
+                );
                 painter.draw_text(word, word_format, label, &self.brushes.muted);
 
-                let unit =
-                    crate::panel::field::size_cell_unit_rect(self.metrics, self.rects, self.scale, cell);
+                let unit = crate::panel::field::size_cell_unit_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    cell,
+                );
                 painter.draw_text(
                     crate::panel::field::SIZE_UNIT_TEXT,
                     unit_format,
@@ -849,8 +852,12 @@ impl Frame<'_> {
             (crate::panel::SizeCell::Height, self.numbers.height),
         ] {
             let Some(view) = view else { continue };
-            let rect =
-                crate::panel::field::size_cell_input_rect(self.metrics, self.rects, self.scale, cell);
+            let rect = crate::panel::field::size_cell_input_rect(
+                self.metrics,
+                self.rects,
+                self.scale,
+                cell,
+            );
             let id = match cell {
                 crate::panel::SizeCell::Width => crate::panel::FieldId::SizeWidth,
                 crate::panel::SizeCell::Height => crate::panel::FieldId::SizeHeight,
@@ -869,7 +876,8 @@ impl Frame<'_> {
                     let mut widths = [0i32; 4];
                     for (index, word) in crate::panel::field::SIZE_PRESET_WORDS.iter().enumerate() {
                         let measured = painter.measure_text_width(word, words_format)? as i32;
-                        widths[index] = crate::panel::field::size_preset_width(self.scale, measured);
+                        widths[index] =
+                            crate::panel::field::size_preset_width(self.scale, measured);
                     }
                     widths
                 }
@@ -887,8 +895,8 @@ impl Frame<'_> {
                 );
                 let edge = self.scale.round().max(1.0);
                 painter.stroke_round(chip, pill, &self.brushes.line_soft, edge);
-                let inset = (crate::panel::field::AFTER_CHIP_PAD_DIP as f32 * self.scale).round()
-                    as i32;
+                let inset =
+                    (crate::panel::field::AFTER_CHIP_PAD_DIP as f32 * self.scale).round() as i32;
                 painter.draw_text(
                     word,
                     words_format,
@@ -965,8 +973,8 @@ impl Frame<'_> {
                     &self.brushes.muted
                 };
                 painter.fill_circle(centre, knob_radius, knob_brush);
-                let gap = (crate::panel::field::LIMIT_SWITCH_GAP_DIP as f32 * self.scale).round()
-                    as i32;
+                let gap =
+                    (crate::panel::field::LIMIT_SWITCH_GAP_DIP as f32 * self.scale).round() as i32;
                 let word = Rect::new(track.right + gap, switch.top, switch.right, switch.bottom);
                 let word_brush = if limit.on {
                     &self.brushes.text
@@ -1038,7 +1046,8 @@ impl Frame<'_> {
             }
             crate::panel::QualityLine::Hint => {
                 if let Some(format) = self.hint {
-                    let rect = crate::panel::quality_hint_rect(self.metrics, self.rects, self.scale);
+                    let rect =
+                        crate::panel::quality_hint_rect(self.metrics, self.rects, self.scale);
                     painter.draw_text(
                         crate::panel::field::QUALITY_HINT_TEXT,
                         format,
@@ -1119,7 +1128,12 @@ impl Frame<'_> {
         if crate::panel::fill_row_shown(self.format) {
             let row = crate::panel::fill_row_rect(self.metrics, self.rects, self.scale);
             if let Some(format) = self.fill_label {
-                painter.draw_text(crate::panel::field::FILL_ROW_LABEL, format, row, &self.brushes.muted);
+                painter.draw_text(
+                    crate::panel::field::FILL_ROW_LABEL,
+                    format,
+                    row,
+                    &self.brushes.muted,
+                );
             }
             let chosen = crate::panel::fill_swatch_selected(self.fill);
             let radius = crate::panel::FILL_SWATCH_RADIUS_DIP * self.scale;
@@ -1148,11 +1162,9 @@ impl Frame<'_> {
                     // The one that opens a picker wears the design's conic gradient (`:317`) until a
                     // colour has been picked, and that colour afterwards, so a custom choice is
                     // visible after the dialog closes rather than only while it is open.
-                    (_, 2) => crate::panel::icons::rounded_square_bgra(
-                        baked,
-                        self.fill,
-                        baked_radius,
-                    ),
+                    (_, 2) => {
+                        crate::panel::icons::rounded_square_bgra(baked, self.fill, baked_radius)
+                    }
                     _ => crate::panel::icons::hue_wheel_bgra(baked, baked_radius),
                 };
                 let bitmap = painter.bgra_bitmap_with_alpha(baked, baked, &pixels)?;
@@ -1175,7 +1187,12 @@ impl Frame<'_> {
             painter.draw_text(
                 text,
                 format,
-                Rect::new(self.rects.title_left, 0, self.rects.close.left, self.rects.divider_y),
+                Rect::new(
+                    self.rects.title_left,
+                    0,
+                    self.rects.close.left,
+                    self.rects.divider_y,
+                ),
                 &self.brushes.text,
             );
         }
@@ -1289,12 +1306,8 @@ impl Frame<'_> {
                 .measure_text_width(crate::panel::field::GHOST_WORD_CHANGE, chip_format)?
                 .round() as i32;
             let change = crate::panel::field::ghost_button_width(self.scale, measured);
-            let change_rect = crate::panel::field::path_change_rect(
-                self.metrics,
-                self.rects,
-                self.scale,
-                change,
-            );
+            let change_rect =
+                crate::panel::field::path_change_rect(self.metrics, self.rects, self.scale, change);
             painter.fill_round(change_rect, radius, &self.brushes.field_fill);
             painter.draw_text(
                 crate::panel::field::GHOST_WORD_CHANGE,
@@ -1303,7 +1316,8 @@ impl Frame<'_> {
                 &self.brushes.text,
             );
 
-            let open_rect = crate::panel::field::path_open_rect(self.metrics, self.rects, self.scale);
+            let open_rect =
+                crate::panel::field::path_open_rect(self.metrics, self.rects, self.scale);
             painter.fill_round(open_rect, radius, &self.brushes.field_fill);
             Self::draw_glyph(
                 painter,
@@ -1321,18 +1335,18 @@ impl Frame<'_> {
                 None => {
                     let mut measured_widths = [0i32; 3];
                     for (index, word) in crate::panel::field::PATH_CHIP_WORDS.iter().enumerate() {
-                        let measured = painter.measure_text_width(word, chip_format)?.round() as i32;
+                        let measured =
+                            painter.measure_text_width(word, chip_format)?.round() as i32;
                         measured_widths[index] =
                             crate::panel::field::path_chip_width(self.scale, measured);
                     }
                     measured_widths
                 }
             };
-            let height =
-                (crate::panel::field::AFTER_CHIP_HEIGHT_DIP as f32 * self.scale).round();
+            let height = (crate::panel::field::AFTER_CHIP_HEIGHT_DIP as f32 * self.scale).round();
             let pill = (height / 2.0).round() as i32;
-            let icon_gap = (crate::panel::field::PATH_CHIP_ICON_GAP_DIP as f32 * self.scale)
-                .round() as i32;
+            let icon_gap =
+                (crate::panel::field::PATH_CHIP_ICON_GAP_DIP as f32 * self.scale).round() as i32;
             for (index, word) in crate::panel::field::PATH_CHIP_WORDS.iter().enumerate() {
                 let rect = crate::panel::field::path_chip_rect(
                     self.metrics,
@@ -1365,7 +1379,6 @@ impl Frame<'_> {
             }
         }
 
-
         // is hovered (`:247`), and the icon is `--accent-text` because the hub starts locked (`:248`,
         // `:603`), so the default state is the icon alone. Its rectangle comes from the same place
         // the two cells were laid out around, so the icon cannot drift away from the row.
@@ -1397,7 +1410,11 @@ impl Frame<'_> {
                 None => {
                     let mut measured = [0i32; 2];
                     for (index, word) in crate::panel::SIZE_MODE_WORDS.iter().enumerate() {
-                        let format = if index == chosen { chosen_format } else { other_format };
+                        let format = if index == chosen {
+                            chosen_format
+                        } else {
+                            other_format
+                        };
                         let text = painter.measure_text_width(word, format)?.round() as i32;
                         measured[index] = crate::panel::size_mode_button_width(self.scale, text);
                     }
@@ -1505,7 +1522,8 @@ impl Frame<'_> {
                     // `:286` copy is a ghost: no background, `--muted`, and its word follows the
                     // glyph rather than centring in the button.
                     crate::panel::FooterButton::Copy => {
-                        let text = crate::panel::footer_copy_text_rect(self.metrics, self.scale, widths);
+                        let text =
+                            crate::panel::footer_copy_text_rect(self.metrics, self.scale, widths);
                         painter.draw_text(word, button_format, text, &self.brushes.muted);
                     }
                 }
@@ -1520,8 +1538,7 @@ impl Frame<'_> {
             )?;
 
             // `:288` the separator is a one-dip `--line-soft` rule, sixteen dip tall.
-            let separator =
-                crate::panel::footer_separator_rect(self.metrics, self.scale, widths);
+            let separator = crate::panel::footer_separator_rect(self.metrics, self.scale, widths);
             painter.fill_round(separator, 0, &self.brushes.line_soft);
 
             // The status line (`:275`, `:675`): the footer's first child, in the space the buttons
@@ -1683,12 +1700,7 @@ impl Frame<'_> {
             let item = crate::panel::var_item_rect(self.metrics, self.rects, scale, index);
             let _ = item_radius;
             // `.var-item { padding: 0 10px; text-align: left }` (`:219`), and `--text` for the word.
-            let text = Rect::new(
-                item.left + pad,
-                item.top,
-                item.right - pad,
-                item.bottom,
-            );
+            let text = Rect::new(item.left + pad, item.top, item.right - pad, item.bottom);
             painter.draw_text(label, label_format, text, &self.brushes.text);
             // `.var-item .val { font-family: var(--num); font-size: 11px; color: var(--muted) }`
             // (`:221`), right aligned against the row's own padding. The shared eleven dip numeric
@@ -1793,7 +1805,8 @@ impl Frame<'_> {
 
         let item_radius = (crate::panel::FMT_ITEM_RADIUS_DIP as f32 * scale).round() as i32;
         for index in 0..crate::panel::FMT_OPTIONS.len() {
-            let item = crate::panel::fmt_item_rect(self.metrics, self.rects, scale, window_height, index);
+            let item =
+                crate::panel::fmt_item_rect(self.metrics, self.rects, scale, window_height, index);
             // `.fmt-item.is-selected { background: var(--fill) }` (`:183`), the same fill the fields
             // and the segmented track use.
             if index == chosen {
@@ -1801,14 +1814,26 @@ impl Frame<'_> {
                 Self::draw_glyph(
                     painter,
                     crate::panel::icons::Glyph::Check,
-                    crate::panel::fmt_check_rect(self.metrics, self.rects, scale, window_height, index),
+                    crate::panel::fmt_check_rect(
+                        self.metrics,
+                        self.rects,
+                        scale,
+                        window_height,
+                        index,
+                    ),
                     self.brushes.accent_text_rgba,
                 )?;
             }
             painter.draw_text(
                 crate::panel::FMT_OPTIONS[index],
                 label_format,
-                crate::panel::fmt_item_label_rect(self.metrics, self.rects, scale, window_height, index),
+                crate::panel::fmt_item_label_rect(
+                    self.metrics,
+                    self.rects,
+                    scale,
+                    window_height,
+                    index,
+                ),
                 &self.brushes.text,
             );
         }
@@ -1861,7 +1886,12 @@ impl Frame<'_> {
             let before = painter.measure_text_width(&view.text[..view.caret], format)? as i32;
             let hairline = self.scale.round().max(1.0) as i32;
             painter.fill_round(
-                Rect::new(left + before, band.top, left + before + hairline, band.bottom),
+                Rect::new(
+                    left + before,
+                    band.top,
+                    left + before + hairline,
+                    band.bottom,
+                ),
                 0,
                 &self.brushes.accent_text,
             );
@@ -1907,8 +1937,7 @@ impl Frame<'_> {
         let side = crate::panel::icons::ICON_BAKED_PX as usize;
         let turned = crate::panel::icons::flipped_180(glyph.raw(), side);
         let tinted = crate::panel::icons::tint_rgba_to_premultiplied_bgra(&turned, colour);
-        let bitmap =
-            painter.bgra_bitmap_with_alpha(side as u32, side as u32, &tinted)?;
+        let bitmap = painter.bgra_bitmap_with_alpha(side as u32, side as u32, &tinted)?;
         painter.draw_bitmap_at(&bitmap, rect);
         Ok(())
     }
@@ -2087,10 +2116,7 @@ pub fn measure_path_chips(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 3]>
 
 /// The after-save switches' measurement: the label they follow and each switch's own width, taken
 /// with the format that draws them so the window can hit-test what the painter drew.
-pub fn measure_after_chips(
-    dwrite: &IDWriteFactory,
-    dpi: f32,
-) -> Result<crate::panel::AfterChips> {
+pub fn measure_after_chips(dwrite: &IDWriteFactory, dpi: f32) -> Result<crate::panel::AfterChips> {
     let scale = (dpi / 96.0).max(0.5);
     let label_format = row_label_format(dwrite, dpi)?;
     let format = chip_format(dwrite, dpi)?;
@@ -2147,7 +2173,8 @@ pub fn measure_context_menu(dwrite: &IDWriteFactory, dpi: f32) -> Result<i32> {
         .iter()
         .zip(crate::panel::CONTEXT_SHORTCUTS.iter())
     {
-        let word_width = crate::panel::d2d::measure_text_width(dwrite, word, &format)?.round() as i32;
+        let word_width =
+            crate::panel::d2d::measure_text_width(dwrite, word, &format)?.round() as i32;
         let key_width = crate::panel::d2d::measure_text_width(dwrite, key, &format)?.round() as i32;
         widest = widest.max(crate::panel::context_menu_width(
             word_width, key_width, scale,
@@ -2190,9 +2217,12 @@ pub fn measure_footer_widths(dwrite: &IDWriteFactory, dpi: f32) -> Result<[i32; 
         } else {
             &button
         };
-        let measured =
-            crate::panel::d2d::measure_text_width(dwrite, crate::panel::footer_button_text(*footer), format)?
-                .round() as i32;
+        let measured = crate::panel::d2d::measure_text_width(
+            dwrite,
+            crate::panel::footer_button_text(*footer),
+            format,
+        )?
+        .round() as i32;
         widths[index] = crate::panel::footer_button_width(scale, *footer, measured);
     }
     Ok(widths)
@@ -2723,7 +2753,11 @@ mod tests {
         let mut careted = crate::panel::TextField::new("1341");
         careted.set_focused(true);
         careted.move_end();
-        assert_eq!(careted.selection(), None, "the caret is bare before it is drawn");
+        assert_eq!(
+            careted.selection(),
+            None,
+            "the caret is bare before it is drawn"
+        );
         paint(&careted, true);
         let mut caret_pixels = 0;
         let pixels = canvas.pixels();
@@ -2848,27 +2882,70 @@ mod tests {
     fn the_limit_controls_are_the_designs_own_numbers() {
         let rects = DEMO.rects(1.0);
         let switch = crate::panel::limit_switch_rect(&DEMO, &rects, 1.0, 44);
-        assert_eq!((switch.width(), switch.height()), (74, 14), "24 + 6 + 44 wide, 14 tall");
-        assert_eq!(switch.right, rects.form.right, "the switch ends at the column's edge");
+        assert_eq!(
+            (switch.width(), switch.height()),
+            (74, 14),
+            "24 + 6 + 44 wide, 14 tall"
+        );
+        assert_eq!(
+            switch.right, rects.form.right,
+            "the switch ends at the column's edge"
+        );
         let track = crate::panel::limit_track_rect(switch, 1.0);
-        assert_eq!((track.width(), track.height()), (24, 14), ".switch-track (:297)");
+        assert_eq!(
+            (track.width(), track.height()),
+            (24, 14),
+            ".switch-track (:297)"
+        );
         let off = crate::panel::limit_knob_rect(track, 1.0, false);
-        assert_eq!((off.left - track.left, off.width()), (3, 8), "inset 3, knob 8 (:298)");
+        assert_eq!(
+            (off.left - track.left, off.width()),
+            (3, 8),
+            "inset 3, knob 8 (:298)"
+        );
         let on = crate::panel::limit_knob_rect(track, 1.0, true);
-        assert_eq!(on.right, track.right - 3, "the knob ends 3 in when on (:300)");
+        assert_eq!(
+            on.right,
+            track.right - 3,
+            "the knob ends 3 in when on (:300)"
+        );
 
         let line = crate::panel::field_rect(&DEMO, &rects, 1.0, crate::panel::Row::Quality);
         let label = crate::panel::limit_label_rect(&DEMO, &rects, 1.0);
-        assert_eq!((label.left, label.width()), (line.left, 34), "the reserved word (:646)");
+        assert_eq!(
+            (label.left, label.width()),
+            (line.left, 34),
+            "the reserved word (:646)"
+        );
         let input = crate::panel::limit_input_rect(&DEMO, &rects, 1.0);
-        assert_eq!(input.left, line.left + 34 + 6, "word, then the group's gap (:307)");
-        assert_eq!((input.width(), input.height()), (64, 28), ".limit-input (:310)");
-        assert_eq!((input.top, input.bottom), (line.top, line.bottom), "it fills the line");
+        assert_eq!(
+            input.left,
+            line.left + 34 + 6,
+            "word, then the group's gap (:307)"
+        );
+        assert_eq!(
+            (input.width(), input.height()),
+            (64, 28),
+            ".limit-input (:310)"
+        );
+        assert_eq!(
+            (input.top, input.bottom),
+            (line.top, line.bottom),
+            "it fills the line"
+        );
         let unit = crate::panel::limit_unit_rect(&DEMO, &rects, 1.0);
-        assert_eq!(unit.left, input.right + 6, "the unit after the input (:307)");
+        assert_eq!(
+            unit.left,
+            input.right + 6,
+            "the unit after the input (:307)"
+        );
 
         let note = crate::panel::limit_note_rect(&DEMO, &rects, 1.0);
-        assert_eq!((note.top, note.height()), (line.bottom + 8, 16), ".limit-note (:311)");
+        assert_eq!(
+            (note.top, note.height()),
+            (line.bottom + 8, 16),
+            ".limit-note (:311)"
+        );
         // The note's space is reserved, so the estimate moves down even with nothing to say.
         assert_eq!(crate::panel::quality_extra_height(1.0, false), 24, "8 + 16");
         let estimate = crate::panel::estimate_label_rect(&DEMO, &rects, 1.0, false);
@@ -2877,7 +2954,11 @@ mod tests {
             crate::panel::label_rect(&DEMO, &rects, 1.0, crate::panel::Row::Estimate).top + 24
         );
         let fill = crate::panel::fill_row_rect(&DEMO, &rects, 1.0);
-        assert_eq!(fill.top, note.bottom + 6, "the fill row sits under the note");
+        assert_eq!(
+            fill.top,
+            note.bottom + 6,
+            "the fill row sits under the note"
+        );
     }
 
     /// The quality line shows exactly one of its three things, and the limit wins.
@@ -2917,7 +2998,16 @@ mod tests {
     /// both: a word's antialiased edge is dimmer than its stroke, so the colour assertion is made on
     /// the darkest-or-brightest ink the rectangle actually contains.
     fn strongest(px: &Bgra8, rect: Rect, colour: Px) -> (Px, i32, i32) {
-        let mut best = (Px { b: 0, g: 0, r: 0, a: 255 }, 0, 0);
+        let mut best = (
+            Px {
+                b: 0,
+                g: 0,
+                r: 0,
+                a: 255,
+            },
+            0,
+            0,
+        );
         let mut best_distance = i32::MAX;
         for y in rect.top..rect.bottom {
             for x in rect.left..rect.right {
@@ -2956,7 +3046,11 @@ mod tests {
 
             // The label is a word, not a block: the box's far corner has to be the fill behind it.
             assert!(
-                close(px.pixel(label.right - 1, label.bottom - 1), fill_rgb(41, 41, 46), 12),
+                close(
+                    px.pixel(label.right - 1, label.bottom - 1),
+                    fill_rgb(41, 41, 46),
+                    12
+                ),
                 "the label's corner must stay the field's fill, so the ink is text rather than a slab"
             );
         }
@@ -3089,12 +3183,20 @@ mod tests {
         );
         // The three colours a border could be, taken from the rule itself rather than copied.
         let border_px: Vec<Px> = [
-            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface).border,
-            crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface).border,
-            crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface).border,
+            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface)
+                .border,
+            crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface)
+                .border,
+            crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface)
+                .border,
         ]
         .iter()
-        .map(|b| Px { b: b[2], g: b[1], r: b[0], a: b[3] })
+        .map(|b| Px {
+            b: b[2],
+            g: b[1],
+            r: b[0],
+            a: b[3],
+        })
         .collect();
         for x in field.left..field.right {
             assert_not_any(px, x, field.top, &border_px, 24, what);
@@ -3148,7 +3250,10 @@ mod tests {
     fn the_close_button_answers_only_inside_itself() {
         let rects = DEMO.rects(1.0);
         let button = rects.close;
-        let middle = ((button.left + button.right) / 2, (button.top + button.bottom) / 2);
+        let middle = (
+            (button.left + button.right) / 2,
+            (button.top + button.bottom) / 2,
+        );
         assert!(
             crate::panel::close_button_contains(&rects, 1.0, middle),
             "the middle of the button is a hit"
@@ -3232,8 +3337,16 @@ mod tests {
         // glyph gate carries all eleven messages (`overlay_drawn_strings` collects `copy`).
         let text = crate::copy::ValidationCopy::StemEmpty.message();
         for (level, colour, name) in [
-            (crate::copy::Level::Error, fill_rgb(255, 123, 123), "--danger"),
-            (crate::copy::Level::Warn, fill_rgb(240, 179, 90), "--warning"),
+            (
+                crate::copy::Level::Error,
+                fill_rgb(255, 123, 123),
+                "--danger",
+            ),
+            (
+                crate::copy::Level::Warn,
+                fill_rgb(240, 179, 90),
+                "--warning",
+            ),
         ] {
             let canvas = Canvas::new_at(1840, 1128, 192.0);
             let widths = canvas.render_status(Some((level, text)));
@@ -3312,7 +3425,10 @@ mod tests {
                 }
             }
         }
-        assert!(inked, "the value's band must carry ink, not just the menu's surface");
+        assert!(
+            inked,
+            "the value's band must carry ink, not just the menu's surface"
+        );
     }
 
     /// Without values the same band is the menu's own surface, which is what makes the assertion
@@ -3385,7 +3501,7 @@ mod tests {
         canvas.render_warn_hint(false);
         let px = canvas.pixels();
         let rect = crate::panel::warn_hint_rect(&DEMO, &DEMO.rects(2.0), 2.0);
-let surface = fill_rgb(23, 23, 28);
+        let surface = fill_rgb(23, 23, 28);
         let mut ink = Vec::new();
         for y in rect.top..rect.bottom {
             for x in rect.left..rect.right {
@@ -3425,7 +3541,12 @@ let surface = fill_rgb(23, 23, 28);
             &jpg,
             wx,
             wy,
-            Px { b: 255, g: 255, r: 255, a: 255 },
+            Px {
+                b: 255,
+                g: 255,
+                r: 255,
+                a: 255,
+            },
             8,
             "the first swatch is the white fill",
         );
@@ -3434,7 +3555,12 @@ let surface = fill_rgb(23, 23, 28);
             &jpg,
             bx,
             by,
-            Px { b: 0, g: 0, r: 0, a: 255 },
+            Px {
+                b: 0,
+                g: 0,
+                r: 0,
+                a: 255,
+            },
             8,
             "the second swatch is the black fill",
         );
@@ -3444,8 +3570,25 @@ let surface = fill_rgb(23, 23, 28);
         let (cx, cy) = centre(wheel);
         let seen = jpg.pixel(cx, cy);
         assert!(
-            !(close(seen, Px { b: 255, g: 255, r: 255, a: 255 }, 8)
-                || close(seen, Px { b: 0, g: 0, r: 0, a: 255 }, 8)),
+            !(close(
+                seen,
+                Px {
+                    b: 255,
+                    g: 255,
+                    r: 255,
+                    a: 255
+                },
+                8
+            ) || close(
+                seen,
+                Px {
+                    b: 0,
+                    g: 0,
+                    r: 0,
+                    a: 255
+                },
+                8
+            )),
             "the third swatch is the colour wheel, not white or black, saw {seen:?}"
         );
         assert!(
@@ -3461,8 +3604,25 @@ let surface = fill_rgb(23, 23, 28);
         let png = canvas.pixels();
         let seen = png.pixel(wx, wy);
         assert!(
-            !(close(seen, Px { b: 255, g: 255, r: 255, a: 255 }, 8)
-                || close(seen, Px { b: 0, g: 0, r: 0, a: 255 }, 8)),
+            !(close(
+                seen,
+                Px {
+                    b: 255,
+                    g: 255,
+                    r: 255,
+                    a: 255
+                },
+                8
+            ) || close(
+                seen,
+                Px {
+                    b: 0,
+                    g: 0,
+                    r: 0,
+                    a: 255
+                },
+                8
+            )),
             "a PNG panel has no fill row, so no swatch is drawn at ({wx},{wy}), saw {seen:?}"
         );
     }
@@ -3514,7 +3674,10 @@ let surface = fill_rgb(23, 23, 28);
                 }
             }
         }
-        assert!(painted, "the wand must be painted in --muted over the field's fill");
+        assert!(
+            painted,
+            "the wand must be painted in --muted over the field's fill"
+        );
         // The shape, stated as what braces are: two strokes with a gap between them. This used to
         // demand ink through the middle, which passed for the wrong reason: the button was placed
         // under the eighty dip format button, so the ink found inside its box was the format
@@ -3587,7 +3750,14 @@ let surface = fill_rgb(23, 23, 28);
             (icon.left, icon.bottom - 1),
             (icon.right - 1, icon.bottom - 1),
         ] {
-            assert_not_any(&px, x, y, &[want], 40, "a corner of the minimize glyph's box");
+            assert_not_any(
+                &px,
+                x,
+                y,
+                &[want],
+                40,
+                "a corner of the minimize glyph's box",
+            );
         }
     }
 
@@ -3638,7 +3808,8 @@ let surface = fill_rgb(23, 23, 28);
         let rects = DEMO.rects(1.0);
         let field = crate::panel::path_field_rect(&DEMO, &rects, 1.0, 56);
         let text = crate::panel::field::path_text_rect(&DEMO, &rects, 1.0, 56);
-        let idle = crate::panel::field_colours(crate::panel::FieldState::Idle, DEMO_PALETTE.surface);
+        let idle =
+            crate::panel::field_colours(crate::panel::FieldState::Idle, DEMO_PALETTE.surface);
         let want = Px {
             b: idle.text[2],
             g: idle.text[1],
@@ -3679,7 +3850,14 @@ let surface = fill_rgb(23, 23, 28);
             (field.left + 40, field.bottom - 1),
             (field.right - 40, field.top),
         ] {
-            assert_not_any(&px, x, y, &[ring], 6, "the directory row's border without focus");
+            assert_not_any(
+                &px,
+                x,
+                y,
+                &[ring],
+                6,
+                "the directory row's border without focus",
+            );
         }
     }
 
@@ -3738,8 +3916,20 @@ let surface = fill_rgb(23, 23, 28);
             );
             // The words are anti-aliased, so a stroke's core pixel is a rasteriser detail; what is
             // not a detail is which colour the glyph is painted in and which rectangle it lands in.
-            assert_ink(&px, label, word_on_surface, 12, "the cell's word is --muted over the surface (:237)");
-            assert_ink(&px, unit_rect, unit_on_fill, 12, "the cell's unit is --muted over the field fill (:244)");
+            assert_ink(
+                &px,
+                label,
+                word_on_surface,
+                12,
+                "the cell's word is --muted over the surface (:237)",
+            );
+            assert_ink(
+                &px,
+                unit_rect,
+                unit_on_fill,
+                12,
+                "the cell's unit is --muted over the field fill (:244)",
+            );
         }
     }
 
@@ -3809,17 +3999,43 @@ let surface = fill_rgb(23, 23, 28);
 
         let chosen = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, 0);
         let (cx, cy) = corner(chosen);
-        assert_px(&px, cx, cy, fill_rgb(31, 117, 219), 6, "the chosen option is --accent (:265)");
+        assert_px(
+            &px,
+            cx,
+            cy,
+            fill_rgb(31, 117, 219),
+            6,
+            "the chosen option is --accent (:265)",
+        );
 
         let other = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, 1);
         let (ox, oy) = corner(other);
-        assert_px(&px, ox, oy, fill_rgb(41, 41, 46), 6, "an unchosen option is the track's --fill (:263)");
+        assert_px(
+            &px,
+            ox,
+            oy,
+            fill_rgb(41, 41, 46),
+            6,
+            "an unchosen option is the track's --fill (:263)",
+        );
 
         // The track itself is filled even where no option is: the last inset's worth of pixels to
         // the right of the third option belongs to the track, not to the surface behind it.
-        let last = crate::panel::quality_option_rect(&DEMO, &rects, 1.0, crate::panel::QUALITY_OPTIONS - 1);
+        let last = crate::panel::quality_option_rect(
+            &DEMO,
+            &rects,
+            1.0,
+            crate::panel::QUALITY_OPTIONS - 1,
+        );
         let (lx, ly) = corner(last);
-        assert_px(&px, lx, ly, fill_rgb(41, 41, 46), 6, "the third option's cell is track fill (:263)");
+        assert_px(
+            &px,
+            lx,
+            ly,
+            fill_rgb(41, 41, 46),
+            6,
+            "the third option's cell is track fill (:263)",
+        );
         assert!(
             track.right > last.right,
             "the track has to extend past the last option, or the insets are not being applied"
@@ -3839,7 +4055,8 @@ let surface = fill_rgb(23, 23, 28);
         let canvas = Canvas::new(920, DEMO.panel_height());
         let rects = DEMO.rects(1.0);
         let corner = |index: usize| {
-            let rect = crate::panel::size_mode_button_rect(&DEMO, &rects, 1.0, SIZE_MODE_WIDTHS, index);
+            let rect =
+                crate::panel::size_mode_button_rect(&DEMO, &rects, 1.0, SIZE_MODE_WIDTHS, index);
             (rect.left + 2, rect.top + 2)
         };
 
@@ -3847,7 +4064,14 @@ let surface = fill_rgb(23, 23, 28);
         canvas.render_size_mode(0);
         let px = canvas.pixels();
         let (cx, cy) = corner(0);
-        assert_px(&px, cx, cy, fill_rgb(41, 41, 46), 6, "the chosen mode is --fill (:227)");
+        assert_px(
+            &px,
+            cx,
+            cy,
+            fill_rgb(41, 41, 46),
+            6,
+            "the chosen mode is --fill (:227)",
+        );
         let (ox, oy) = corner(1);
         assert_px(
             &px,
@@ -3869,7 +4093,14 @@ let surface = fill_rgb(23, 23, 28);
             6,
             "the formerly chosen mode loses its fill",
         );
-        assert_px(&px, ox, oy, fill_rgb(41, 41, 46), 6, "the newly chosen mode takes it");
+        assert_px(
+            &px,
+            ox,
+            oy,
+            fill_rgb(41, 41, 46),
+            6,
+            "the newly chosen mode takes it",
+        );
     }
     /// A click and the picture it produces, in one test. The state machine chooses the option and
     /// the painter is told that choice; splitting the two is how a control ends up clickable but
@@ -4013,7 +4244,14 @@ let surface = fill_rgb(23, 23, 28);
 
         canvas.render_format_index(0);
         let px = canvas.pixels();
-        assert_not_any(&px, probe.0, probe.1, &[accent], 16, "PNG draws no block (:639)");
+        assert_not_any(
+            &px,
+            probe.0,
+            probe.1,
+            &[accent],
+            16,
+            "PNG draws no block (:639)",
+        );
         let hint = crate::panel::quality_hint_rect(&DEMO, &rects, 2.0);
         assert!(
             any_close(&px, hint, fill_rgb(142, 142, 145), 24),
@@ -4060,7 +4298,6 @@ let surface = fill_rgb(23, 23, 28);
         }
     }
 
-
     /// The chosen option's word is `--text` while the others are `--muted` (`:266`, `:267`), so the
     /// brightest pixel of the chosen box is brighter than the brightest of an unchosen one. Both
     /// boxes are named, and swapping the two brushes — or dropping the word — fails here.
@@ -4072,9 +4309,7 @@ let surface = fill_rgb(23, 23, 28);
         canvas.render_format_index(1);
         let px = canvas.pixels();
         let rects = DEMO.rects(1.0);
-        let option = |index: usize| {
-            crate::panel::quality_option_rect(&DEMO, &rects, 1.0, index)
-        };
+        let option = |index: usize| crate::panel::quality_option_rect(&DEMO, &rects, 1.0, index);
         let chosen = brightest_inside(&px, option(0));
         let muted = brightest_inside(&px, option(1));
         assert!(
@@ -4084,11 +4319,11 @@ let surface = fill_rgb(23, 23, 28);
     }
     use super::*;
     use windows::Win32::Graphics::DirectWrite::DWRITE_FACTORY_TYPE_ISOLATED;
+    use windows::Win32::Graphics::DirectWrite::DWriteCreateFactory;
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
         DeleteDC, DeleteObject, SelectObject,
     };
-    use windows::Win32::Graphics::DirectWrite::DWriteCreateFactory;
 
     /// The layout is arithmetic, so the numbers the design states can be asserted without a device.
     #[test]
@@ -4097,8 +4332,16 @@ let surface = fill_rgb(23, 23, 28);
         // The footer is the last strip: 44 header + 4 body top + 460 preview + 56 footer (:94,
         // :100, :44, :274 with --btn-h: 32 at :50). The mock's 12px body bottom padding is the
         // footer's own top padding, not a fourth term.
-        assert_eq!(DEMO.panel_height(), 564, "44 header + 4 + 460 preview + 56 footer");
-        assert_eq!(DEMO.form_width(), 320, "920 - 32 padding - 556 preview - 12 gap");
+        assert_eq!(
+            DEMO.panel_height(),
+            564,
+            "44 header + 4 + 460 preview + 56 footer"
+        );
+        assert_eq!(
+            DEMO.form_width(),
+            320,
+            "920 - 32 padding - 556 preview - 12 gap"
+        );
     }
 
     #[test]
@@ -4106,13 +4349,24 @@ let surface = fill_rgb(23, 23, 28);
         let rects = DEMO.rects(1.0);
         assert_eq!(rects.header.bottom, 44, ".head is 44 dips tall");
         assert_eq!(rects.divider_y, 44);
-        assert_eq!(rects.preview.left, 16, "body padding is 16 dips on the left");
+        assert_eq!(
+            rects.preview.left, 16,
+            "body padding is 16 dips on the left"
+        );
         assert_eq!(rects.preview.top, 48, "header 44 + body padding 4");
         assert_eq!(rects.preview.width(), 556);
         assert_eq!(rects.preview.height(), 460);
-        assert_eq!(rects.form.left, 16 + 556 + 12, "preview, then the column gap");
+        assert_eq!(
+            rects.form.left,
+            16 + 556 + 12,
+            "preview, then the column gap"
+        );
         assert_eq!(rects.form.right, 920 - 16);
-        assert_eq!(rects.close.right, 920 - 16, "the close button hugs the right padding");
+        assert_eq!(
+            rects.close.right,
+            920 - 16,
+            "the close button hugs the right padding"
+        );
         assert_eq!(rects.close.width(), 26);
     }
 
@@ -4152,7 +4406,11 @@ let surface = fill_rgb(23, 23, 28);
         // The preview card's right edge is inside the window, and past it is still surface.
         let card_right = px(16 + 556);
         assert!(
-            (card_right - 3..=card_right + 3).any(|x| !close(view.pixel(x, px(300)), surface_px(), 6)),
+            (card_right - 3..=card_right + 3).any(|x| !close(
+                view.pixel(x, px(300)),
+                surface_px(),
+                6
+            )),
             "the preview card's right edge must be near {card_right} px"
         );
         assert!(
@@ -4169,11 +4427,7 @@ let surface = fill_rgb(23, 23, 28);
             a: 255,
         };
         assert!(
-            close(
-                view.pixel(px(584 + 40), px(44 + 4 + 22 + 6 + 16)),
-                fill,
-                8
-            ),
+            close(view.pixel(px(584 + 40), px(44 + 4 + 22 + 6 + 16)), fill, 8),
             "the first field must be drawn in the form column, not collapsed to a sliver"
         );
     }
@@ -4522,7 +4776,12 @@ let surface = fill_rgb(23, 23, 28);
     /// Some graphics are found by scanning rather than by naming a coordinate: a folder's stroke
     /// need not cross its box's centre, and guessing a coordinate would produce a test that either
     /// fails for the right reason today or passes for the wrong one tomorrow.
-    fn any_close(px: &Bgra8, rect: snapclip_model::geometry::Rect, want: Px, tolerance: i32) -> bool {
+    fn any_close(
+        px: &Bgra8,
+        rect: snapclip_model::geometry::Rect,
+        want: Px,
+        tolerance: i32,
+    ) -> bool {
         for y in rect.top..rect.bottom {
             for x in rect.left..rect.right {
                 if close(px.pixel(x, y), want, tolerance) {
@@ -4572,7 +4831,10 @@ let surface = fill_rgb(23, 23, 28);
             "the first chip carries the folder the mockup puts before its word (:1008)"
         );
         let chip = crate::panel::field::path_chip_rect(&DEMO, &rects, 2.0, &widths, 0);
-        assert_eq!(chip.left, rects.form.left, "the chips start at the column's edge (:548)");
+        assert_eq!(
+            chip.left, rects.form.left,
+            "the chips start at the column's edge (:548)"
+        );
     }
 
     fn assert_px(px: &Bgra8, x: i32, y: i32, want: Px, tolerance: i32, what: &str) {
@@ -4661,7 +4923,12 @@ let surface = fill_rgb(23, 23, 28);
             crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface);
         // The three states that do paint a border. Idle is not one of them (`:167`), which is why the
         // idle assertion is "none of these" rather than "not this colour".
-        let border_px = |c: [u8; 4]| Px { b: c[2], g: c[1], r: c[0], a: 255 };
+        let border_px = |c: [u8; 4]| Px {
+            b: c[2],
+            g: c[1],
+            r: c[0],
+            a: 255,
+        };
         let error =
             crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface);
         let warning =
@@ -4862,7 +5129,10 @@ let surface = fill_rgb(23, 23, 28);
                 expected
             );
             assert_eq!(height.top, width.top, "both cells sit on the same row");
-            assert!(width.right < height.left, "the link hub sits between the two cells (:246)");
+            assert!(
+                width.right < height.left,
+                "the link hub sits between the two cells (:246)"
+            );
             assert_eq!(
                 height.right, rects.form.right,
                 "the second cell ends at the form's right edge"
@@ -4877,14 +5147,29 @@ let surface = fill_rgb(23, 23, 28);
     #[test]
     fn the_first_form_slot_starts_where_the_design_puts_it() {
         let rects = DEMO.rects(1.0);
-        assert_eq!(rects.form.top, 48, ".body padding-top 4 under the 44 dip header (:100)");
-        assert_eq!(DEMO.text_row_height(), 60, "22 label + 6 gap + 32 field (:165, :164, :167)");
+        assert_eq!(
+            rects.form.top, 48,
+            ".body padding-top 4 under the 44 dip header (:100)"
+        );
+        assert_eq!(
+            DEMO.text_row_height(),
+            60,
+            "22 label + 6 gap + 32 field (:165, :164, :167)"
+        );
     }
 
     #[test]
     fn the_form_groups_are_sixteen_apart() {
-        assert_eq!(DEMO.text_row_pitch() - DEMO.text_row_height(), 12, ".form gap is 12px (:162)");
-        assert_eq!(DEMO.text_group_pitch() - DEMO.text_row_pitch(), 4, ".form-row.grp margin-top (:163)");
+        assert_eq!(
+            DEMO.text_row_pitch() - DEMO.text_row_height(),
+            12,
+            ".form gap is 12px (:162)"
+        );
+        assert_eq!(
+            DEMO.text_group_pitch() - DEMO.text_row_pitch(),
+            4,
+            ".form-row.grp margin-top (:163)"
+        );
         assert_eq!(
             DEMO.text_group_pitch() - DEMO.text_row_height(),
             16,
@@ -4902,7 +5187,11 @@ let surface = fill_rgb(23, 23, 28);
     /// the difference itself so that collapsing the two heights cannot pass unnoticed.
     #[test]
     fn a_text_row_and_a_row_of_design_height_are_not_interchangeable() {
-        assert_eq!(DEMO.text_row_height(), 60, "a row with a text field (:165, :164, :167)");
+        assert_eq!(
+            DEMO.text_row_height(),
+            60,
+            "a row with a text field (:165, :164, :167)"
+        );
         assert_eq!(
             crate::panel::ROW_DIP,
             28,
@@ -4918,7 +5207,11 @@ let surface = fill_rgb(23, 23, 28);
     #[test]
     fn the_form_column_ends_before_the_panel_padding() {
         let rects = DEMO.rects(1.0);
-        assert_eq!(rects.form.right, DEMO.panel_width - DEMO.pad_x, "right padding is 16 (:42)");
+        assert_eq!(
+            rects.form.right,
+            DEMO.panel_width - DEMO.pad_x,
+            "right padding is 16 (:42)"
+        );
     }
 
     #[test]
@@ -4934,7 +5227,16 @@ let surface = fill_rgb(23, 23, 28);
         let got = canvas.pixels().pixel(0, 0);
         // Deliberately not `fill_rgb`: this is the assertion that pins the channel order, and routing it
         // through the helper would make it compare the helper with itself.
-        assert_eq!(got, Px { b: 0, g: 0, r: 255, a: 255 }, "the DIB stores BGRA, blue first");
+        assert_eq!(
+            got,
+            Px {
+                b: 0,
+                g: 0,
+                r: 255,
+                a: 255
+            },
+            "the DIB stores BGRA, blue first"
+        );
     }
 
     #[test]
@@ -4945,7 +5247,10 @@ let surface = fill_rgb(23, 23, 28);
         // height, because the path row now carries a filled button and three chips where its
         // surface used to show.
         let got = canvas.pixels().pixel(700, 12);
-        assert!(close(got, surface_px(), 3), "the surface should be --surface: got {got:?}");
+        assert!(
+            close(got, surface_px(), 3),
+            "the surface should be --surface: got {got:?}"
+        );
     }
 
     #[test]
@@ -4955,10 +5260,18 @@ let surface = fill_rgb(23, 23, 28);
         let rects = DEMO.rects(1.0);
         let px = canvas.pixels();
         let above = px.pixel(400, rects.divider_y - 4);
-        assert!(close(above, surface_px(), 3), "above the divider is still surface: {above:?}");
-        let near: Vec<Px> = (-1..=1).map(|d| px.pixel(400, rects.divider_y + d)).collect();
+        assert!(
+            close(above, surface_px(), 3),
+            "above the divider is still surface: {above:?}"
+        );
+        let near: Vec<Px> = (-1..=1)
+            .map(|d| px.pixel(400, rects.divider_y + d))
+            .collect();
         let lit = near.iter().any(|p| !close(*p, surface_px(), 3));
-        assert!(lit, "one of the three rows at the divider must be the --line stroke: {near:?}");
+        assert!(
+            lit,
+            "one of the three rows at the divider must be the --line stroke: {near:?}"
+        );
     }
 
     #[test]
@@ -4969,14 +5282,20 @@ let surface = fill_rgb(23, 23, 28);
         let mid = rects.preview.top + rects.preview.height() / 2;
         let px = canvas.pixels();
         let outside = px.pixel(rects.preview.left - 4, mid);
-        assert!(close(outside, surface_px(), 3), "left of the card is the surface: {outside:?}");
-        let edge: Vec<Px> = (-1..=1).map(|d| px.pixel(rects.preview.left + d, mid)).collect();
+        assert!(
+            close(outside, surface_px(), 3),
+            "left of the card is the surface: {outside:?}"
+        );
+        let edge: Vec<Px> = (-1..=1)
+            .map(|d| px.pixel(rects.preview.left + d, mid))
+            .collect();
         let lit = edge.iter().any(|p| !close(*p, surface_px(), 3));
         assert!(lit, "the card's edge is drawn at x = 16: {edge:?}");
     }
 
     #[test]
-    fn the_title_is_drawn_inside_the_header() {        let canvas = Canvas::new(920, DEMO.panel_height());
+    fn the_title_is_drawn_inside_the_header() {
+        let canvas = Canvas::new(920, DEMO.panel_height());
         canvas.render();
         let rects = DEMO.rects(1.0);
         let px = canvas.pixels();
@@ -5008,27 +5327,55 @@ let surface = fill_rgb(23, 23, 28);
         );
         // The three colours a border could be, from the rule itself rather than a copy of it.
         let borders = [
-            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface).border,
-            crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface).border,
-            crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface).border,
+            crate::panel::field_colours(crate::panel::FieldState::Focused, DEMO_PALETTE.surface)
+                .border,
+            crate::panel::field_colours(crate::panel::FieldState::Error, DEMO_PALETTE.surface)
+                .border,
+            crate::panel::field_colours(crate::panel::FieldState::Warning, DEMO_PALETTE.surface)
+                .border,
         ];
 
         // The top edge, along its whole width.
         let border_px: Vec<Px> = borders
             .iter()
-            .map(|b| Px { b: b[2], g: b[1], r: b[0], a: b[3] })
+            .map(|b| Px {
+                b: b[2],
+                g: b[1],
+                r: b[0],
+                a: b[3],
+            })
             .collect();
         for x in field.left..field.right {
-            assert_not_any(&px, x, field.top, &border_px, 24, "the idle field's top edge");
+            assert_not_any(
+                &px,
+                x,
+                field.top,
+                &border_px,
+                24,
+                "the idle field's top edge",
+            );
         }
         // The left edge, down its whole height.
         for y in field.top..field.bottom {
-            assert_not_any(&px, field.left, y, &border_px, 24, "the idle field's left edge");
+            assert_not_any(
+                &px,
+                field.left,
+                y,
+                &border_px,
+                24,
+                "the idle field's left edge",
+            );
         }
         // And the interior is still the fill, so the test above is not passing because the field
         // was never painted at all.
-        let middle = px.pixel((field.left + field.right) / 2, (field.top + field.bottom) / 2);
-        assert!(close(middle, fill, 6), "the idle field is a fill: saw {middle:?}");
+        let middle = px.pixel(
+            (field.left + field.right) / 2,
+            (field.top + field.bottom) / 2,
+        );
+        assert!(
+            close(middle, fill, 6),
+            "the idle field is a fill: saw {middle:?}"
+        );
     }
 
     /// The inset is what keeps the rounded corner ours: the frame's own stroke must survive around
@@ -5056,8 +5403,11 @@ let surface = fill_rgb(23, 23, 28);
         );
         // The ring, at the inset the child window is placed by.
         assert!(
-            (field.top + ring - 1..=field.top + ring + 1)
-                .any(|y| close(px.pixel(mid_x, y), accent, 12)),
+            (field.top + ring - 1..=field.top + ring + 1).any(|y| close(
+                px.pixel(mid_x, y),
+                accent,
+                12
+            )),
             "the inset ring must sit {ring} px inside the edge (:169), as the child is placed: saw {:?}",
             px.pixel(mid_x, field.top + ring)
         );
@@ -5093,16 +5443,27 @@ let surface = fill_rgb(23, 23, 28);
         let big_ring = (crate::panel::EDIT_INSET_DIP * 2.0).round() as i32;
         let big_mid = (big_field.left + big_field.right) / 2;
         assert!(
-            (big_field.top..=big_field.top + 1).any(|y| close(big_px.pixel(big_mid, y), accent, 12)),
+            (big_field.top..=big_field.top + 1).any(|y| close(
+                big_px.pixel(big_mid, y),
+                accent,
+                12
+            )),
             "at 2x the accent border is on the edge"
         );
         assert!(
-            (big_field.top + big_ring - 1..=big_field.top + big_ring + 1)
-                .any(|y| close(big_px.pixel(big_mid, y), accent, 12)),
+            (big_field.top + big_ring - 1..=big_field.top + big_ring + 1).any(|y| close(
+                big_px.pixel(big_mid, y),
+                accent,
+                12
+            )),
             "at 2x the ring sits {big_ring} px inside the edge"
         );
         assert!(
-            !close(big_px.pixel(big_mid, big_field.top + big_ring / 2), accent, 12),
+            !close(
+                big_px.pixel(big_mid, big_field.top + big_ring / 2),
+                accent,
+                12
+            ),
             "at 2x the border and the ring are separate strokes, not one thick edge"
         );
     }
@@ -5184,7 +5545,10 @@ let surface = fill_rgb(23, 23, 28);
         // changes, which is the mistake the closed-loop cadence test made once already.
         let tile = 16;
         let at = |cx: i32, cy: i32| {
-            px.pixel(rects.preview.left + cx * tile + tile / 2, rects.preview.top + cy * tile + tile / 2)
+            px.pixel(
+                rects.preview.left + cx * tile + tile / 2,
+                rects.preview.top + cy * tile + tile / 2,
+            )
         };
         let light = fill_rgb(50, 54, 62);
         let dark = fill_rgb(33, 36, 42);
@@ -5194,14 +5558,26 @@ let surface = fill_rgb(23, 23, 28);
         let b = at(1, 0);
         let c = at(2, 0);
         let d = at(0, 1);
-        assert!(is_checker(a), "the first tile is one of the two checker colours: saw {a:?}");
-        assert!(is_checker(b), "the second tile is one of the two checker colours: saw {b:?}");
+        assert!(
+            is_checker(a),
+            "the first tile is one of the two checker colours: saw {a:?}"
+        );
+        assert!(
+            is_checker(b),
+            "the second tile is one of the two checker colours: saw {b:?}"
+        );
         assert!(
             !close(a, b, 6),
             "adjacent tiles must differ, saw {a:?} and {b:?} — a flat fill means no checkerboard"
         );
-        assert!(close(a, c, 6), "a tile two steps along is the same colour again: {a:?} vs {c:?}");
-        assert!(!close(a, d, 6), "the tile below is the other colour: {a:?} vs {d:?}");
+        assert!(
+            close(a, c, 6),
+            "a tile two steps along is the same colour again: {a:?} vs {c:?}"
+        );
+        assert!(
+            !close(a, d, 6),
+            "the tile below is the other colour: {a:?} vs {d:?}"
+        );
     }
 
     /// The card's border must survive its own checkerboard. The tiles are square and reach the card's
@@ -5233,9 +5609,21 @@ let surface = fill_rgb(23, 23, 28);
         );
         let samples = [
             ("top, past the left corner", (card.left + past, card.top), 1),
-            ("top, past the right corner", (card.right - past, card.top), 1),
-            ("bottom, past the left corner", (card.left + past, card.bottom), -1),
-            ("bottom, past the right corner", (card.right - past, card.bottom), -1),
+            (
+                "top, past the right corner",
+                (card.right - past, card.top),
+                1,
+            ),
+            (
+                "bottom, past the left corner",
+                (card.left + past, card.bottom),
+                -1,
+            ),
+            (
+                "bottom, past the right corner",
+                (card.right - past, card.bottom),
+                -1,
+            ),
         ];
         // What the edge must be, named exactly: `--line` is white at thirty percent alpha, so over a
         // tile it is a blend, and either tile may lie under any given sample. Excluding the fills was
@@ -5328,8 +5716,22 @@ let surface = fill_rgb(23, 23, 28);
         let at = |sx: i32, sy: i32| (left.round() as i32 + sx, top.round() as i32 + sy);
         let (rx, ry) = at(20, 20);
         let (bx, by) = at(w as i32 - 20, h as i32 - 20);
-        assert_px(&px, rx, ry, red, 12, "the picture's top left quadrant is where the capture put it");
-        assert_px(&px, bx, by, blue, 12, "the picture's bottom right quadrant is where the capture put it");
+        assert_px(
+            &px,
+            rx,
+            ry,
+            red,
+            12,
+            "the picture's top left quadrant is where the capture put it",
+        );
+        assert_px(
+            &px,
+            bx,
+            by,
+            blue,
+            12,
+            "the picture's bottom right quadrant is where the capture put it",
+        );
     }
 }
 
@@ -5451,7 +5853,11 @@ mod preview_fit_tests {
     #[test]
     fn a_wide_image_touches_the_sides_and_is_centred() {
         let (x, y, right, bottom) = fit_preview((1000.0, 500.0), (0.0, 0.0, 400.0, 300.0));
-        assert_eq!((x, right), (0.0, 400.0), "the width is the binding constraint");
+        assert_eq!(
+            (x, right),
+            (0.0, 400.0),
+            "the width is the binding constraint"
+        );
         assert_eq!(y, 50.0, "leftover height is split evenly");
         assert_eq!(bottom, 250.0);
     }
@@ -5460,7 +5866,11 @@ mod preview_fit_tests {
     #[test]
     fn a_tall_image_touches_the_top_and_bottom() {
         let (x, y, right, bottom) = fit_preview((300.0, 900.0), (0.0, 0.0, 400.0, 300.0));
-        assert_eq!((y, bottom), (0.0, 300.0), "the height is the binding constraint");
+        assert_eq!(
+            (y, bottom),
+            (0.0, 300.0),
+            "the height is the binding constraint"
+        );
         assert_eq!((x, right), (150.0, 250.0), "leftover width is split evenly");
     }
 
@@ -5476,14 +5886,24 @@ mod preview_fit_tests {
     #[test]
     fn the_placement_is_relative_to_the_card_origin() {
         let (x, y, right, bottom) = fit_preview((200.0, 100.0), (16.0, 48.0, 416.0, 348.0));
-        assert_eq!((x, y), (116.0, 148.0), "centred inside a card that starts at its own corner");
+        assert_eq!(
+            (x, y),
+            (116.0, 148.0),
+            "centred inside a card that starts at its own corner"
+        );
         assert_eq!((right, bottom), (316.0, 248.0));
     }
 
     /// A degenerate source or card yields an empty rectangle rather than a panic or a huge scale.
     #[test]
     fn a_degenerate_input_yields_nothing_to_draw() {
-        assert_eq!(fit_preview((0.0, 10.0), (0.0, 0.0, 400.0, 300.0)), (0.0, 0.0, 0.0, 0.0));
-        assert_eq!(fit_preview((10.0, 10.0), (5.0, 5.0, 5.0, 5.0)), (5.0, 5.0, 5.0, 5.0));
+        assert_eq!(
+            fit_preview((0.0, 10.0), (0.0, 0.0, 400.0, 300.0)),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+        assert_eq!(
+            fit_preview((10.0, 10.0), (5.0, 5.0, 5.0, 5.0)),
+            (5.0, 5.0, 5.0, 5.0)
+        );
     }
 }

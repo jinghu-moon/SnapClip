@@ -68,7 +68,9 @@ impl WebpSink {
                 height: meta.height,
             })?;
         if meta.width == 0 || meta.height == 0 {
-            return Err(ExportError::Sink("a 0-sided image has no WebP encoding".into()));
+            return Err(ExportError::Sink(
+                "a 0-sided image has no WebP encoding".into(),
+            ));
         }
         let pixels = meta.width.saturating_mul(meta.height);
         if pixels > MAX_PIXELS {
@@ -193,7 +195,7 @@ mod tests {
             for x in 0..width {
                 let clear = (x + y) % 4 == 0;
                 out.extend_from_slice(&[
-                    250,          // B, deliberately loud under the transparent pixels
+                    250,                // B, deliberately loud under the transparent pixels
                     30 + (y % 7) as u8, // G
                     200,
                     if clear { 0 } else { 255 },

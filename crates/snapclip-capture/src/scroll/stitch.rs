@@ -15,10 +15,10 @@
 //! a fixed bar on that side appears once. The band is the reference's choice (`snow_shot`'s
 //! `compositor.rs`): `max(H/2, growth + H/4)`, at most `H`.
 
+pub(crate) use super::store::Budgets;
 pub(crate) use super::store::CanvasStore;
 #[cfg(test)]
 pub(crate) use super::store::MemoryCanvas;
-pub(crate) use super::store::Budgets;
 #[cfg(feature = "test-support")]
 pub(crate) use super::store::MoveCounters;
 
@@ -125,7 +125,10 @@ impl<C: CanvasStore> Stitcher<C> {
             let growth = (cand + view - known) as u32;
             let band = self.band(growth) as usize;
             // The last `band` rows of the newest frame replace the previous copy of the edge.
-            if !self.store.append(growth, &frame[(self.view as usize - band) * row..]) {
+            if !self
+                .store
+                .append(growth, &frame[(self.view as usize - band) * row..])
+            {
                 return Placement::Full;
             }
             self.pos = self.store.rows() - self.view;
@@ -277,9 +280,15 @@ mod tests {
             preallocated.place(&window(&page, W, top, H), 60);
         }
         let reserved = preallocated.counters();
-        assert_eq!(reserved.grow_moves, 0, "no reallocation after reserving: {reserved:?}");
+        assert_eq!(
+            reserved.grow_moves, 0,
+            "no reallocation after reserving: {reserved:?}"
+        );
         assert_eq!(reserved.shift_moves, 0);
-        assert!(preallocated.canvas() == down.canvas(), "the pixels are the same");
+        assert!(
+            preallocated.canvas() == down.canvas(),
+            "the pixels are the same"
+        );
 
         // An upward step past the canvas top is the shift.
         let mut up = Stitcher::new(&window(&page, W, 1000, H), W, H, 32 * H);
@@ -587,7 +596,13 @@ mod tests {
         let first = frame_at(&page, start);
         let inner: Box<dyn CanvasStore> = match store {
             Store::Memory => Box::new(MemoryCanvas::new(&first, W, H, max_rows)),
-            Store::Backed => Box::new(super::super::backed::BackedCanvas::new(&first, W, H, max_rows)),
+            Store::Backed => Box::new(super::super::backed::BackedCanvas::new(
+                &first,
+                W,
+                H,
+                max_rows,
+                snapclip_model::PixelFormat::Bgra8Unorm,
+            )),
         };
         let mut subject = Stitcher::with_store(inner, W, H);
         let mut oracle = Reference::new(&first, W, H, max_rows);
@@ -599,13 +614,31 @@ mod tests {
             let frame = frame_at(&page, next as u32);
             let placed = subject.place(&frame, dy);
             let expected = oracle.place(&frame, dy);
-            assert_eq!(placed, expected, "{store:?}: placement differs at shift {index} ({dy})");
-            assert_eq!(subject.pos(), oracle.pos, "{store:?}: viewport row at shift {index}");
-            assert_eq!(subject.top(), oracle.top, "{store:?}: content origin at shift {index}");
-            assert_eq!(subject.rows(), oracle.rows, "{store:?}: image height at shift {index}");
+            assert_eq!(
+                placed, expected,
+                "{store:?}: placement differs at shift {index} ({dy})"
+            );
+            assert_eq!(
+                subject.pos(),
+                oracle.pos,
+                "{store:?}: viewport row at shift {index}"
+            );
+            assert_eq!(
+                subject.top(),
+                oracle.top,
+                "{store:?}: content origin at shift {index}"
+            );
+            assert_eq!(
+                subject.rows(),
+                oracle.rows,
+                "{store:?}: image height at shift {index}"
+            );
             let rows = subject.rows();
             let mut pixels = vec![0u8; rows as usize * row];
-            subject.store().read_rows(0, rows, &mut pixels).expect("rows");
+            subject
+                .store()
+                .read_rows(0, rows, &mut pixels)
+                .expect("rows");
             assert!(
                 pixels == oracle.canvas,
                 "{store:?}: pixels differ at shift {index} ({dy})"
@@ -651,7 +684,11 @@ mod tests {
     fn a_sequence_that_hits_the_row_cap_matches_the_oracle() {
         let shifts = [80, 80, 80, 80];
         let (_, rows) = equivalence(0, &shifts, H + 160);
-        assert_eq!(rows, H + 160, "growth stops at the cap, and both agree on where");
+        assert_eq!(
+            rows,
+            H + 160,
+            "growth stops at the cap, and both agree on where"
+        );
     }
 
     /// The same six sequences over the backed store: same placements, same pixels, so the tile
@@ -661,7 +698,11 @@ mod tests {
         let cases: [(u32, Vec<i32>, u32); 5] = [
             (0, vec![60; 12], 32 * H),
             (1000, vec![-50; 8], 32 * H),
-            (1000, vec![60, 60, -70, -50, 80, -90, 40, -30, -30, 50, -110, 70], 64 * H),
+            (
+                1000,
+                vec![60, 60, -70, -50, 80, -90, 40, -30, -30, 50, -110, 70],
+                64 * H,
+            ),
             (500, vec![10, -10, 0, 5, -5, 3, -3], 32 * H),
             (0, vec![80, 80, 80, 80], H + 160),
         ];

@@ -83,7 +83,11 @@ mod tests {
     fn a_transcode_is_the_format_it_was_asked_for() {
         let jpeg = to_bytes(&master(), SaveFormat::Jpeg, 92).expect("a jpeg");
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "a JPEG begins with SOI");
-        assert_ne!(&jpeg[..4], b"\x89PNG", "and not with the master's signature");
+        assert_ne!(
+            &jpeg[..4],
+            b"\x89PNG",
+            "and not with the master's signature"
+        );
     }
 
     /// The quality setting reaches the encoder instead of being accepted and ignored: two tiers

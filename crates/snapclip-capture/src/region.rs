@@ -110,7 +110,6 @@ impl Region {
     }
 }
 
-
 impl Region {
     pub fn swapped(self) -> Self {
         Self {
@@ -306,14 +305,46 @@ pub const RADIUS_MAX_PX: i32 = 128;
 
 /// 菜单里除「无比例」之外的项，顺序就是下拉顺序。
 pub const RATIOS: [Ratio; 8] = [
-    Ratio { name: "1:1", w: 1, h: 1 },
-    Ratio { name: "4:3", w: 4, h: 3 },
-    Ratio { name: "3:4", w: 3, h: 4 },
-    Ratio { name: "16:9", w: 16, h: 9 },
-    Ratio { name: "9:16", w: 9, h: 16 },
-    Ratio { name: "3:2", w: 3, h: 2 },
-    Ratio { name: "2:3", w: 2, h: 3 },
-    Ratio { name: "21:9", w: 21, h: 9 },
+    Ratio {
+        name: "1:1",
+        w: 1,
+        h: 1,
+    },
+    Ratio {
+        name: "4:3",
+        w: 4,
+        h: 3,
+    },
+    Ratio {
+        name: "3:4",
+        w: 3,
+        h: 4,
+    },
+    Ratio {
+        name: "16:9",
+        w: 16,
+        h: 9,
+    },
+    Ratio {
+        name: "9:16",
+        w: 9,
+        h: 16,
+    },
+    Ratio {
+        name: "3:2",
+        w: 3,
+        h: 2,
+    },
+    Ratio {
+        name: "2:3",
+        w: 2,
+        h: 3,
+    },
+    Ratio {
+        name: "21:9",
+        w: 21,
+        h: 9,
+    },
 ];
 
 /// 比例菜单的项数：「无比例」+ [`RATIOS`]。
@@ -451,7 +482,10 @@ impl PanelSlot {
 
     /// 下一个 / 上一个槽，两端回卷。
     pub fn step(self, forward: bool) -> Self {
-        let index = Self::ORDER.iter().position(|slot| *slot == self).unwrap_or(0);
+        let index = Self::ORDER
+            .iter()
+            .position(|slot| *slot == self)
+            .unwrap_or(0);
         let count = Self::ORDER.len();
         let next = if forward {
             (index + 1) % count
@@ -771,7 +805,11 @@ impl RegionPanel {
         // 缓冲换成提交后的读数：用户看到的数和他敲的数在两种单位下都一致。
         // 光标**留在用户放的地方**（只 clamp）：不然在中间插一位就会跳到末尾。
         let text = next.shown(field, self.unit, dpi).to_string();
-        let caret = self.editing.as_ref().map_or(0, |edit| edit.caret).min(text.len());
+        let caret = self
+            .editing
+            .as_ref()
+            .map_or(0, |edit| edit.caret)
+            .min(text.len());
         self.editing = Some(FieldText { field, text, caret });
         Some(next)
     }
@@ -801,7 +839,7 @@ impl RegionPanel {
         if let Some(_field) = slot.field() {
             self.focus_slot(slot);
             self.begin_edit(region, dpi);
-            
+
             return PanelChange::Repaint;
         }
         self.focus_slot(slot);
@@ -855,14 +893,8 @@ impl RegionPanel {
                         }
                     }
                     return match self.commit(region, dpi) {
-                        Some(next) => {
-                            
-                            PanelChange::Region(next)
-                        }
-                        None => {
-                            
-                            PanelChange::Repaint
-                        }
+                        Some(next) => PanelChange::Region(next),
+                        None => PanelChange::Repaint,
                     };
                 }
                 PanelKey::Backspace => {
@@ -873,16 +905,17 @@ impl RegionPanel {
                             edit.text.remove(edit.caret);
                         }
                     }
-                    if self.editing.as_ref().is_some_and(|edit| edit.text.is_empty()) {
+                    if self
+                        .editing
+                        .as_ref()
+                        .is_some_and(|edit| edit.text.is_empty())
+                    {
                         // 空输入不改区域：留着空格子等用户接着敲。
-                        
+
                         return PanelChange::Repaint;
                     }
                     return match self.commit(region, dpi) {
-                        Some(next) => {
-                            
-                            PanelChange::Region(next)
-                        }
+                        Some(next) => PanelChange::Region(next),
                         None => PanelChange::Repaint,
                     };
                 }
@@ -992,12 +1025,12 @@ impl RegionPanel {
                 }
                 PanelSlot::Center => {
                     let next = region.centered(self.screen);
-                    
+
                     PanelChange::Region(next)
                 }
                 PanelSlot::Origin => {
                     let next = region.at_origin(self.screen);
-                    
+
                     PanelChange::Region(next)
                 }
                 slot => match slot.toggle() {
@@ -1056,7 +1089,6 @@ mod tests {
         assert_eq!(desktop.to_rect(origin), rect, "换回本屏像素要回到原矩形");
     }
 
-
     #[test]
     fn the_image_summary_follows_the_unit_and_says_when_there_is_none() {
         let mut panel = panel();
@@ -1080,9 +1112,19 @@ mod tests {
         panel.set_radius(999, region());
         assert_eq!(panel.radius_px(), 128);
         // 短边先到顶：1000×300 ⇒ 75；100×40 ⇒ 10。
-        let wide = Region { width: 1000, height: 300, x: 0, y: 0 };
+        let wide = Region {
+            width: 1000,
+            height: 300,
+            x: 0,
+            y: 0,
+        };
         assert_eq!(wide.radius_max(), 75);
-        let small = Region { width: 100, height: 40, x: 0, y: 0 };
+        let small = Region {
+            width: 100,
+            height: 40,
+            x: 0,
+            y: 0,
+        };
         assert_eq!(small.radius_max(), 10);
         panel.set_radius(999, small);
         assert_eq!(panel.radius_px(), 10);
@@ -1094,16 +1136,48 @@ mod tests {
         // 点一下滑块把它聚焦（点数字格以外的地方也一样：`click` 只负责聚焦 + Enter）。
         panel.click(PanelSlot::Radius, region(), 96);
         assert_eq!(panel.focus(), PanelSlot::Radius);
-        assert_eq!(panel.key(PanelKey::Enter, region(), 96), PanelChange::None, "滑块不提交");
-        assert_eq!(panel.key(PanelKey::Right, region(), 96), PanelChange::Radius(1));
-        assert_eq!(panel.key(PanelKey::Up, region(), 96), PanelChange::Radius(2));
-        assert_eq!(panel.key(PanelKey::PageUp, region(), 96), PanelChange::Radius(10));
-        assert_eq!(panel.key(PanelKey::PageDown, region(), 96), PanelChange::Radius(2));
-        assert_eq!(panel.key(PanelKey::Left, region(), 96), PanelChange::Radius(1));
-        assert_eq!(panel.key(PanelKey::Down, region(), 96), PanelChange::Radius(0));
-        assert_eq!(panel.key(PanelKey::Down, region(), 96), PanelChange::Radius(0), "0 是地板");
-        assert_eq!(panel.key(PanelKey::End, region(), 96), PanelChange::Radius(128));
-        assert_eq!(panel.key(PanelKey::Home, region(), 96), PanelChange::Radius(0));
+        assert_eq!(
+            panel.key(PanelKey::Enter, region(), 96),
+            PanelChange::None,
+            "滑块不提交"
+        );
+        assert_eq!(
+            panel.key(PanelKey::Right, region(), 96),
+            PanelChange::Radius(1)
+        );
+        assert_eq!(
+            panel.key(PanelKey::Up, region(), 96),
+            PanelChange::Radius(2)
+        );
+        assert_eq!(
+            panel.key(PanelKey::PageUp, region(), 96),
+            PanelChange::Radius(10)
+        );
+        assert_eq!(
+            panel.key(PanelKey::PageDown, region(), 96),
+            PanelChange::Radius(2)
+        );
+        assert_eq!(
+            panel.key(PanelKey::Left, region(), 96),
+            PanelChange::Radius(1)
+        );
+        assert_eq!(
+            panel.key(PanelKey::Down, region(), 96),
+            PanelChange::Radius(0)
+        );
+        assert_eq!(
+            panel.key(PanelKey::Down, region(), 96),
+            PanelChange::Radius(0),
+            "0 是地板"
+        );
+        assert_eq!(
+            panel.key(PanelKey::End, region(), 96),
+            PanelChange::Radius(128)
+        );
+        assert_eq!(
+            panel.key(PanelKey::Home, region(), 96),
+            PanelChange::Radius(0)
+        );
     }
 
     #[test]
@@ -1114,7 +1188,11 @@ mod tests {
         panel.key(PanelKey::Enter, region(), 96);
         assert!(!panel.image_open(), "再按一次收起");
         panel.key(PanelKey::Tab, region(), 96);
-        assert_eq!(panel.focus(), PanelSlot::Cancel, "收起时跳过圆角，直接到取消");
+        assert_eq!(
+            panel.focus(),
+            PanelSlot::Cancel,
+            "收起时跳过圆角，直接到取消"
+        );
         panel.toggle_image();
         panel.click(PanelSlot::Image, region(), 96);
         panel.toggle_image();
@@ -1242,12 +1320,7 @@ mod tests {
     ///
     /// 面板现在是普通文本框语义（聚焦落在末尾、光标可移），所以测试里"直接敲一个数字就替换整格"
     /// 的写法不再成立；清空必须真的逐字符删（docs/23 §14.55）。
-    fn retype(
-        panel: &mut RegionPanel,
-        region: Region,
-        slot: PanelSlot,
-        digits: &str,
-    ) -> Region {
+    fn retype(panel: &mut RegionPanel, region: Region, slot: PanelSlot, digits: &str) -> Region {
         let mut region = region;
         panel.click(slot, region, 96);
         for _ in 0..8 {
@@ -1285,7 +1358,11 @@ mod tests {
         region = pick_menu(&mut panel, region, 4);
         assert_eq!(panel.ratio().map(|ratio| ratio.name), Some("16:9"));
         assert!(panel.locked());
-        assert_eq!((region.width, region.height), (1370, 771), "1370×9/16 四舍五入");
+        assert_eq!(
+            (region.width, region.height),
+            (1370, 771),
+            "1370×9/16 四舍五入"
+        );
 
         // 改宽：高跟着比例走。
         region = retype(&mut panel, region, PanelSlot::Width, "800");
@@ -1315,7 +1392,10 @@ mod tests {
         let PanelChange::Region(swapped) = panel.click(PanelSlot::Swap, region, 96) else {
             panic!("交换要给新区域");
         };
-        assert_eq!((swapped.width, swapped.height), (region.height, region.width));
+        assert_eq!(
+            (swapped.width, swapped.height),
+            (region.height, region.width)
+        );
         assert_eq!(panel.ratio().map(|ratio| ratio.name), Some("1:1"));
 
         // 16:9 → 9:16。
@@ -1353,14 +1433,22 @@ mod tests {
         let PanelChange::Region(swapped) = panel.click(PanelSlot::Swap, region, 96) else {
             panic!("交换要给新区域");
         };
-        assert_eq!((swapped.x, swapped.y), (region.x, region.y), "位置一毫米都没动");
+        assert_eq!(
+            (swapped.x, swapped.y),
+            (region.x, region.y),
+            "位置一毫米都没动"
+        );
     }
 
     #[test]
     fn the_destination_defaults_to_copy_and_drives_the_footer_readout() {
         let mut panel = RegionPanel::new(LengthUnit::Px, Delay::ALL[0], screen(), 8);
         let region = region();
-        assert_eq!(panel.destination(), Destination::Copy, "默认与确定一直以来的行为一致");
+        assert_eq!(
+            panel.destination(),
+            Destination::Copy,
+            "默认与确定一直以来的行为一致"
+        );
         assert_eq!(panel.readout(region, 96), "将复制 1370×824 px");
 
         panel.choose_destination(Destination::Pin);
@@ -1382,7 +1470,11 @@ mod tests {
         // 菜单里打勾的项跟着走。
         assert_eq!(Ratio::menu_index(panel.ratio()), 4);
         assert_eq!(Ratio::at_menu(4).map(|ratio| ratio.name), Some("16:9"));
-        assert_eq!(Ratio::at_menu(0), None, "第 0 项是无比例，没有「0:0」这种伪值");
+        assert_eq!(
+            Ratio::at_menu(0),
+            None,
+            "第 0 项是无比例，没有「0:0」这种伪值"
+        );
         assert_eq!(RATIO_MENU_LEN, 9);
         let _ = region;
     }
@@ -1431,7 +1523,11 @@ mod tests {
         assert_eq!(panel.unit(), LengthUnit::Dp, "两项之间来回，越界回卷");
         panel.key(PanelKey::Left, region, 96);
         assert_eq!(panel.unit(), LengthUnit::Px);
-        assert_eq!(panel.focus(), PanelSlot::Unit, "方向键换的是组内选项，不是焦点");
+        assert_eq!(
+            panel.focus(),
+            PanelSlot::Unit,
+            "方向键换的是组内选项，不是焦点"
+        );
     }
 
     #[test]
@@ -1490,7 +1586,10 @@ mod tests {
         assert_eq!(keys.menu(), None);
         // Esc 先收下拉，再按一次才是取消这次截图。
         panel.click(PanelSlot::Ratio, region, 96);
-        assert_eq!(panel.key(PanelKey::Escape, region, 96), PanelChange::Repaint);
+        assert_eq!(
+            panel.key(PanelKey::Escape, region, 96),
+            PanelChange::Repaint
+        );
         assert_eq!(panel.menu(), None);
         assert_eq!(panel.key(PanelKey::Escape, region, 96), PanelChange::Cancel);
     }
@@ -1507,7 +1606,10 @@ mod tests {
         };
         let picked = pick_menu(&mut panel, region, 8);
         assert_eq!(panel.ratio().map(|ratio| ratio.name), Some("21:9"));
-        assert!(picked.width <= 3840 && picked.height <= 2160, "必须在小屏幕里");
+        assert!(
+            picked.width <= 3840 && picked.height <= 2160,
+            "必须在小屏幕里"
+        );
         let lhs = i64::from(picked.width) * 9;
         let rhs = i64::from(picked.height) * 21;
         assert!(
@@ -1575,10 +1677,7 @@ mod tests {
             y: 0,
         };
         // 页脚那句由此刻的区域现算，所以这里只断言它算得对。
-        assert_eq!(
-            panel.status(tiny, 96).as_deref(),
-            Some("宽和高要大于 1")
-        );
+        assert_eq!(panel.status(tiny, 96).as_deref(), Some("宽和高要大于 1"));
         assert_eq!(panel.status(region(), 96), None);
     }
 
@@ -1643,7 +1742,11 @@ mod tests {
         panel.set_unit(LengthUnit::Px);
         assert_eq!(panel.field_text(RegionField::Width, region, 144), "1370");
         assert_eq!(panel.unit(), LengthUnit::Px);
-        assert_eq!(panel.editing(), None, "换单位丢掉半截输入，避免把旧单位的数字当新单位的");
+        assert_eq!(
+            panel.editing(),
+            None,
+            "换单位丢掉半截输入，避免把旧单位的数字当新单位的"
+        );
     }
 
     #[test]
@@ -1694,7 +1797,12 @@ mod char_entry_tests {
     fn anything_that_is_not_a_digit_is_refused() {
         // 负号、小数点、字母、空格、控制字符都不进数字格（数字格的规则没变，见 `RegionPanel::key`）。
         let refused = [
-            '-', '.', 'a', 'Z', ' ', '中',
+            '-',
+            '.',
+            'a',
+            'Z',
+            ' ',
+            '中',
             char::from_u32(8).unwrap(),
             char::from_u32(13).unwrap(),
             char::from_u32(27).unwrap(),

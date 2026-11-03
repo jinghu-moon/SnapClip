@@ -1,10 +1,9 @@
 use super::{SegmentState, segment_outer_radius, segment_radius, segment_slide};
 use snapclip_model::geometry::Rect;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
-    D2D_SIZE_U, D2D_RECT_F,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED,
+    D2D1_PIXEL_FORMAT,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_INTERPOLATION_MODE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1DeviceContext,
@@ -13,6 +12,7 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_TEXT_METRICS, IDWriteFactory, IDWriteTextFormat,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::Result;
 
 /// How wide a string lays out, in pixels, at the given format.
@@ -27,9 +27,7 @@ pub fn measure_text(
     format: &IDWriteTextFormat,
 ) -> Result<DWRITE_TEXT_METRICS> {
     let wide = text.encode_utf16().collect::<Vec<_>>();
-    let layout = unsafe {
-        dwrite.CreateTextLayout(&wide, format, f32::INFINITY, f32::INFINITY)?
-    };
+    let layout = unsafe { dwrite.CreateTextLayout(&wide, format, f32::INFINITY, f32::INFINITY)? };
     let mut metrics = DWRITE_TEXT_METRICS::default();
     unsafe { layout.GetMetrics(&mut metrics)? };
     Ok(metrics)
@@ -211,13 +209,8 @@ macro_rules! impl_paint_target {
                     dpiX: 96.0,
                     dpiY: 96.0,
                 };
-                let size = D2D_SIZE_U {
-                    width,
-                    height,
-                };
-                unsafe {
-                    base.CreateBitmap(size, Some(pixels.as_ptr().cast()), pitch, &props)
-                }
+                let size = D2D_SIZE_U { width, height };
+                unsafe { base.CreateBitmap(size, Some(pixels.as_ptr().cast()), pitch, &props) }
             }
         }
     };

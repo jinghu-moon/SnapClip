@@ -153,7 +153,11 @@ mod tests {
     /// keeps. Changing the spec means changing this number **and** the code, which is the point.
     #[test]
     fn the_plan_and_the_code_agree_on_the_count() {
-        assert_eq!(ValidationCopy::ALL.len(), 11, "docs/41 §0.3 lists eleven messages");
+        assert_eq!(
+            ValidationCopy::ALL.len(),
+            11,
+            "docs/41 §0.3 lists eleven messages"
+        );
     }
 
     /// Two rules that read the same would be indistinguishable to a user and to a test.
@@ -164,7 +168,10 @@ mod tests {
             let message = copy.message();
             assert!(!message.is_empty(), "{copy:?} has no wording");
             assert_eq!(message.trim(), message, "{copy:?} has stray whitespace");
-            assert!(seen.insert(message), "{copy:?} repeats another message: {message}");
+            assert!(
+                seen.insert(message),
+                "{copy:?} repeats another message: {message}"
+            );
         }
         assert_eq!(seen.len(), 11);
     }
@@ -189,7 +196,10 @@ mod tests {
     fn warnings_carry_a_repair() {
         assert_eq!(ValidationCopy::DirectoryMissing.repair(), Some("立即创建"));
         assert_eq!(ValidationCopy::StemIllegalChars.repair(), Some("替换为 _"));
-        assert_eq!(ValidationCopy::StemTrailingDotOrSpace.repair(), Some("去掉"));
+        assert_eq!(
+            ValidationCopy::StemTrailingDotOrSpace.repair(),
+            Some("去掉")
+        );
         for copy in [
             ValidationCopy::PathEmpty,
             ValidationCopy::PathNotAbsolute,
@@ -236,11 +246,18 @@ mod tests {
                 copy.message()
             );
             if let Some(repair) = copy.repair() {
-                assert!(spec.contains(repair), "{copy:?} offers a repair the spec does not");
+                assert!(
+                    spec.contains(repair),
+                    "{copy:?} offers a repair the spec does not"
+                );
             }
         }
         for link in [ConflictLink::Overwrite, ConflictLink::Rename] {
-            assert!(spec.contains(link.text()), "the spec does not offer {:?}", link);
+            assert!(
+                spec.contains(link.text()),
+                "the spec does not offer {:?}",
+                link
+            );
         }
     }
 }

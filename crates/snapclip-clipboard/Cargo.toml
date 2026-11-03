@@ -1,0 +1,30 @@
+[package]
+name = "snapclip-clipboard"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+snapclip-model = { path = "../snapclip-model" }
+serde_json = "1"
+blake3 = "1.5"
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "webp"] }
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+url = "2"
+rclip-rtf = { version = "0.1", features = ["std", "codepage"] }
+encoding_rs = "0.8"
+[target.'cfg(not(windows))'.dependencies]
+arboard = "3.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem",
+  "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory",
+  "Win32_System_Ole", "Win32_System_Threading", "Win32_UI_Controls",
+  "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+png = "0.18"

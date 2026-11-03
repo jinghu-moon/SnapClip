@@ -20,20 +20,19 @@ use std::ffi::c_void;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CombineRgn, CreateCompatibleDC, CreateDIBSection, CreateRectRgn, DeleteDC,
-    DeleteObject, GetDC, ReleaseDC, SelectObject, SetWindowRgn, AC_SRC_ALPHA, AC_SRC_OVER,
-    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC,
-    RGN_DIFF, SRCCOPY,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, BitBlt,
+    CAPTUREBLT, CombineRgn, CreateCompatibleDC, CreateDIBSection, CreateRectRgn, DIB_RGB_COLORS,
+    DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, RGN_DIFF, ReleaseDC, SRCCOPY, SelectObject,
+    SetWindowRgn,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowRect, PeekMessageW,
-    RegisterClassW, SetWindowPos, ShowWindow, UnregisterClassW, UpdateLayeredWindow, MSG,
-    PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOW, ULW_ALPHA,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowRect, MSG,
+    PM_REMOVE, PeekMessageW, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SetWindowPos, ShowWindow, ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow,
     WM_QUIT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
-
 
 /// 让本进程与产品一致地 per-monitor-v2 感知。
 ///
@@ -42,7 +41,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 /// 取到的多半是桌面（上一轮"逐字节相同"的结论就是这么来的）。
 fn be_dpi_aware() {
     use windows_sys::Win32::UI::HiDpi::{
-        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
@@ -130,7 +129,10 @@ impl Layered {
                 0,
             )
         };
-        assert!(!bitmap.is_null() && !bits.is_null(), "CreateDIBSection 失败");
+        assert!(
+            !bitmap.is_null() && !bits.is_null(),
+            "CreateDIBSection 失败"
+        );
         unsafe { SelectObject(memory_dc, bitmap as _) };
 
         let mut window = Self {
@@ -245,14 +247,34 @@ fn screen_mean(rect: (i32, i32, i32, i32)) -> [f64; 3] {
     let memory = unsafe { CreateCompatibleDC(screen) };
     let mut bits: *mut c_void = std::ptr::null_mut();
     let bitmap = unsafe {
-        CreateDIBSection(memory, &info, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0)
+        CreateDIBSection(
+            memory,
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     assert!(!bitmap.is_null() && !bits.is_null(), "观测用 DIB 创建失败");
     unsafe { SelectObject(memory, bitmap as _) };
-    let ok = unsafe { BitBlt(memory, 0, 0, width, height, screen, left, top, SRCCOPY | CAPTUREBLT) };
+    let ok = unsafe {
+        BitBlt(
+            memory,
+            0,
+            0,
+            width,
+            height,
+            screen,
+            left,
+            top,
+            SRCCOPY | CAPTUREBLT,
+        )
+    };
     assert_ne!(ok, 0, "BitBlt 失败：{}", unsafe { GetLastError() });
 
-    let pixels = unsafe { std::slice::from_raw_parts(bits.cast::<u32>(), (width * height) as usize) };
+    let pixels =
+        unsafe { std::slice::from_raw_parts(bits.cast::<u32>(), (width * height) as usize) };
     let mut sum = [0f64; 3];
     for pixel in pixels {
         sum[0] += (pixel & 0xff) as f64;
@@ -367,12 +389,7 @@ fn a_pin_style_layered_window_shows_what_a_dim_style_one_does_not() {
         unsafe {
             let outer = CreateRectRgn(0, 0, width, height);
             let hole = CreateRectRgn(40, 30, width - 40, height - 30);
-            CombineRgn(
-                outer,
-                outer,
-                hole,
-                RGN_DIFF,
-            );
+            CombineRgn(outer, outer, hole, RGN_DIFF);
             SetWindowRgn(subject.hwnd, outer, 1);
         }
     }
@@ -418,12 +435,7 @@ fn a_pin_style_layered_window_shows_what_a_dim_style_one_does_not() {
         unsafe {
             let outer = CreateRectRgn(0, 0, width, height);
             let hole = CreateRectRgn(40, 30, width - 40, height - 30);
-            CombineRgn(
-                outer,
-                outer,
-                hole,
-                RGN_DIFF,
-            );
+            CombineRgn(outer, outer, hole, RGN_DIFF);
             SetWindowRgn(subject.hwnd, outer, 1);
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity(
                 subject.hwnd,
@@ -486,14 +498,21 @@ fn the_probe_itself_can_see_a_plain_window() {
             std::ptr::null_mut(),
         )
     };
-    assert!(!hwnd.is_null(), "CreateWindowExW 失败：{}", unsafe { GetLastError() });
+    assert!(!hwnd.is_null(), "CreateWindowExW 失败：{}", unsafe {
+        GetLastError()
+    });
 
     // 让它画一次（背景刷在 WM_ERASEBKGND 里由 DefWindowProc 用类刷子填）。
     unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 1) };
     pump(300);
 
     let rect = {
-        let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let mut rect = windows_sys::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
         unsafe { GetWindowRect(hwnd, &mut rect) };
         (rect.left, rect.top, rect.right, rect.bottom)
     };
@@ -510,7 +529,6 @@ fn the_probe_itself_can_see_a_plain_window() {
         UnregisterClassW(name.as_ptr(), instance);
     }
 }
-
 
 // ── 屏幕级证据：圆角在屏幕上真的透出桌面（docs/23 §14.55.18）────────────────
 
@@ -546,7 +564,11 @@ fn write_bgra(window: &Layered, bgra: &[u8]) {
     }
 }
 
-fn pixel_of(bitmap: &snapclip_capture::windows::win::bitblt::CapturedBitmap, x: u32, y: u32) -> [u8; 4] {
+fn pixel_of(
+    bitmap: &snapclip_capture::windows::win::bitblt::CapturedBitmap,
+    x: u32,
+    y: u32,
+) -> [u8; 4] {
     let index = ((y * bitmap.width + x) * 4) as usize;
     [
         bitmap.pixels[index],
@@ -620,7 +642,10 @@ fn a_rounded_pin_shows_the_desktop_through_its_corners() {
     let expected = [CONTENT[2], CONTENT[1], CONTENT[0], 255];
     let centre = pixel_of(&rounded, w / 2, h / 2);
     eprintln!("[centre] shown={centre:?} content={expected:?}");
-    assert!(close(centre, expected, 2), "中心应是内容色：{centre:?} ≠ {expected:?}");
+    assert!(
+        close(centre, expected, 2),
+        "中心应是内容色：{centre:?} ≠ {expected:?}"
+    );
 
     let mut blended = 0;
     for yy in 0..(RADIUS + 12).min(h) {

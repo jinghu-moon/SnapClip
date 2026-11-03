@@ -18,10 +18,7 @@ fn a_rectangle_owns_its_left_and_top_but_not_its_right_and_bottom() {
         !rect_contains(rect, (30, 39)),
         "the right edge belongs to the next box"
     );
-    assert!(
-        !rect_contains(rect, (29, 40)),
-        "so does the bottom edge"
-    );
+    assert!(!rect_contains(rect, (29, 40)), "so does the bottom edge");
     assert!(!rect_contains(rect, (9, 20)));
 }
 
@@ -317,12 +314,19 @@ fn the_minimize_button_answers_only_inside_itself() {
     for scale in [1.0_f32, 1.25, 1.5, 2.0] {
         let rects = metrics.rects(scale);
         let button = rects.minimize;
-        let middle = ((button.left + button.right) / 2, (button.top + button.bottom) / 2);
+        let middle = (
+            (button.left + button.right) / 2,
+            (button.top + button.bottom) / 2,
+        );
         assert!(
             minimize_button_contains(&rects, scale, middle),
             "the middle of the button is the button at {scale}"
         );
-        assert!(minimize_button_contains(&rects, scale, (button.left, button.top)));
+        assert!(minimize_button_contains(
+            &rects,
+            scale,
+            (button.left, button.top)
+        ));
         assert!(
             !minimize_button_contains(&rects, scale, (button.left - 1, middle.1)),
             "one pixel left of the button is not the button at {scale}"
@@ -360,7 +364,10 @@ fn a_native_control_is_inset_and_centred_at_its_text_height() {
     // every test, which is how the square corners survived the first time.
     let scaled = Rect::new(150, 300, 480, 372);
     let wide = edit_control_rect(scaled, 24, 1.5);
-    assert_eq!(wide.left, 153, "two dip at one and a half scale is three pixels");
+    assert_eq!(
+        wide.left, 153,
+        "two dip at one and a half scale is three pixels"
+    );
     assert_eq!(wide.right, 477, "and the same on the other side");
     // The height is the font's, so the text is not pushed against an edge: the two gaps above and
     // below are equal save for the rounding an odd remainder forces.
@@ -396,7 +403,10 @@ fn the_after_save_switches_are_hit_where_they_are_drawn() {
     let metrics = DEMO;
     for scale in [1.0f32, 1.25, 1.5, 2.0] {
         let rects = metrics.rects(scale);
-        let chips = AfterChips { label: (40.0 * scale).round() as i32, widths: [(52.0 * scale).round() as i32, (64.0 * scale).round() as i32] };
+        let chips = AfterChips {
+            label: (40.0 * scale).round() as i32,
+            widths: [(52.0 * scale).round() as i32, (64.0 * scale).round() as i32],
+        };
         for index in 0..2 {
             let rect = chips.rect(&metrics, &rects, scale, index);
             let middle = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
@@ -409,17 +419,32 @@ fn the_after_save_switches_are_hit_where_they_are_drawn() {
         let first = chips.rect(&metrics, &rects, scale, 0);
         let second = chips.rect(&metrics, &rects, scale, 1);
         assert_eq!(
-            chips.at(&metrics, &rects, scale, (first.right, (first.top + first.bottom) / 2)),
+            chips.at(
+                &metrics,
+                &rects,
+                scale,
+                (first.right, (first.top + first.bottom) / 2)
+            ),
             None,
             "the right edge is the gap, not the next switch, at {scale}"
         );
         assert_eq!(
-            chips.at(&metrics, &rects, scale, (second.left, (second.top + second.bottom) / 2)),
+            chips.at(
+                &metrics,
+                &rects,
+                scale,
+                (second.left, (second.top + second.bottom) / 2)
+            ),
             Some(1),
             "the next switch starts at its own left edge, at {scale}"
         );
         assert_eq!(
-            chips.at(&metrics, &rects, scale, (second.right + 8, (second.top + second.bottom) / 2)),
+            chips.at(
+                &metrics,
+                &rects,
+                scale,
+                (second.right + 8, (second.top + second.bottom) / 2)
+            ),
             None,
             "a point past the last switch hits neither at {scale}"
         );

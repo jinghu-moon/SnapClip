@@ -300,11 +300,20 @@ mod preference_tests {
     #[test]
     fn a_hand_edited_quality_is_clamped_not_rejected() {
         // A settings file is not a place to fail a capture: clamp and carry on.
-        let low = SavePreferences { format: SaveFormat::Jpeg, jpeg_quality: 0 };
+        let low = SavePreferences {
+            format: SaveFormat::Jpeg,
+            jpeg_quality: 0,
+        };
         assert_eq!(low.quality(), MIN_JPEG_QUALITY);
-        let high = SavePreferences { format: SaveFormat::Jpeg, jpeg_quality: 255 };
+        let high = SavePreferences {
+            format: SaveFormat::Jpeg,
+            jpeg_quality: 255,
+        };
         assert_eq!(high.quality(), MAX_JPEG_QUALITY);
-        let fine = SavePreferences { format: SaveFormat::Jpeg, jpeg_quality: 85 };
+        let fine = SavePreferences {
+            format: SaveFormat::Jpeg,
+            jpeg_quality: 85,
+        };
         assert_eq!(fine.quality(), 85);
     }
 

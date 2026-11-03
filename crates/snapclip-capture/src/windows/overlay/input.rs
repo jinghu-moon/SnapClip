@@ -7,7 +7,7 @@
 
 use super::*;
 
-use crate::geometry::{region_panel_layout, RegionPanelLayout, RegionPanelTarget};
+use crate::geometry::{RegionPanelLayout, RegionPanelTarget, region_panel_layout};
 use crate::region::{Delay, Destination, PanelChange, PanelKey, Region};
 use crate::units::LengthUnit;
 
@@ -51,10 +51,12 @@ pub(super) fn selection_cursor(geometry: SelectionGeometry) -> *const u16 {
         | SelectionGeometry::Resize(Handle::BottomRight) => IDC_SIZENWSE,
         SelectionGeometry::Resize(Handle::TopRight)
         | SelectionGeometry::Resize(Handle::BottomLeft) => IDC_SIZENESW,
-        SelectionGeometry::Resize(Handle::Top)
-        | SelectionGeometry::Resize(Handle::Bottom) => IDC_SIZENS,
-        SelectionGeometry::Resize(Handle::Left)
-        | SelectionGeometry::Resize(Handle::Right) => IDC_SIZEWE,
+        SelectionGeometry::Resize(Handle::Top) | SelectionGeometry::Resize(Handle::Bottom) => {
+            IDC_SIZENS
+        }
+        SelectionGeometry::Resize(Handle::Left) | SelectionGeometry::Resize(Handle::Right) => {
+            IDC_SIZEWE
+        }
         SelectionGeometry::Move => IDC_SIZEALL,
         SelectionGeometry::Create | SelectionGeometry::Outside => IDC_CROSS,
     }
@@ -163,13 +165,11 @@ impl OverlayController {
                         ResizeMode::Handle(Handle::BottomRight),
                         true,
                     );
-                    self.session
-                        .pointer_moved_with_constraints(point, shift);
+                    self.session.pointer_moved_with_constraints(point, shift);
                     self.disarm_dwell();
                 }
                 MoveOutcome::Dragging => {
-                    self.session
-                        .pointer_moved_with_constraints(point, shift);
+                    self.session.pointer_moved_with_constraints(point, shift);
                 }
             }
             self.update_cursor_shape(point);
@@ -202,11 +202,7 @@ impl OverlayController {
                 | Some(RegionPanelTarget::Delay(_))
                 | Some(RegionPanelTarget::MenuItem(_))
         );
-        let cursor = if on_control {
-            IDC_HAND
-        } else {
-            IDC_ARROW
-        };
+        let cursor = if on_control { IDC_HAND } else { IDC_ARROW };
         unsafe { SetCursor(LoadCursorW(null_mut(), cursor) as _) };
         true
     }
@@ -1002,8 +998,7 @@ impl OverlayController {
 
     /// 会话能接受的最小选区：面板描红用的是同一条规则，不另说一套。
     fn minimum_selection(&self) -> i32 {
-        crate::geometry::SelectionSnapshot::new(Rect::default(), self.session.dpi())
-            .minimum_size()
+        crate::geometry::SelectionSnapshot::new(Rect::default(), self.session.dpi()).minimum_size()
     }
 
     /// The panel's layout as of this moment (docs/23 §14.54).
@@ -1051,7 +1046,10 @@ impl OverlayController {
         let dpi = self.session.dpi();
         let region = self.region_now();
         // 分段器换了选项就起一次平移（快照前后值，谁变了给谁起，点选与键盘同一条路）。
-        let before = self.region_panel.as_ref().map(|panel| (panel.unit(), panel.delay()));
+        let before = self
+            .region_panel
+            .as_ref()
+            .map(|panel| (panel.unit(), panel.delay()));
         let change = match layout.target_at(point) {
             None | Some(RegionPanelTarget::MenuPadding) => return,
             Some(RegionPanelTarget::Unit(unit)) => {
@@ -1251,7 +1249,10 @@ impl OverlayController {
         let SelectionGeometry::Resize(handle) = self.session.pointer_hit(point) else {
             return;
         };
-        if !self.session.begin_drag(point, ResizeMode::Handle(handle), false) {
+        if !self
+            .session
+            .begin_drag(point, ResizeMode::Handle(handle), false)
+        {
             return;
         }
         // 唯一的 `SetCapture`（docs/23 §14.55.9.3）：HUD 的窗口只在选框环上存在，往外拖时指针
@@ -1324,9 +1325,9 @@ impl OverlayController {
 
 #[cfg(test)]
 mod tests {
-    use super::{nudge_point, OverlayController};
-    use crate::keymap::{Chord, Context, Key, Keymap};
+    use super::{OverlayController, nudge_point};
     use crate::CaptureState;
+    use crate::keymap::{Chord, Context, Key, Keymap};
     use crate::units::LabelDisplay;
     use windows_sys::Win32::Foundation::POINT;
 
@@ -1546,7 +1547,10 @@ mod tests {
         }
         controller.run_action(Action::OpenSavePanel);
 
-        let saves = sink.saves.lock().expect("the recording sink is not poisoned");
+        let saves = sink
+            .saves
+            .lock()
+            .expect("the recording sink is not poisoned");
         assert_eq!(
             saves.len(),
             1,
@@ -1570,7 +1574,10 @@ mod tests {
         // Idle: no selection, and `panel_entry_available` refuses, so the action is a no-op.
         controller.run_action(Action::OpenSavePanel);
 
-        let saves = sink.saves.lock().expect("the recording sink is not poisoned");
+        let saves = sink
+            .saves
+            .lock()
+            .expect("the recording sink is not poisoned");
         assert!(
             saves.is_empty(),
             "an idle session has no pixels to save and must not ask the shell"
@@ -1603,7 +1610,10 @@ mod tests {
         // Idle, so there is no selection of this session's own, but the slot is not empty.
         controller.request_save();
 
-        let saves = sink.saves.lock().expect("the recording sink is not poisoned");
+        let saves = sink
+            .saves
+            .lock()
+            .expect("the recording sink is not poisoned");
         assert!(
             saves.is_empty(),
             "a session with no selection must not hand over the previous session's pixels"
@@ -1622,7 +1632,10 @@ mod tests {
             controller.session.has_selection(),
             "the fixture must reach the branch with a selection"
         );
-        assert!(!controller.pending_save, "nothing is armed before the action runs");
+        assert!(
+            !controller.pending_save,
+            "nothing is armed before the action runs"
+        );
 
         controller.run_action(Action::OpenSavePanel);
 
@@ -1642,7 +1655,10 @@ mod tests {
         use crate::keymap::Action;
 
         let mut controller = controller_for_tests();
-        assert!(!controller.session.has_selection(), "the bare fixture has no selection");
+        assert!(
+            !controller.session.has_selection(),
+            "the bare fixture has no selection"
+        );
 
         controller.run_action(Action::OpenSavePanel);
 
@@ -1711,10 +1727,20 @@ mod tests {
 
     #[test]
     fn the_panel_entry_needs_a_live_selection() {
-        for state in [CaptureState::Idle, CaptureState::Preparing, CaptureState::Annotating] {
-            assert!(!OverlayController::panel_entry_available(state, true), "{state:?}");
+        for state in [
+            CaptureState::Idle,
+            CaptureState::Preparing,
+            CaptureState::Annotating,
+        ] {
+            assert!(
+                !OverlayController::panel_entry_available(state, true),
+                "{state:?}"
+            );
         }
-        assert!(!OverlayController::panel_entry_available(CaptureState::Selecting, false));
+        assert!(!OverlayController::panel_entry_available(
+            CaptureState::Selecting,
+            false
+        ));
     }
 
     #[test]

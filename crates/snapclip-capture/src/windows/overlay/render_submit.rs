@@ -6,7 +6,6 @@
 
 use super::*;
 
-
 use crate::geometry::region_panel_layout;
 use crate::region::{Ratio, Region, RegionField};
 use crate::units::LabelToggle;
@@ -133,7 +132,10 @@ impl OverlayController {
         if self.advance_segment_slides() {
             self.dirty = true;
         }
-        if self.precision_feedback_until.is_some_and(|until| Instant::now() >= until) {
+        if self
+            .precision_feedback_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
             self.precision_feedback_until = None;
             self.dirty = true;
         }
@@ -187,10 +189,8 @@ impl OverlayController {
         );
         Some(RegionPanelView {
             values: RegionField::ALL.map(|field| (field, panel.field_text(field, region, dpi))),
-            invalid: RegionField::ALL.map(|field| {
-                problem
-                    .is_some_and(|problem| problem.fields().contains(&field))
-            }),
+            invalid: RegionField::ALL
+                .map(|field| problem.is_some_and(|problem| problem.fields().contains(&field))),
             hover: self
                 .cursor_visible
                 .then(|| rects.target_at(self.cursor))
@@ -309,7 +309,10 @@ impl OverlayController {
                 self.frames_normal += 1;
                 // 可见性读数：如果普通帧全在窗口隐藏之后，那"灰底"就不是普通帧，得换方向查。
                 // `self.window` 是 windows-sys 的 `HWND`（裸指针），所以这里用同一族的 IsWindowVisible。
-                if unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.window) } != 0 {
+                if unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(self.window)
+                } != 0
+                {
                     self.frames_normal_visible += 1;
                 }
             }

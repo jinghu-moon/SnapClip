@@ -32,13 +32,13 @@
 //! (0.9729 versus 0.9968) and 13 % larger. The crate keeps `TrellisConfig` private, so a controlled
 //! trellis arm cannot be built from outside; that is why this sink does not claim one.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use zenjpeg::encoder::{ChromaSubsampling, EncoderConfig, PixelLayout, Stop as JpegStop};
 
 use super::row_band_png::{Artifact, ExportError, ImageMeta};
-use super::save_format::{within_jpeg_frame_budget, SaveFormat, JPEG_FRAME_BUDGET_PIXELS};
+use super::save_format::{JPEG_FRAME_BUDGET_PIXELS, SaveFormat, within_jpeg_frame_budget};
 
 /// The quality `docs/34` §11 selected: q95 and q85 are both worse trades for UI material.
 pub const JPEG_QUALITY: u8 = 92;
@@ -83,7 +83,9 @@ impl JpgRowBandSink {
     /// 30000 rows tall: the first names the real reason, the second names a limit it never reached.
     pub fn begin(&mut self, meta: &ImageMeta) -> Result<JpgRowBandWriter, ExportError> {
         if meta.width == 0 || meta.height == 0 {
-            return Err(ExportError::Sink("a 0-sided image has no JPEG encoding".into()));
+            return Err(ExportError::Sink(
+                "a 0-sided image has no JPEG encoding".into(),
+            ));
         }
         SaveFormat::Jpeg
             .can_encode(meta.width, meta.height)
@@ -281,10 +283,7 @@ mod tests {
         assert_eq!(pixels.len(), 160 * 120 * 4);
         // Baseline SOF0, not progressive SOF2 (docs/34 §9: streaming is baseline only anyway).
         assert!(
-            !artifact
-                .bytes
-                .windows(2)
-                .any(|pair| pair == [0xFF, 0xC2]),
+            !artifact.bytes.windows(2).any(|pair| pair == [0xFF, 0xC2]),
             "progressive markers must not appear"
         );
     }
@@ -383,7 +382,9 @@ mod tests {
         let mut sink = JpgRowBandSink::new();
         let meta = meta(64, 64);
         let mut writer = sink.begin(&meta).expect("begin");
-        writer.write_rows(0, &vec![0x80u8; 64 * 4 * 64]).expect("rows");
+        writer
+            .write_rows(0, &vec![0x80u8; 64 * 4 * 64])
+            .expect("rows");
         writer.cancel();
         let error = writer.finish().unwrap_err();
         assert!(

@@ -21,11 +21,11 @@
 //! effect performs *inside* the offscreen render, where it needs no target state at all.
 
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
-    D2D1_PIXEL_FORMAT, D2D_SIZE_U,
+    D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
+    D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D12DAffineTransform, CLSID_D2D1ColorMatrix,
+    CLSID_D2D1ColorMatrix, CLSID_D2D12DAffineTransform,
     D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX, D2D1_BITMAP_OPTIONS_TARGET,
     D2D1_BITMAP_PROPERTIES1, D2D1_COLORMATRIX_PROP_COLOR_MATRIX,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_PROPERTY_TYPE_UNKNOWN, ID2D1Bitmap1,
@@ -34,7 +34,8 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmapSource, IWICImagingFactory,
-    IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+    IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
+    WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, IStream,
@@ -315,11 +316,26 @@ impl PanelIcons {
         let scale = |value: f32| value * colour.a;
         // `D2D1_MATRIX_5X4_F` is five rows of four: four channel mixes and a bias row.
         let matrix: [f32; 20] = [
-            scale(colour.r), 0.0, 0.0, 0.0, //
-            0.0, scale(colour.g), 0.0, 0.0, //
-            0.0, 0.0, scale(colour.b), 0.0, //
-            0.0, 0.0, 0.0, colour.a, //
-            0.0, 0.0, 0.0, 0.0,
+            scale(colour.r),
+            0.0,
+            0.0,
+            0.0, //
+            0.0,
+            scale(colour.g),
+            0.0,
+            0.0, //
+            0.0,
+            0.0,
+            scale(colour.b),
+            0.0, //
+            0.0,
+            0.0,
+            0.0,
+            colour.a, //
+            0.0,
+            0.0,
+            0.0,
+            0.0,
         ];
         unsafe {
             tint.SetInput(0, source, true);

@@ -88,10 +88,13 @@ mod tests {
                 band: 404,
             }),
         );
-        stats.record(&shift(-60), Some(&Placement::Prepended {
-            growth: 60,
-            band: 404,
-        }));
+        stats.record(
+            &shift(-60),
+            Some(&Placement::Prepended {
+                growth: 60,
+                band: 404,
+            }),
+        );
         stats.record(&shift(7), Some(&Placement::Contained));
         stats.record(&shift(93), Some(&Placement::Full));
         stats.record(

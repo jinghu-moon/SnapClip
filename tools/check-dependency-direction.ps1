@@ -13,31 +13,29 @@
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tools/check-dependency-direction.ps1
-#   powershell ... -File tools/check-dependency-direction.ps1 -Package snapclip   # negative control
+#   powershell ... -File tools/check-dependency-direction.ps1 -Package snapclip-app   # negative control
 #
 # Exits non-zero and prints every offending edge.
 
 param(
     # Check one package instead of the whole invariant set. Used as the negative control:
-    # `-Package snapclip` must fail, because the shell *does* depend on Tauri.
+    # `-Package snapclip-app` must fail because the shell depends on GPUI and capabilities.
     [string]$Package
 )
 
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
-# Per crate: names that may never appear in its normal dependency graph.
-#
-# The list differs by crate on purpose. `rusqlite` is forbidden in capture (screenshots do
-# not touch the database) but is exactly what history is for; `arboard` is forbidden in
-# both because owning the clipboard belongs to the shell. Capability crates never depend
-# on each other: the shell wires them.
+# Capability crates may depend on a shared clipboard service, never on sibling views.
+# Pin is now a GPUI feature (docs/52); clipboard/model/history remain UI-free.
 $SHELL_ONLY = @("snapclip-app", "tauri", "wry", "gpui", "gpui-pre", "gpui-kit", "gpui-base", "gpui-component", "yue-component")
+$APP_ONLY = @("snapclip-app", "tauri", "wry")
 $FORBIDDEN = @{
-    "snapclip-pin"     = $SHELL_ONLY + @("rusqlite", "arboard", "snapclip-capture", "snapclip-history", "snapclip-recognize")
-    "snapclip-capture" = $SHELL_ONLY + @("snapclip-pin", "rusqlite", "arboard", "snapclip-history", "snapclip-recognize")
-    "snapclip-history" = $SHELL_ONLY + @("snapclip-pin", "arboard", "snapclip-capture", "snapclip-recognize")
-    "snapclip-model"   = $SHELL_ONLY + @("snapclip-pin", "rusqlite", "arboard", "image", "windows", "windows-sys", "snapclip-capture", "snapclip-history", "snapclip-recognize")
+    "snapclip-pin" = $APP_ONLY + @("rusqlite", "arboard", "snapclip-clipboard", "snapclip-capture", "snapclip-history", "snapclip-recognize")
+    "snapclip-clipboard" = $SHELL_ONLY + @("rusqlite", "snapclip-pin", "snapclip-capture", "snapclip-history", "snapclip-recognize", "snapclip-ui")
+    "snapclip-capture" = $SHELL_ONLY + @("snapclip-pin", "snapclip-clipboard", "rusqlite", "arboard", "snapclip-history", "snapclip-recognize")
+    "snapclip-history" = $SHELL_ONLY + @("snapclip-pin", "snapclip-capture", "snapclip-recognize")
+    "snapclip-model" = $SHELL_ONLY + @("snapclip-pin", "snapclip-clipboard", "rusqlite", "arboard", "image", "windows", "windows-sys", "snapclip-capture", "snapclip-history", "snapclip-recognize")
 }
 
 # `snapclip-model` is the bottom of the graph: value types and `serde`, nothing else.
@@ -64,7 +62,7 @@ function Get-PackageNames([string[]]$lines) {
 
 $failures = New-Object System.Collections.Generic.List[string]
 
-$targets = if ($Package) { @($Package) } else { @("snapclip-capture", "snapclip-history", "snapclip-model", "snapclip-pin") }
+$targets = if ($Package) { @($Package) } else { @("snapclip-capture", "snapclip-history", "snapclip-model", "snapclip-pin", "snapclip-clipboard") }
 
 foreach ($target in $targets) {
     $lines = Get-TreeLines $target
@@ -75,11 +73,11 @@ foreach ($target in $targets) {
         # `-Package <other>` (the negative control): apply the strictest list.
         $forbidden_for_target = $SHELL_ONLY + @("snapclip-capture", "snapclip-history", "snapclip-recognize")
     }
-    foreach ($forbidden in $forbidden_for_target) {
+    foreach ($dependency in $forbidden_for_target) {
         # The first line of `cargo tree` is the package itself, not a dependency.
-        if ($forbidden -eq $target) { continue }
-        if ($names.Contains($forbidden)) {
-            $failures.Add("$target depends on $forbidden")
+        if ($dependency -eq $target) { continue }
+        if ($names.Contains($dependency)) {
+            $failures.Add("$target depends on $dependency")
         }
     }
 

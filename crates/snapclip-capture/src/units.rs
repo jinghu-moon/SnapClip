@@ -96,7 +96,11 @@ pub fn px_to_dip(px: i32, dpi: u32) -> i32 {
     let dpi = i64::from(dpi.max(96));
     let scaled = i64::from(px) * 96;
     let half = dpi / 2;
-    let rounded = if scaled < 0 { scaled - half } else { scaled + half };
+    let rounded = if scaled < 0 {
+        scaled - half
+    } else {
+        scaled + half
+    };
     (rounded / dpi) as i32
 }
 
@@ -108,7 +112,11 @@ pub fn dip_to_px(dip: i32, dpi: u32) -> i32 {
     let dpi = i64::from(dpi.max(96));
     let scaled = i64::from(dip) * dpi;
     let half = 96 / 2;
-    let rounded = if scaled < 0 { scaled - half } else { scaled + half };
+    let rounded = if scaled < 0 {
+        scaled - half
+    } else {
+        scaled + half
+    };
     (rounded / 96) as i32
 }
 
@@ -230,7 +238,7 @@ impl LabelDisplay {
 
 #[cfg(test)]
 mod tests {
-    use super::{dip_to_px, px_to_dip, LabelDisplay, LabelToggle, LengthUnit};
+    use super::{LabelDisplay, LabelToggle, LengthUnit, dip_to_px, px_to_dip};
     use crate::geometry::{Point, Rect};
 
     #[test]
@@ -263,9 +271,19 @@ mod tests {
         // At 125/150/175/200 % a dp is 1.25/1.5/1.75/2 pixels, so a multiple of 4 dp is a whole
         // number of pixels and dividing by the scale has to come back exactly. Otherwise the label
         // and the box it describes would disagree about their own size as the display scale changes.
-        for (dpi, percent) in [(96u32, 100i32), (120, 125), (144, 150), (168, 175), (192, 200)] {
+        for (dpi, percent) in [
+            (96u32, 100i32),
+            (120, 125),
+            (144, 150),
+            (168, 175),
+            (192, 200),
+        ] {
             for dp in [4i32, 12, 100, 848] {
-                assert_eq!(px_to_dip(dp * percent / 100, dpi), dp, "{dp} dp at {percent} %");
+                assert_eq!(
+                    px_to_dip(dp * percent / 100, dpi),
+                    dp,
+                    "{dp} dp at {percent} %"
+                );
             }
         }
     }
@@ -371,7 +389,10 @@ mod tests {
             show_unit: false,
             ..dp
         };
-        assert_eq!(no_unit.text(selection, origin, 144), "1000×667  (-1080, 100)");
+        assert_eq!(
+            no_unit.text(selection, origin, 144),
+            "1000×667  (-1080, 100)"
+        );
         // 三项全关：没有话可说，调用方据此不画徽标（而不是画一个空盒子）。
         let quiet = LabelDisplay {
             show_size: false,

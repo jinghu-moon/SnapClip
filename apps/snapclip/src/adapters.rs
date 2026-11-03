@@ -59,9 +59,8 @@ pub struct CaptureEvents {
     /// 存成闭包而不是直接存 `PinPoster`：接线发生在**贴图管理器起来之后**（两份东西各自
     /// 在半路上创建），闭包让"到底怎么贴"留在接线处一行，也让这件事可以被测——测试塞一个
     /// 记账的闭包进来，断言延时到点时确实发了这一条（docs/23 §14.55.8）。
-    pin_poster: std::sync::Mutex<
-        Option<std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>>,
-    >,
+    pin_poster:
+        std::sync::Mutex<Option<std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>>>,
     /// 「请为这张选区开保存面板」的投递器，与 `pin_poster` 同一形状、同一理由：接线发生在外壳
     /// 起来之后，存成闭包让"怎么开面板"留在接线处一行，测试也能塞一个记账闭包进来断言确实收到了那张图。
     save_opener: std::sync::Mutex<
@@ -190,9 +189,9 @@ impl CaptureEventSink for CaptureEvents {
                 pixels.region.right - pixels.region.left,
                 pixels.region.bottom - pixels.region.top
             ),
-            Some(Err(error)) => eprintln!(
-                "[snapclip-app][capture] session={session_id} 打开保存面板失败：{error}"
-            ),
+            Some(Err(error)) => {
+                eprintln!("[snapclip-app][capture] session={session_id} 打开保存面板失败：{error}")
+            }
             None => eprintln!(
                 "[snapclip-app][capture] session={session_id} 收到保存请求，但保存面板没接上"
             ),
@@ -443,7 +442,9 @@ mod save_open_tests {
                 origin: Some(snapclip_model::Point::new(0, 0)),
             },
             region: snapclip_model::Rect::new(0, 0, 2, 2),
-            bgra: vec![0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255],
+            bgra: vec![
+                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+            ],
             origin: Some(snapclip_model::Point::new(0, 0)),
             corner_radius: 0,
         }
@@ -469,7 +470,11 @@ mod save_open_tests {
 
         events.on_save_requested("session-1", &pixels());
 
-        assert_eq!(calls.load(Ordering::Acquire), 1, "must be asked exactly once");
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            1,
+            "must be asked exactly once"
+        );
         let seen = *seen.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(
             seen,

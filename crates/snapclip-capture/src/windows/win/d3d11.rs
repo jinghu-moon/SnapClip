@@ -32,6 +32,10 @@ use ::windows::Win32::Graphics::Dxgi::{
     IDXGISurface, IDXGISwapChain1,
 };
 use ::windows::core::{Interface, Result as WinResult};
+use snapclip_model::{
+    PixelFormat,
+    pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding},
+};
 use std::sync::{Arc, OnceLock};
 use std::thread::ThreadId;
 
@@ -289,47 +293,7 @@ impl GraphicsDevice {
     pub fn read_back_bgra(&self, texture: &ID3D11Texture2D) -> Result<Vec<u8>, String> {
         let mut description = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut description) };
-        let staging = D3D11_TEXTURE2D_DESC {
-            Width: description.Width,
-            Height: description.Height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: description.Format,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-        };
-        let mut staging_texture: Option<ID3D11Texture2D> = None;
-        unsafe {
-            self.d3d
-                .CreateTexture2D(&staging, None, Some(&mut staging_texture))
-        }
-        .map_err(|error| super::hresult("CreateTexture2D(staging)", &error))?;
-        let staging_texture = staging_texture
-            .ok_or_else(|| "staging CreateTexture2D returned nothing".to_string())?;
-
-        unsafe {
-            let context = self.owned_context("read_back_bgra");
-            context.CopyResource(&staging_texture, texture);
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            context
-                .Map(&staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-                .map_err(|error| super::hresult("ID3D11DeviceContext::Map", &error))?;
-
-            let row_bytes = description.Width as usize * 4;
-            let mut pixels = Vec::with_capacity(row_bytes * description.Height as usize);
-            for row in 0..description.Height as usize {
-                let source = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
-                pixels.extend_from_slice(std::slice::from_raw_parts(source, row_bytes));
-            }
-            context.Unmap(&staging_texture, 0);
-            Ok(pixels)
-        }
+        self.read_back_region_bgra(texture, 0, 0, description.Width, description.Height)
     }
 
     /// Present the current back buffer.
@@ -359,37 +323,93 @@ impl GraphicsDevice {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, String> {
-        if width == 0 || height == 0 {
-            return Ok(Vec::new());
+        let descriptor = PixelDescriptor::new(
+            PixelFormat::Bgra8Unorm,
+            PixelEncoding::Srgb,
+            AlphaMode::Straight,
+        )
+        .map_err(str::to_owned)?;
+        self.read_back_pixels(texture, [x, y, width, height], descriptor)
+            .map(PixelBuffer::into_bytes)
+    }
+
+    /// Typed, region-sized readback. The caller supplies the source's retained
+    /// color/alpha definition; the texture's actual format is cross-checked.
+    /// A current monitor setting is never used to reinterpret an old frame.
+    pub fn read_back_pixels(
+        &self,
+        texture: &ID3D11Texture2D,
+        [x, y, width, height]: [u32; 4],
+        descriptor: PixelDescriptor,
+    ) -> Result<PixelBuffer, String> {
+        use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let mut source = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            texture.GetDesc(&mut source);
         }
-        let staging = self.create_staging_texture(width, height, "CreateTexture2D(region staging)")?;
+        let format = match descriptor.format() {
+            PixelFormat::Bgra8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
+            PixelFormat::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        };
+        if source.Format != format
+            || source.SampleDesc.Count != 1
+            || width == 0
+            || height == 0
+            || x.checked_add(width)
+                .is_none_or(|right| right > source.Width)
+            || y.checked_add(height)
+                .is_none_or(|bottom| bottom > source.Height)
+        {
+            return Err(
+                "readback source format or region does not match the pixel descriptor".into(),
+            );
+        }
+        let row_bytes = descriptor.row_bytes(width).ok_or("readback row overflow")?;
+        let staging = self.create_staging_texture_for_format(
+            width,
+            height,
+            format,
+            "CreateTexture2D(typed staging)",
+        )?;
         let src_box = D3D11_BOX {
             left: x,
             top: y,
             front: 0,
-            right: x.saturating_add(width),
-            bottom: y.saturating_add(height),
+            right: x + width,
+            bottom: y + height,
             back: 1,
         };
         let mut pixels = Vec::new();
         unsafe {
-            let context = self.owned_context("read_back_region_bgra");
+            let context = self.owned_context("read_back_pixels");
             context.CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(&src_box));
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             context
                 .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .map_err(|error| super::hresult("Map(region staging)", &error))?;
-            copy_rows(&mapped, width, height, &mut pixels);
+            let copied = copy_mapped_rows(&mapped, row_bytes, height, &mut pixels);
             context.Unmap(&staging, 0);
+            copied?;
         }
-        Ok(pixels)
+        PixelBuffer::from_bytes(width, height, row_bytes, descriptor, pixels).map_err(str::to_owned)
     }
 
     /// A CPU-readable staging texture sized `width`×`height` BGRA.
+    #[cfg(test)]
     fn create_staging_texture(
         &self,
         width: u32,
         height: u32,
+        what: &str,
+    ) -> Result<ID3D11Texture2D, String> {
+        self.create_staging_texture_for_format(width, height, DXGI_FORMAT_B8G8R8A8_UNORM, what)
+    }
+
+    fn create_staging_texture_for_format(
+        &self,
+        width: u32,
+        height: u32,
+        format: ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
         what: &str,
     ) -> Result<ID3D11Texture2D, String> {
         let staging_desc = D3D11_TEXTURE2D_DESC {
@@ -397,7 +417,7 @@ impl GraphicsDevice {
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: format,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -408,13 +428,17 @@ impl GraphicsDevice {
             MiscFlags: 0,
         };
         let mut staging: Option<ID3D11Texture2D> = None;
-        unsafe { self.d3d.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }
-            .map_err(|error| super::hresult(what, &error))?;
+        unsafe {
+            self.d3d
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+        }
+        .map_err(|error| super::hresult(what, &error))?;
         staging.ok_or_else(|| format!("{what} returned nothing"))
     }
 
     /// Detect `DXGI_ERROR_DEVICE_REMOVED` / `DEVICE_RESET` / `DEVICE_HUNG`.
-    pub fn is_device_lost(message: &str) -> bool {        const DEVICE_REMOVED: i32 = 0x887A_0005u32 as i32;
+    pub fn is_device_lost(message: &str) -> bool {
+        const DEVICE_REMOVED: i32 = 0x887A_0005u32 as i32;
         const DEVICE_HUNG: i32 = 0x887A_0006u32 as i32;
         const DEVICE_RESET: i32 = 0x887A_0007u32 as i32;
         message
@@ -491,17 +515,43 @@ impl Drop for CompositionTarget {
 ///
 /// # Safety
 /// `mapped.pData` must point at `height` readable rows of at least `width * 4` bytes each.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 unsafe fn copy_rows(mapped: &D3D11_MAPPED_SUBRESOURCE, width: u32, height: u32, out: &mut Vec<u8>) {
-    let row_bytes = width as usize * 4;
+    unsafe { copy_mapped_rows(mapped, width as usize * 4, height, out) }
+        .expect("valid mapped BGRA rows");
+}
+
+/// # Safety
+/// `pData` points at `height` readable mapped rows. The caller must unmap even
+/// if this returns an error. Pitch is checked before any raw slice is created.
+unsafe fn copy_mapped_rows(
+    mapped: &D3D11_MAPPED_SUBRESOURCE,
+    row_bytes: usize,
+    height: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = row_bytes
+        .checked_mul(height as usize)
+        .ok_or("readback byte count overflow")?;
+    let mapped_bytes = (mapped.RowPitch as usize)
+        .checked_mul(height as usize)
+        .ok_or("readback pitch overflow")?;
+    if mapped.pData.is_null()
+        || (mapped.RowPitch as usize) < row_bytes
+        || mapped_bytes > isize::MAX as usize
+    {
+        return Err("invalid mapped readback data or row pitch".into());
+    }
     out.clear();
-    out.reserve(row_bytes * height as usize);
+    out.try_reserve_exact(bytes)
+        .map_err(|e| format!("cannot allocate readback: {e}"))?;
     for row in 0..height as usize {
         unsafe {
             let source = (mapped.pData as *const u8).add(row * mapped.RowPitch as usize);
             out.extend_from_slice(std::slice::from_raw_parts(source, row_bytes));
         }
     }
+    Ok(())
 }
 
 /// Three-slot async GPU staging sampler for magnifier color extraction.
@@ -691,16 +741,114 @@ pub fn create_bitmap_from_texture(
 #[cfg(test)]
 mod tests {
     use super::{GraphicsDevice, ID3D11Texture2D, copy_rows};
-    use ::windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
+    use ::windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use ::windows::Win32::Graphics::Direct3D11::{
         D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
     };
-    use ::windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use ::windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
     use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use ::windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, UnregisterClassW,
         WNDCLASSW, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_POPUP,
     };
+
+    #[test]
+    fn typed_copy_strips_padding_and_refuses_short_pitch_before_reading() {
+        let mut source = [0xcc; 32];
+        source[..8].copy_from_slice(&[0x00, 0xb4, 0x40, 0x4a, 0, 0x80, 0, 0x3c]);
+        source[16..24].copy_from_slice(&[0x00, 0xb4, 0x40, 0x4a, 1, 0x80, 0, 0x3c]);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE {
+            pData: source.as_mut_ptr().cast(),
+            RowPitch: 16,
+            DepthPitch: 32,
+        };
+        let mut result = vec![];
+        unsafe { super::copy_mapped_rows(&mapped, 8, 2, &mut result) }.unwrap();
+        assert_eq!(result, [&source[..8], &source[16..24]].concat());
+        mapped.RowPitch = 7;
+        assert!(unsafe { super::copy_mapped_rows(&mapped, 8, 2, &mut result) }.is_err());
+        mapped.pData = std::ptr::null_mut();
+        assert!(unsafe { super::copy_mapped_rows(&mapped, 8, 2, &mut result) }.is_err());
+    }
+
+    #[test]
+    #[ignore = "L4: opt-in D3D11 FP16 upload/readback, no window or display changes"]
+    fn fp16_region_readback_is_typed_and_keeps_exact_source_bits() {
+        use super::*;
+        use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+        use snapclip_model::{
+            PixelFormat,
+            pixels::{AlphaMode, PixelDescriptor, PixelEncoding},
+        };
+        let device = GraphicsDevice::create().unwrap();
+        let descriptor = PixelDescriptor::new(
+            PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        for i in 0..20u16 {
+            for v in [0xb400, 0x4a40, 0x8000 | i, 0x3c00] {
+                bytes.extend(v.to_le_bytes());
+            }
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 5,
+            Height: 4,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            ..Default::default()
+        };
+        let initial = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bytes.as_ptr().cast(),
+            SysMemPitch: 40,
+            ..Default::default()
+        };
+        let mut texture = None;
+        unsafe {
+            device
+                .d3d
+                .CreateTexture2D(&desc, Some(&initial), Some(&mut texture))
+                .unwrap();
+        }
+        let texture = texture.unwrap();
+        let pixels = device
+            .read_back_pixels(&texture, [1, 1, 3, 2], descriptor)
+            .unwrap();
+        assert_eq!(pixels.size(), [3, 2]);
+        assert_eq!(pixels.row_stride(), 24);
+        assert_eq!(pixels.descriptor(), descriptor);
+        let expected = [&bytes[48..72], &bytes[88..112]].concat();
+        assert_eq!(pixels.as_bytes(), expected);
+        assert!(
+            device.read_back_bgra(&texture).is_err(),
+            "SDR entry must reject FP16 rather than reinterpret it"
+        );
+        assert!(device.read_back_region_bgra(&texture, 1, 1, 3, 2).is_err());
+        assert!(
+            device
+                .read_back_pixels(&texture, [4, 3, 2, 2], descriptor)
+                .is_err()
+        );
+        assert!(
+            device
+                .read_back_pixels(&texture, [u32::MAX, 0, 1, 1], descriptor)
+                .is_err()
+        );
+        assert!(
+            device
+                .read_back_pixels(&texture, [0, 0, 0, 1], descriptor)
+                .is_err()
+        );
+    }
 
     /// Create a hidden popup window shaped exactly like the capture overlay.
     ///
@@ -873,7 +1021,11 @@ mod tests {
             GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
         let (frame_w, frame_h, sel_w, sel_h) = (3840u32, 2160u32, 2148u32, 1344u32);
         let frame = device
-            .create_bgra_texture(frame_w, frame_h, &vec![0x5au8; (frame_w * frame_h * 4) as usize])
+            .create_bgra_texture(
+                frame_w,
+                frame_h,
+                &vec![0x5au8; (frame_w * frame_h * 4) as usize],
+            )
             .unwrap();
         let (x, y) = ((frame_w - sel_w) / 2, (frame_h - sel_h) / 2);
         let mut costs = Vec::new();
@@ -1053,7 +1205,11 @@ mod tests {
             GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
         let (frame_w, frame_h, sel_w, sel_h) = (3840u32, 2160u32, 2148u32, 1344u32);
         let frame = device
-            .create_bgra_texture(frame_w, frame_h, &vec![0x5au8; (frame_w * frame_h * 4) as usize])
+            .create_bgra_texture(
+                frame_w,
+                frame_h,
+                &vec![0x5au8; (frame_w * frame_h * 4) as usize],
+            )
             .unwrap();
         let (x, y) = ((frame_w - sel_w) / 2, (frame_h - sel_h) / 2);
         let src_box = ::windows::Win32::Graphics::Direct3D11::D3D11_BOX {

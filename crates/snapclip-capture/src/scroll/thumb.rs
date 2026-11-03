@@ -296,8 +296,14 @@ mod tests {
             variants[1].0,
             variants[2].0
         );
-        assert!(a > 0.0 && b > 0.0, "the measurement was optimised away: {a} {b} {c}");
-        assert!(a <= b, "the divide is not the bottleneck: integer {a:.1}us vs shared scale {b:.1}us");
+        assert!(
+            a > 0.0 && b > 0.0,
+            "the measurement was optimised away: {a} {b} {c}"
+        );
+        assert!(
+            a <= b,
+            "the divide is not the bottleneck: integer {a:.1}us vs shared scale {b:.1}us"
+        );
     }
 
     #[test]
@@ -367,7 +373,9 @@ mod tests {
             "the last bucket runs to the canvas's own right edge"
         );
         assert_eq!(
-            (spans.last().unwrap().0..spans.last().unwrap().1).max().unwrap(),
+            (spans.last().unwrap().0..spans.last().unwrap().1)
+                .max()
+                .unwrap(),
             src_width - 1,
             "so the canvas's last column is inside it"
         );
