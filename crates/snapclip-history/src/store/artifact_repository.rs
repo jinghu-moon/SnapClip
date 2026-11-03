@@ -46,6 +46,7 @@ pub(super) fn delete_publication(
     connection: &Connection,
     blob_store: &BlobStore,
     artifacts: &crate::artifact_store::CaptureArtifactStore,
+    recovery: &super::capture_recovery::CaptureRecovery,
     clip_id: &str,
 ) -> Result<bool, StoreError> {
     let source: Option<String> = connection
@@ -60,6 +61,11 @@ pub(super) fn delete_publication(
             serde_json::from_str(&json).map_err(|e| StoreError::InvalidPublication(e.to_string()))
         })
         .transpose()?;
+    if let Some(source) = &source {
+        // Clear a committed-but-unretired handoff before deletion so reopening
+        // cannot recreate a history item the user explicitly removed.
+        recovery.finish(clip_id, source)?;
+    }
     let transaction = connection.unchecked_transaction()?;
     let removed = transaction.execute("DELETE FROM clips WHERE id = ?1", params![clip_id])?;
     if removed == 0 {

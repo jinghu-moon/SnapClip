@@ -98,6 +98,8 @@ impl Store {
         let writer_database_path = database_path.clone();
         let artifacts =
             crate::artifact_store::CaptureArtifactStore::new(root.join("artifacts/capture"));
+        let recovery =
+            capture_recovery::CaptureRecovery::new(root.join("artifacts/pending-captures"));
 
         thread::Builder::new()
             .name("snapclip-db-writer".into())
@@ -110,7 +112,10 @@ impl Store {
                     }
                 };
 
-                if let Err(error) = sweep_orphans(&connection, &writer_blob_store) {
+                if let Err(error) = recovery
+                    .recover(&connection, &writer_blob_store, &artifacts)
+                    .and_then(|()| sweep_orphans(&connection, &writer_blob_store))
+                {
                     let _ = ready_tx.send(Err(error.to_string()));
                     return;
                 }
@@ -119,7 +124,13 @@ impl Store {
                     return;
                 }
 
-                writer_loop(connection, writer_blob_store, artifacts, writer_rx);
+                writer_loop(
+                    connection,
+                    writer_blob_store,
+                    artifacts,
+                    recovery,
+                    writer_rx,
+                );
             })
             .map_err(StoreError::Io)?;
 
@@ -165,6 +176,9 @@ impl Store {
 
     /// Save a validated app-owned source reference and its bounded SDR thumbnail
     /// atomically in SQLite. No source pixels enter the request queue.
+    /// A bounded on-disk handoff is retained on failure and replayed on open.
+    /// Repeating the same id and immutable source is idempotent; conflicting ids
+    /// are rejected. An error never removes the original capture file.
     pub fn save_capture(
         &self,
         id: String,
@@ -499,6 +513,7 @@ fn writer_loop(
     connection: Connection,
     blob_store: BlobStore,
     artifacts: crate::artifact_store::CaptureArtifactStore,
+    recovery: capture_recovery::CaptureRecovery,
     receiver: Receiver<WriterRequest>,
 ) {
     for request in receiver {
@@ -513,6 +528,7 @@ fn writer_loop(
                     &connection,
                     &blob_store,
                     &artifacts,
+                    &recovery,
                     id,
                     source,
                     thumbnail,
@@ -583,6 +599,7 @@ fn writer_loop(
                     &connection,
                     &blob_store,
                     &artifacts,
+                    &recovery,
                     &clip_id,
                 ));
             }
@@ -591,6 +608,7 @@ fn writer_loop(
 }
 
 mod artifact_repository;
+mod capture_recovery;
 mod capture_repository;
 mod clip_repository;
 mod connection;

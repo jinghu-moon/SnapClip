@@ -8,6 +8,7 @@ pub(super) fn insert_capture(
     connection: &Connection,
     blobs: &BlobStore,
     artifacts: &CaptureArtifactStore,
+    recovery: &super::capture_recovery::CaptureRecovery,
     id: String,
     source: CaptureSource,
     thumbnail: Vec<u8>,
@@ -66,6 +67,37 @@ pub(super) fn insert_capture(
         crate::image::decode_to_rgba8(&thumbnail).map_err(StoreError::InvalidPublication)?;
     let thumbnail = crate::image::encode_rgba_png(decoded.as_raw(), width, height)
         .map_err(StoreError::InvalidPublication)?;
+    // The handoff must precede even the first database read: a broken schema,
+    // unavailable disk or connection error is itself a recoverable failure.
+    let staged = recovery.stage(&id, &source, &thumbnail)?;
+    let existing: Option<Option<String>> = connection
+        .query_row(
+            "SELECT capture_sources.source_json FROM clips
+         LEFT JOIN capture_sources ON capture_sources.clip_id = clips.id WHERE clips.id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let existing: Option<CaptureSource> = existing
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|e| StoreError::InvalidPublication(e.to_string()))
+            })
+            .transpose()?;
+        if existing.as_ref() != Some(&source) {
+            if staged {
+                // This was a rejected new request, not a previously pending one.
+                // Do not leave an intent that could replace the existing id later.
+                recovery.finish(&id, &source)?;
+            }
+            return Err(invalid(
+                "capture id already belongs to a different publication",
+            ));
+        }
+        // SQLite committed but the process stopped before clearing its handoff.
+        return recovery.finish(&id, &source);
+    }
     let hash = blake3::hash(&thumbnail).to_hex().to_string();
     let payload = PayloadRef {
         payload_id: format!("{id}-thumbnail"),
@@ -76,7 +108,7 @@ pub(super) fn insert_capture(
         image_dimensions: Some(ImageDimensions { width, height }),
     };
     let publication = Publication {
-        publication_id: id,
+        publication_id: id.clone(),
         origin: PublicationOrigin::Capture,
         captured_at_unix_ms: metadata.captured_at_unix_ms,
         source_app: Some("SnapClip".into()),
@@ -92,7 +124,8 @@ pub(super) fn insert_capture(
             bytes: thumbnail,
         }],
         Some(&source),
-    )
+    )?;
+    recovery.finish(&id, &source)
 }
 
 /// Called after the last SQLite owner was deleted. Never delete a replaced file

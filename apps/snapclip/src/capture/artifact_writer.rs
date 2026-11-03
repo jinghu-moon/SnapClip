@@ -119,7 +119,8 @@ impl HistoryArtifactWriter {
                 )
                 .map_err(|e| {
                     CaptureError::EncodeFailed(format!(
-                        "capture source was written but history registration failed: {e}"
+                        "capture source was written but history registration failed; original retained at {}: {e}",
+                        reference.absolute_path.display()
                     ))
                 })?;
         }
@@ -760,6 +761,64 @@ mod tests {
             bytes,
             "persistence must not mutate the source"
         );
+        drop(master);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn an_archive_registration_failure_reports_the_retained_original_path() {
+        use snapclip_model::pixels::{
+            AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource,
+        };
+        let directory = root("registration-failure");
+        let history = snapclip_history::store::Store::open(directory.join("history")).unwrap();
+        // A source outside history's owned directory must be rejected, but the
+        // caller must still be told exactly where its immutable original lives.
+        let artifacts = directory.join("separate-artifacts");
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let bytes = [0, 0xb4, 0, 0x49, 0, 0, 0, 0x38].to_vec();
+        let pixels = PixelBuffer::from_tight(1, 1, descriptor, bytes.clone()).unwrap();
+        let metadata = snapclip_model::CaptureMetadata {
+            session_id: "failed-registration".into(),
+            width: 1,
+            height: 1,
+            dpi: 144,
+            source: PixelSource::new(descriptor, 93),
+            captured_at_unix_ms: 42,
+            monitor_device_name: None,
+        };
+        let error = HistoryArtifactWriter::new(&artifacts)
+            .with_history(history)
+            .write_pixels(&metadata, &pixels)
+            .unwrap_err();
+        let paths: Vec<_> = fs::read_dir(&artifacts)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert!(error.to_string().contains("history registration failed"));
+        assert!(error.to_string().contains(&paths[0].display().to_string()));
+        let reference = snapclip_model::ArtifactRef {
+            absolute_path: paths[0].clone(),
+            mime: "application/x-snapclip-pixels".into(),
+            dimensions: snapclip_model::ImageDimensions {
+                width: 1,
+                height: 1,
+            },
+            byte_len: fs::metadata(&paths[0]).unwrap().len(),
+            content_fingerprint: blake3::hash(&fs::read(&paths[0]).unwrap())
+                .to_hex()
+                .to_string(),
+        };
+        let mut master = snapclip_history::pixel_master::PixelMaster::open(&reference).unwrap();
+        assert_eq!(master.metadata(), &metadata);
+        assert_eq!(master.read_rows(0, 1).unwrap().as_bytes(), bytes);
+        assert_eq!(pixels.as_bytes(), bytes);
         drop(master);
         let _ = fs::remove_dir_all(directory);
     }

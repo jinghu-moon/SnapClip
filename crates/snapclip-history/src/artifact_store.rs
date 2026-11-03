@@ -10,9 +10,10 @@
 //! sequence is per-process, which is what makes two captures in the same session land in
 //! two files.
 //!
-//! **Not here yet**: cleanup/LRU. Nothing in the current code evicts artifacts, and this
-//! task moved what exists rather than inventing a policy; when a retention rule is
-//! decided, this store is where it belongs.
+//! History removes a verified app-owned source after its last SQLite reference
+//! is explicitly deleted. Its bounded capture-registration journal recovers a
+//! failed file/SQLite handoff. Automatic eviction/LRU and sweeping files without
+//! a validated handoff are deliberately separate, undecided retention policies.
 
 use std::fs;
 use std::io::Read;
