@@ -353,6 +353,8 @@ cargo clippy -p snapclip-capture --all-targets --no-deps --locked --offline -- -
 - [ ] HDR AVIF 按真实生产编解码/许可/色彩证据门禁。
 - [ ] Release 资源性能、旧功能回归、严格 Clippy 与真实窗口/HDR/DPI 验收。
 
+进度解释：§12–§16 已交付代码与分层测试；本清单保留产品级验收状态，不能仅凭无头、合成 DPI 消息或离屏 GPU 数值勾选全部完成。F6 旧宿主的删除与共用资源已在 §16 落地，真实热键/跨屏/HDR 肉眼矩阵仍待验收。
+
 ### 11.1 纯数学共享边界
 
 Yue 的 `yue-color` 仅承载已有的传递函数、基色矩阵及 BT.2390 数学，无 GPUI、图像、编解码器、资源或平台依赖。目的是让原生捕获和 GPUI 显示引用同一个实现，而非复制数值算法或让 Capture 反向依赖 GPUI。ICC 管理仍留在 Yue 图片资源层，采集/文件/生命周期仍在各自既有模块；没有新增媒体引擎。
@@ -488,3 +490,49 @@ SDR 倒计时保留原 BGRA8 内容路径，与 HDR 共用一次模糊＋遮罩�
 日志为 `target/hdr-p3h-{countdown-before,target-restore-before,d2d-gpu,countdown-release,window-contract,sdr-blur,workspace,capture-clippy}.log`。仍使用前述隔离依赖，不把并行虚拟列表工作树当作已经通过。窗口 probe 只创建短暂、无激活的测试内容，没有截取桌面、注入输入、写剪贴板或改变 HDR 设置。
 
 这些证据证明内部颜色链路和原生输入宿主合同；未宣称已经验证 DWM 在真实 HDR 屏上的最终亮度、圆角外观、跨屏／各 DPI、完整倒计时触发截图或资源峰值。因此 §11 的产品级项暂不勾选；剩余 F6 宿主替换、历史母版引用与回放、AVIF 生产门禁、性能与实机矩阵继续执行，普通捕获入口的 preserving 门禁保持关闭。
+
+## 16. F6 共用 GPUI/Yue 宿主（P3-I，2026-11-03）
+
+### 16.1 所有权与实际变化
+
+- F3 `PinView` 与 F6 `ScreenshotView` 都由应用线程的 `PinManager` 管理。F6 直接调用既有 Yue `ImagePreviewImage::paint`，使用同一来源 Arc、generation、Alpha 和颜色定义；HDR 不再被旧宿主拒绝。没有新增媒体引擎、全局图像缓存或 CPU 缩放器。
+- 删除 `host.rs`、`source.rs`、`windows_host_tests.rs`：GDI DIB、专用消息线程、重采样滤镜、通道和 50ms 常驻轮询均不再参与生产。示例也删除轮询，精确删除不再使用的 parking_lot 和 Windows features。
+- F6 使用无标题 `WS_POPUP`、topmost、持久 `NOACTIVATE`，物理 bounds 包含负坐标；图片以源物理像素为 1×，DPI 仅影响 DIP chrome。滚轮整数十分位、范围 0.1–10，带余量及鼠标锚定。窗口移动调用 backend 的 deferred 系统拖动。圆角 shader 与 native hit region 配合；Root 显式透明，避免半透明像素被 Kit 默认底色填实。
+- open map 也拥有准备中窗口。成功上传/绘制后只回执一次；空 HWND 或解码完成都不消费截图来源。失败/取消释放 claim，不进撤销；重复/迟到回执无效。hidden 准备不提交，显示后再确认。此回执不是 DWM/显示器完成信号。
+- 右键系统菜单可越出小尺寸、无激活 HWND，支持普通 SDR 复制、HDR PNG 复制、文字备选及关闭。普通 F3 选字/文件/工具栏路径保持原有语义。右键与真实鼠标拖动仍需人工验收。
+
+### 16.2 旧行为与测试迁移
+
+| 原实现/检查 | 当前生产路径与覆盖 | 验收边界 |
+| --- | --- | --- |
+| 独立线程和跨线程 request/report | 应用线程 Entity、统一编号/溢出拒绝、窗口关闭订阅、准备回执 | 线程宿主的 stopped/channel/Send+Sync 测试随被删除 API 退役，不保留空壳 |
+| 原位/负坐标/滚轮/缩放/边框几何 | 14 项仍适用的几何测试迁移；增加极端 delta、NaN、完整十分位往返、边界反向及 DPI 物理几何 | 旧 `i32::MIN.abs()` 先真实 panic；新算法 O(1)，不按数千万 notch 循环 |
+| ImageSource RGBA/BGRA/尺寸/不透明化 | 14 项真实生产 PinImage→Yue 资源测试，覆盖行序、stride、8/16bit、关联/零 alpha、LinearSrgb/ScRgb、代理边缘、同 Arc | 旧强制 alpha=255 是错误合同，改为明确保留/解除关联；不再测已删除的 u32 DIB |
+| GDI resample/packed blend/GDI 字体/滤镜出图/旧性能 | 生产使用共用 native GPU renderer 与 Yue 文本；F6 原生读回检查 alpha/透明圆角，资源回归检查精度 | 旧 GDI 算法单测和 ignored 性能出图工具退役；不能据 GPU probe 宣称滤镜视觉/字体质量已人工验收 |
+| 创建/失败/取消/重复/迟到回执 | 首次 paint 消费、失败和取消不消费；claim Drop 恰好一次；double click、hide/raise、undo | 原 manager receipt 组合测试已补成真实 GPUI 窗口回归 |
+| native 宿主创建/销毁/重建 | 新精确 opt-in probe 创建生产 F6、发 own-HWND 滚轮、检查样式/前台/FP16/alpha/资源释放 | 不使用 SendInput，不读取桌面/写剪贴板/移动光标/改变系统 HDR |
+
+测试总数发生变化是被替代 GDI 线程/算法/API 的退役，不是修改 baseline 门禁。修改前 Pin headless 76 passed / 4 ignored；当前 ordinary 59 passed，headless 71 passed / 1 ignored，native 另显式执行 1 passed。原有 58-test Pin 下限不降，新 ordinary 实际 59，门禁通过。
+
+### 16.3 已执行验证
+
+| 验证 | 结果 |
+| --- | --- |
+| workspace ordinary lib，串行、隔离依赖 | App 275、Capture 568、Clipboard 13、History 43、Model 31、Pin 59、UI 221，共 **1,210 passed**；ignored 分别 5/88/2/0/0/0/0，不计入通过 |
+| App / Pin headless lib | **295 / 71 passed**，另 5 / 1 ignored |
+| Pin all-targets strict Clippy | headless feature、`--no-deps -D warnings` 通过，包含 preview example；不是全仓 strict lint 结论 |
+| 原生生产 F6（Debug） | 精确 filter **1 passed**；原位(16,16)、NOACTIVATE/TOOLWINDOW/TOPMOST、无 LAYERED/APPWINDOW、前台不变；FP16 bits/源 Arc 保留，GPU corner alpha≈0/center≈0.5，滚轮1.1且资源复用，关闭后 Weak 释放 |
+| framework 原生窗口 | 两个独立进程各 **1 passed**：持续无激活及 synthetic DPI 保物理尺寸；禁用 preserve 分支的负对照先失败 |
+| workspace all-targets check、scoped fmt、diff check、test-count gate | 均通过；gallery 既有 9 项 must-use warnings 保留 |
+
+回归主要日志：`target/hdr-f6-{baseline,admission-red,wheel-red,ordinary-final,headless-final,native-final,workspace-final,app-headless-final,pin-clippy,check-final}.log`。框架窗口日志位于 Yue `target/hdr-f6-window-*.log`。继续使用 §12.3 的本机隔离依赖快照（叠加本轮窗口 API），不宣称另一任务的虚拟列表工作树已通过。
+
+原生命令必须精确选择单个测试，并在独立进程执行：
+
+```powershell
+cargo test -p snapclip-pin --lib --features headless-tests screenshot::native_tests::native_hdr_surface_keeps_placement_alpha_focus_and_releases_its_render_image --locked --offline --config target/hdr-isolated.toml -- --ignored --exact --nocapture --test-threads=1
+# Yue 仓执行；CorePath 仅在使用本机隔离快照时需要：
+pwsh -NoProfile -File tools/test-gpui-window.ps1 -Native -CorePath D:/100_Projects/110_Daily/SnapClip/target/hdr-vendor-baseline/vendor/gpui-pre
+```
+
+**仍未验收**：F5/F6 全链路真实热键、实际鼠标拖动/菜单、DWM 闪烁、HDR 开/关和高光观感、不同显示器/真实 DPI、屏幕 45MP 和完整设备恢复；原生小窗与无头测试不能代替这些证据。Release、RSS/VRAM、20 次替换、空闲重绘仍单独记录，未完成前不开放 production HDR 捕获门禁。

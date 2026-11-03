@@ -1,19 +1,17 @@
-//! Prepared-content pins: Yue-backed GPUI viewers and an original-position native F6 host.
+//! Prepared-content pins: inspectable F3 viewers and chrome-free F6 GPUI/Yue surfaces.
 #![cfg(windows)]
 mod feedback;
-mod host;
 mod image_preview;
 mod manager;
 mod platform;
-mod source;
+mod screenshot;
+mod screenshot_geometry;
 mod table;
 mod view;
-pub use host::{PinEvent, PinHandle, PinReport, PinRequest};
 pub use image_preview::decode_image;
-pub use manager::{CopyTarget, PinCommand, PinManager, PinPlacement};
+pub use manager::{CopyTarget, PinCommand, PinHandle, PinManager, PinPlacement};
 use snapclip_model::geometry::Rect;
 pub use snapclip_model::pin::*;
-pub use source::ImageSource;
 /// The most recently confirmed screenshot, in virtual-desktop physical pixels.
 ///
 /// The image shares validated original pixels with the capture result. Placement

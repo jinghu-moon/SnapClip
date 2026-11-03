@@ -18,14 +18,9 @@ snapclip-model = { path = "../snapclip-model" }
 snapclip-ui = { path = "../snapclip-ui" }
 
 [target.'cfg(windows)'.dependencies]
-parking_lot = "0.12"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Performance",
-    "Win32_System_Threading",
-    "Win32_UI_Controls",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_Graphics_Dwm",
@@ -34,7 +29,7 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
-# The existing opt-in filter-comparison test writes PNG sheets.
+# PQ/cICP fixtures exercise the same PNG decoding route as production.
 png = "0.18"
 
 [features]

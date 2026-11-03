@@ -1,6 +1,5 @@
 use crate::{
-    ImageSource, PinContent, PinEvent, PinHandle, PinRequest, PinSelection, PinSnapshot,
-    host::NativeImages, platform, view::PinView,
+    PinContent, PinSelection, PinSnapshot, platform, screenshot::ScreenshotView, view::PinView,
 };
 use gpui_kit::{component::Root, *};
 use std::{collections::HashMap, sync::Arc};
@@ -10,7 +9,27 @@ fn initial_image_zoom(image: (u32, u32), work_area: (i32, i32)) -> f64 {
         .min(f64::from(work_area.1.max(1)) * 0.7 / f64::from(image.1))
         .min(1.)
 }
-
+fn validate_selection(selection: &PinSelection) -> anyhow::Result<()> {
+    let region = selection.region();
+    let dimensions = [
+        u32::try_from(region.width())?,
+        u32::try_from(region.height())?,
+    ];
+    anyhow::ensure!(
+        !region.is_empty() && dimensions == selection.image().pixels().size(),
+        "截图像素与尺寸不符"
+    );
+    Ok(())
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PinHandle {
+    id: u64,
+}
+impl PinHandle {
+    pub fn id(self) -> u64 {
+        self.id
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub enum PinPlacement {
     Pointer((i32, i32)),
@@ -28,36 +47,30 @@ pub enum CopyTarget {
 pub enum PinCommand {
     Copy { id: u64, target: CopyTarget },
 }
-
 enum Surface {
-    Image(PinHandle),
+    Screenshot(WindowHandle<Root>, WeakEntity<ScreenshotView>),
     View(WindowHandle<Root>, WeakEntity<PinView>),
+}
+impl Surface {
+    fn window(&self) -> WindowHandle<Root> {
+        match self {
+            Self::Screenshot(w, _) | Self::View(w, _) => *w,
+        }
+    }
 }
 struct OpenPin {
     snapshot: Arc<PinSnapshot>,
     surface: Surface,
-    _closed: Option<Subscription>,
+    _closed: Subscription,
     derived_bytes: usize,
-}
-
-struct PendingPin {
-    snapshot: Arc<PinSnapshot>,
-    /// Dropping a failed/cancelled request drops its source claim without consuming it.
+    ready: bool,
     on_created: Option<Box<dyn FnOnce()>>,
 }
-impl PendingPin {
-    fn created(self) -> Arc<PinSnapshot> {
-        if let Some(on_created) = self.on_created {
-            on_created();
-        }
-        self.snapshot
-    }
-}
-/// One application-thread owner of live pins, pending native creations, undo and command delivery.
+/// One application-thread owner of windows, preparation receipts, undo and commands.
+/// F3/F6 share GPUI/Yue resources; there is no private image thread or polling loop.
 pub struct PinManager {
-    native: NativeImages,
+    next_id: u64,
     open: HashMap<u64, OpenPin>,
-    pending: HashMap<u64, PendingPin>,
     closed: Vec<Arc<PinSnapshot>>,
     commands: async_channel::Sender<PinCommand>,
     owner: Option<WeakEntity<Self>>,
@@ -65,19 +78,28 @@ pub struct PinManager {
 }
 impl PinManager {
     #[cfg(all(test, feature = "headless-tests"))]
+    pub(crate) fn screenshot_for_test(
+        &self,
+        id: u64,
+    ) -> (WindowHandle<Root>, WeakEntity<ScreenshotView>, bool) {
+        match &self.open[&id].surface {
+            Surface::Screenshot(w, v) => (*w, v.clone(), self.open[&id].ready),
+            _ => panic!("expected screenshot"),
+        }
+    }
+    #[cfg(all(test, feature = "headless-tests"))]
     pub(crate) fn view_for_test(&self, id: u64) -> (WindowHandle<Root>, WeakEntity<PinView>) {
         match &self.open[&id].surface {
-            Surface::View(window, view) => (*window, view.clone()),
-            _ => panic!("expected GPUI pin"),
+            Surface::View(w, v) => (*w, v.clone()),
+            _ => panic!("expected inspectable pin"),
         }
     }
     pub fn new() -> anyhow::Result<(Self, async_channel::Receiver<PinCommand>)> {
         let (commands, receiver) = async_channel::unbounded();
         Ok((
             Self {
-                native: NativeImages::start()?,
+                next_id: 1,
                 open: HashMap::new(),
-                pending: HashMap::new(),
                 closed: vec![],
                 commands,
                 owner: None,
@@ -85,6 +107,15 @@ impl PinManager {
             },
             receiver,
         ))
+    }
+    fn allocate_id(&mut self) -> anyhow::Result<PinHandle> {
+        let next = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("贴图编号已用尽"))?;
+        let handle = PinHandle { id: self.next_id };
+        self.next_id = next;
+        Ok(handle)
     }
     pub fn open(
         snapshot: Arc<PinSnapshot>,
@@ -94,7 +125,6 @@ impl PinManager {
     ) -> anyhow::Result<PinHandle> {
         Self::open_with_ready(snapshot, placement, owner, cx, None)
     }
-
     fn open_with_ready(
         snapshot: Arc<PinSnapshot>,
         placement: PinPlacement,
@@ -117,148 +147,202 @@ impl PinManager {
             }
             _ => {}
         }
-        // Bound retained source + decoded pixels including undo; reject honestly rather than truncate.
-        owner.update(cx, |this, cx| {
-            this.owner = Some(owner.downgrade());
-            this.poll(cx)
-        });
+        owner.update(cx, |this, _| this.owner = Some(owner.downgrade()));
         let admitted = owner
             .read(cx)
             .retained_bytes()
             .checked_add(snapshot.retained_bytes())
             .is_some_and(|bytes| bytes <= 256 * 1024 * 1024);
-        if !admitted || owner.read(cx).open.len() + owner.read(cx).pending.len() >= 32 {
+        if !admitted || owner.read(cx).open.len() >= 32 {
             anyhow::bail!("贴图已达到当前资源上限，请先关闭一些贴图");
         }
+        let handle = owner.update(cx, |this, _| this.allocate_id())?;
         let cursor = match placement {
             PinPlacement::Pointer(p) | PinPlacement::Screenshot(p, _) => p,
         };
-        // F6 is an original-position, non-activating screenshot surface. F3 is
-        // an inspectable GPUI viewer and shares YueImagePreview with file previews.
-        if let (PinContent::Image(image), PinPlacement::Screenshot(position, radius)) =
+        let mut surface = None;
+        let weak = owner.downgrade();
+        let window = if let (PinContent::Image(image), PinPlacement::Screenshot(position, radius)) =
             (snapshot.content(), placement)
         {
-            // The native F6 host is an explicitly SDR-only capability until its
-            // original-position/nonactivation contract moves to GPUI.
-            if image.is_hdr() {
-                anyhow::bail!("原位截图贴图的 HDR 窗口迁移尚未完成，原始像素未被量化");
-            }
-            let image = ImageSource::from_rgba(
-                &image.sdr_rgba().map_err(anyhow::Error::msg)?,
-                image.width(),
-                image.height(),
-            )?;
-            let handle = owner.read(cx).native.create_pin(
-                PinRequest::new(image, position)
-                    .radius(radius)
-                    .text_available(snapshot.text().is_some_and(|text| !text.is_empty()))
-                    .initial_zoom(1.),
-            )?;
-            owner.update(cx, |this, _| {
-                this.pending.insert(
-                    handle.id(),
-                    PendingPin {
-                        snapshot,
-                        on_created,
-                    },
-                );
-            });
-            return Ok(handle);
-        }
-        let handle = owner.read(cx).native.reserve_handle()?;
-        let mut width = if matches!(snapshot.content(), PinContent::Files(_)) {
-            384.
+            let (_, scale) = platform::work_area(position);
+            let border = crate::screenshot_geometry::border_px((scale * 96.).round() as u32);
+            let dimensions =
+                crate::screenshot_geometry::window_size(image.width(), image.height(), 1., border);
+            cx.open_window(
+                WindowOptions {
+                    color_policy: WindowColorPolicy::AutomaticHdr,
+                    physical_bounds: Some(crate::screenshot::physical_bounds(position, dimensions)),
+                    keep_physical_size_on_dpi_change: true,
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(position.0 as f32 / scale), px(position.1 as f32 / scale)),
+                        size(
+                            px(dimensions.0 as f32 / scale),
+                            px(dimensions.1 as f32 / scale),
+                        ),
+                    ))),
+                    kind: WindowKind::PopUp,
+                    titlebar: None,
+                    focus: false,
+                    is_activatable: false,
+                    is_resizable: false,
+                    is_minimizable: false,
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    inactive_frame_interval: None,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    let pin = cx.new(|cx| {
+                        ScreenshotView::new(
+                            handle.id(),
+                            snapshot.clone(),
+                            weak,
+                            position,
+                            radius,
+                            window,
+                            cx,
+                        )
+                    });
+                    surface = Some(Surface::Screenshot(
+                        window
+                            .window_handle()
+                            .downcast::<Root>()
+                            .expect("root handle"),
+                        pin.downgrade(),
+                    ));
+                    cx.new(|cx| Root::new(pin, window, cx).bg(transparent_black()))
+                },
+            )?
         } else {
-            448.
+            let mut width = if matches!(snapshot.content(), PinContent::Files(_)) {
+                384.
+            } else {
+                448.
+            };
+            let mut height = match snapshot.content() {
+                PinContent::Files(files)
+                    if files.len() == 1 && files[0].kind() == crate::FileKind::Image =>
+                {
+                    360.
+                }
+                PinContent::Files(files) => {
+                    (144. + files.len().saturating_sub(1).min(6) as f32 * 56.).clamp(240., 480.)
+                }
+                PinContent::Document(doc) => {
+                    (128. + doc.text().lines().count().min(16) as f32 * 24.).clamp(240., 540.)
+                }
+                _ => 360.,
+            };
+            if let PinContent::Image(image) = snapshot.content() {
+                let (area, scale) = platform::work_area(cursor);
+                let zoom = initial_image_zoom(
+                    (image.width(), image.height()),
+                    (area.2 - area.0, area.3 - area.1),
+                ) as f32;
+                width = (image.width() as f32 * zoom / scale + 32.).max(320.);
+                height = (image.height() as f32 * zoom / scale + 112.).max(240.);
+            }
+            cx.open_window(
+                WindowOptions {
+                    color_policy: WindowColorPolicy::AutomaticHdr,
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(width), px(height)),
+                    ))),
+                    titlebar: None,
+                    focus: false,
+                    window_min_size: Some(size(px(320.), px(200.))),
+                    is_resizable: true,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    platform::configure(window, cursor, (width, height), true);
+                    let pin =
+                        cx.new(|cx| PinView::new(handle.id(), snapshot.clone(), weak, window, cx));
+                    surface = Some(Surface::View(
+                        window
+                            .window_handle()
+                            .downcast::<Root>()
+                            .expect("root handle"),
+                        pin.downgrade(),
+                    ));
+                    cx.new(|cx| Root::new(pin, window, cx))
+                },
+            )?
         };
-        let mut height = match snapshot.content() {
-            PinContent::Files(files)
-                if files.len() == 1 && files[0].kind() == crate::FileKind::Image =>
-            {
-                360.
-            }
-            PinContent::Files(files) => {
-                (144. + files.len().saturating_sub(1).min(6) as f32 * 56.).clamp(240., 480.)
-            }
-            PinContent::Document(doc) => {
-                (128. + doc.text().lines().count().min(16) as f32 * 24.).clamp(240., 540.)
-            }
-            _ => 360.,
-        };
-        if let PinContent::Image(image) = snapshot.content() {
-            let (area, scale) = platform::work_area(cursor);
-            let zoom = initial_image_zoom(
-                (image.width(), image.height()),
-                (area.2 - area.0, area.3 - area.1),
-            ) as f32;
-            width = (image.width() as f32 * zoom / scale + 32.).max(320.);
-            height = (image.height() as f32 * zoom / scale + 112.).max(240.);
-        }
-        let weak = owner.downgrade();
-        let mut view = None;
-        let window = cx.open_window(
-            WindowOptions {
-                color_policy: WindowColorPolicy::AutomaticHdr,
-                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(width), px(height)),
-                ))),
-                titlebar: None,
-                focus: false,
-                window_min_size: Some(size(px(320.), px(200.))),
-                is_resizable: true,
-                ..Default::default()
-            },
-            |window, cx| {
-                platform::configure(window, cursor, (width, height), true);
-                let pin =
-                    cx.new(|cx| PinView::new(handle.id(), snapshot.clone(), weak, window, cx));
-                view = Some(pin.downgrade());
-                cx.new(|cx| Root::new(pin, window, cx))
-            },
-        )?;
-        let weak = owner.downgrade();
         let window_id = window.window_id();
+        let weak = owner.downgrade();
         let closed = cx.on_window_closed(move |cx, closed| {
             if closed == window_id {
                 let weak = weak.clone();
                 cx.defer(move |cx| {
-                    _ = weak.update(cx, |manager, cx| manager.released(handle.id(), cx));
+                    _ = weak.update(cx, |m, cx| m.released(handle.id(), cx));
                 });
             }
         });
+        let surface = surface.expect("constructed pin");
+        let ready = matches!(surface, Surface::View(..));
         owner.update(cx, |this, _| {
             this.open.insert(
                 handle.id(),
                 OpenPin {
                     snapshot,
-                    surface: Surface::View(window, view.expect("constructed pin")),
-                    _closed: Some(closed),
+                    surface,
+                    _closed: closed,
                     derived_bytes: 0,
+                    ready,
+                    on_created,
                 },
             );
         });
-        if let Some(on_created) = on_created {
-            on_created();
+        if ready {
+            owner.update(cx, |this, _| {
+                if let Some(callback) = this
+                    .open
+                    .get_mut(&handle.id())
+                    .and_then(|p| p.on_created.take())
+                {
+                    callback();
+                }
+            });
         }
         Ok(handle)
     }
-
-    /// Create an original-position pin. The callback runs once, only after creation
-    /// succeeds (including the native host's asynchronous Created acknowledgement).
-    /// Rejection, failure and pending cancellation drop the callback without invoking it.
+    /// Acknowledge the first successful image upload/paint, once. Failure or
+    /// cancellation releases the source claim and never adds an empty undo entry.
+    pub(crate) fn screenshot_ready(&mut self, id: u64, result: Result<(), String>, cx: &mut App) {
+        if !self.open.get(&id).is_some_and(|p| !p.ready) {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                let pin = self.open.get_mut(&id).unwrap();
+                pin.ready = true;
+                if let Some(callback) = pin.on_created.take() {
+                    callback();
+                }
+            }
+            Err(error) => {
+                if let Some(pin) = self.open.remove(&id) {
+                    _ = pin.surface.window().update(cx, |_, w, _| w.remove_window());
+                    eprintln!("[snapclip-pin] image preparation/paint failed id={id}: {error}");
+                    crate::show_feedback(
+                        format!("无法创建图片贴图：{error}"),
+                        platform::cursor_position(),
+                        cx,
+                    );
+                }
+            }
+        }
+    }
     pub fn open_selection(
         selection: PinSelection,
         owner: &Entity<Self>,
         cx: &mut App,
         on_created: impl FnOnce() + 'static,
     ) -> anyhow::Result<PinHandle> {
+        validate_selection(&selection)?;
         let region = selection.region();
-        let w = u32::try_from(region.width())?;
-        let h = u32::try_from(region.height())?;
-        if [w, h] != selection.image().pixels().size() {
-            anyhow::bail!("截图像素与尺寸不符");
-        }
         let image = selection.image().clone();
         Self::open_with_ready(
             Arc::new(PinSnapshot::new(PinContent::Image(image))),
@@ -268,108 +352,41 @@ impl PinManager {
             Some(Box::new(on_created)),
         )
     }
-    pub fn poll(&mut self, cx: &mut App) -> crate::PinReport {
-        let mut observed = vec![];
-        while let Some(event) = self.native.try_recv_event() {
-            observed.push(event);
-            self.apply_native_event(event, cx);
-        }
-        crate::host::summarize(observed)
-    }
-
-    fn apply_native_event(&mut self, event: PinEvent, cx: &mut App) {
-        match event {
-            PinEvent::Created { id } => {
-                if let Some(pending) = self.pending.remove(&id) {
-                    let snapshot = pending.created();
-                    self.open.insert(
-                        id,
-                        OpenPin {
-                            snapshot,
-                            surface: Surface::Image(PinHandle::from_id(id)),
-                            _closed: None,
-                            derived_bytes: 0,
-                        },
-                    );
-                }
-            }
-            PinEvent::Closed { id } => self.released(id, cx),
-            PinEvent::Failed { id } => {
-                eprintln!("[snapclip-pin] image window failed id={id}");
-                if self.pending.remove(&id).is_some() {
-                    crate::show_feedback(
-                        "无法创建图片贴图，请稍后重试",
-                        platform::cursor_position(),
-                        cx,
-                    );
-                }
-            }
-            PinEvent::CopyRequested { id } => {
-                if let Some(pin) = self.open.get(&id) {
-                    self.copy(id, CopyTarget::Content(pin.snapshot.clone()));
-                }
-            }
-            PinEvent::TextRequested { id } => {
-                if let Some(pin) = self.open.get(&id) {
-                    if let Some(text) = pin.snapshot.text().filter(|t| !t.is_empty()) {
-                        let mut snapshot = PinSnapshot::new(PinContent::Document(
-                            crate::PinDocument::new(text.into(), crate::DocumentMode::Text),
-                        ));
-                        if let PinContent::Image(image) = pin.snapshot.content() {
-                            snapshot = snapshot.with_image(image.clone());
-                        }
-                        let weak = self.owner.clone();
-                        cx.defer(move |cx| {
-                            if let Some(owner) = weak.and_then(|w| w.upgrade())
-                                && let Err(error) = Self::open(
-                                    Arc::new(snapshot),
-                                    PinPlacement::Pointer(platform::cursor_position()),
-                                    &owner,
-                                    cx,
-                                )
-                            {
-                                crate::show_feedback(
-                                    error.to_string(),
-                                    platform::cursor_position(),
-                                    cx,
-                                );
-                            }
-                        });
-                    } else {
-                        crate::show_feedback(
-                            "该图片没有文字备选表示",
-                            platform::cursor_position(),
-                            cx,
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     pub fn is_open(&self, id: u64) -> bool {
-        self.open.contains_key(&id) || self.pending.contains_key(&id)
+        self.open.contains_key(&id)
     }
     pub fn raise(&self, id: u64, cx: &mut App) -> bool {
-        match self.open.get(&id).map(|pin| &pin.surface) {
-            Some(Surface::Image(handle)) => self.native.raise(*handle).is_ok(),
-            Some(Surface::View(handle, _)) => handle
-                .update(cx, |_, window, _| {
-                    platform::visible(window, true);
-                    platform::raise(window);
+        self.open.get(&id).is_some_and(|pin| {
+            pin.surface
+                .window()
+                .update(cx, |_, w, cx| {
+                    if let Surface::Screenshot(_, view) = &pin.surface {
+                        if let Some(view) = view.upgrade() {
+                            view.update(cx, |v, cx| {
+                                v.set_visible(true, w);
+                                cx.notify();
+                            });
+                        }
+                    } else {
+                        platform::visible(w, true);
+                    }
+                    platform::raise(w);
                 })
-                .is_ok(),
-            None => self.pending.contains_key(&id),
-        }
+                .is_ok()
+        })
     }
     pub(crate) fn released(&mut self, id: u64, cx: &mut App) {
         if let Some(pin) = self.open.remove(&id) {
+            if !pin.ready {
+                return;
+            }
             self.closed.push(pin.snapshot);
             while self.closed.len() > 8 || self.retained_bytes() > 256 * 1024 * 1024 {
                 self.closed.remove(0);
             }
             if let Some(handle) = self.undo_feedback.take() {
-                _ = handle.update(cx, |_, window, _| window.remove_window());
+                _ = handle.update(cx, |_, w, _| w.remove_window());
             }
             if !self.closed.is_empty() {
                 self.undo_feedback = crate::feedback::show(
@@ -383,47 +400,67 @@ impl PinManager {
         }
     }
     pub fn close(&mut self, id: u64, cx: &mut App) {
-        if self.pending.remove(&id).is_some() {
-            _ = self.native.close_pin(PinHandle::from_id(id));
-        }
-        if let Some(pin) = self.open.get(&id) {
-            match &pin.surface {
-                Surface::Image(handle) => {
-                    _ = self.native.close_pin(*handle);
-                }
-                Surface::View(handle, _) => {
-                    _ = handle.update(cx, |_, window, _| window.remove_window());
-                }
+        // Remove pending state first: a queued paint receipt cannot resurrect it.
+        if self.open.get(&id).is_some_and(|p| !p.ready) {
+            if let Some(pin) = self.open.remove(&id) {
+                _ = pin.surface.window().update(cx, |_, w, _| w.remove_window());
             }
+        } else if let Some(pin) = self.open.get(&id) {
+            _ = pin.surface.window().update(cx, |_, w, _| w.remove_window());
         }
     }
     pub fn close_all(&mut self, cx: &mut App) {
-        let ids: Vec<_> = self
-            .open
-            .keys()
-            .chain(self.pending.keys())
-            .copied()
-            .collect();
-        for id in ids {
+        for id in self.open.keys().copied().collect::<Vec<_>>() {
             self.close(id, cx);
         }
     }
     pub fn set_visible(&mut self, visible: bool, cx: &mut App) {
-        // These commands follow Create in the native host's FIFO even if Created
-        // has not reached the application registry yet.
-        for id in self.pending.keys() {
-            _ = self.native.set_visible(PinHandle::from_id(*id), visible);
-        }
         for pin in self.open.values() {
+            let window = pin.surface.window();
             match &pin.surface {
-                Surface::Image(handle) => {
-                    _ = self.native.set_visible(*handle, visible);
+                Surface::Screenshot(_, view) => {
+                    if let Some(view) = view.upgrade() {
+                        _ = window.update(cx, |_, w, cx| {
+                            view.update(cx, |v, cx| {
+                                v.set_visible(visible, w);
+                                cx.notify();
+                            })
+                        });
+                    }
                 }
-                Surface::View(handle, _) => {
-                    _ = handle.update(cx, |_, window, _| platform::visible(window, visible));
+                Surface::View(..) => {
+                    _ = window.update(cx, |_, w, _| platform::visible(w, visible));
                 }
             }
         }
+    }
+    pub(crate) fn show_text(&self, id: u64, cx: &mut App) {
+        let Some(pin) = self.open.get(&id) else {
+            return;
+        };
+        let Some(text) = pin.snapshot.text().filter(|t| !t.is_empty()) else {
+            return;
+        };
+        let mut snapshot = PinSnapshot::new(PinContent::Document(crate::PinDocument::new(
+            text.into(),
+            crate::DocumentMode::Text,
+        )));
+        if let PinContent::Image(image) = pin.snapshot.content() {
+            snapshot = snapshot.with_image(image.clone());
+        }
+        let owner = self.owner.clone();
+        cx.defer(move |cx| {
+            if let Some(owner) = owner.and_then(|w| w.upgrade())
+                && let Err(error) = Self::open(
+                    Arc::new(snapshot),
+                    PinPlacement::Pointer(platform::cursor_position()),
+                    &owner,
+                    cx,
+                )
+            {
+                crate::show_feedback(error.to_string(), platform::cursor_position(), cx);
+            }
+        });
     }
     pub fn undo(owner: &Entity<Self>, cursor: (i32, i32), cx: &mut App) -> anyhow::Result<()> {
         if let Some(handle) = owner.update(cx, |this, _| this.undo_feedback.take()) {
@@ -458,61 +495,108 @@ impl PinManager {
             false
         }
     }
+
     pub fn report_copy(&self, id: u64, result: Result<(), String>, cx: &mut App) {
-        if self
-            .open
-            .get(&id)
-            .is_some_and(|pin| matches!(pin.surface, Surface::Image(_)))
-        {
-            crate::show_feedback(
-                result.err().unwrap_or_else(|| "已复制图片".into()),
-                platform::cursor_position(),
-                cx,
-            );
-            return;
-        }
-        if let Some(OpenPin {
-            surface: Surface::View(handle, view),
-            ..
-        }) = self.open.get(&id)
-            && let Some(view) = view.upgrade()
-        {
-            _ = handle.update(cx, |_, window, cx| {
-                view.update(cx, |this, cx| this.copied(result, window, cx))
-            });
+        if let Some(pin) = self.open.get(&id) {
+            match &pin.surface {
+                Surface::Screenshot(..) => crate::show_feedback(
+                    result.err().unwrap_or_else(|| "已复制图片".into()),
+                    platform::cursor_position(),
+                    cx,
+                ),
+                Surface::View(handle, view) => {
+                    if let Some(view) = view.upgrade() {
+                        _ = handle.update(cx, |_, w, cx| {
+                            view.update(cx, |v, cx| v.copied(result, w, cx))
+                        });
+                    }
+                }
+            }
         }
     }
     fn retained_bytes(&self) -> usize {
         self.open
             .values()
-            .map(|pin| pin.snapshot.retained_bytes() + pin.derived_bytes)
-            .chain(
-                self.pending
-                    .values()
-                    .map(|pending| pending.snapshot.retained_bytes()),
-            )
+            .map(|p| p.snapshot.retained_bytes().saturating_add(p.derived_bytes))
             .chain(self.closed.iter().map(|s| s.retained_bytes()))
-            .sum()
+            .fold(0, usize::saturating_add)
     }
 }
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ids_start_at_one_and_both_window_kinds_share_the_same_sequence() {
+        let (mut manager, _) = super::PinManager::new().unwrap();
+        assert_eq!(manager.allocate_id().unwrap().id(), 1);
+        assert_eq!(manager.allocate_id().unwrap().id(), 2);
+        assert_eq!(manager.allocate_id().unwrap().id(), 3);
+    }
+    #[test]
+    fn exhausted_ids_never_wrap_or_become_reusable() {
+        let (mut manager, _) = super::PinManager::new().unwrap();
+        manager.next_id = u64::MAX - 1;
+        assert_eq!(manager.allocate_id().unwrap().id(), u64::MAX - 1);
+        assert!(manager.allocate_id().is_err());
+        assert!(manager.allocate_id().is_err());
+        assert_eq!(manager.next_id, u64::MAX);
+    }
+    #[test]
+    fn image_copy_commands_retain_the_exact_shared_original_source() {
+        let (manager, commands) = super::PinManager::new().unwrap();
+        let image = crate::PinImage::new(1, 1, vec![17, 31, 91, 127]).unwrap();
+        manager.copy(7, super::CopyTarget::Pixels(image.clone()));
+        let super::PinCommand::Copy {
+            id: 7,
+            target: super::CopyTarget::Pixels(copy),
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("wrong copy intent")
+        };
+        assert!(std::sync::Arc::ptr_eq(image.pixels(), copy.pixels()));
+        assert_eq!(copy.pixels().as_bytes(), [91, 31, 17, 127]);
+    }
+    #[test]
+    fn valid_selections_keep_negative_origins_and_source_radius() {
+        let selection = crate::PinSelection::new(
+            snapclip_model::geometry::Rect::new(-11, -22, -10, -21),
+            crate::PinImage::new(1, 1, vec![0; 4]).unwrap(),
+        )
+        .radius(12);
+        super::validate_selection(&selection).unwrap();
+        assert_eq!(
+            (selection.region().left, selection.region().top),
+            (-11, -22)
+        );
+        assert_eq!(selection.corner_radius(), 12);
+    }
+    #[test]
+    fn empty_selection_is_rejected_before_a_window_or_id_is_allocated() {
+        let selection = crate::PinSelection::new(
+            snapclip_model::geometry::Rect::new(1, 1, 1, 2),
+            crate::PinImage::new(1, 1, vec![0; 4]).unwrap(),
+        );
+        assert!(super::validate_selection(&selection).is_err());
+    }
+    #[test]
+    fn mismatched_selection_dimensions_never_reinterpret_original_pixels() {
+        let selection = crate::PinSelection::new(
+            snapclip_model::geometry::Rect::new(0, 0, 2, 2),
+            crate::PinImage::new(1, 1, vec![0; 4]).unwrap(),
+        );
+        assert!(super::validate_selection(&selection).is_err());
+        assert_eq!(selection.image().pixels().as_bytes().len(), 4);
+    }
     #[cfg(feature = "headless-tests")]
     #[gpui_kit::test]
-    fn native_creation_receipts_commit_once_and_release_failed_or_cancelled_claims(
+    fn hdr_screenshot_is_admitted_without_consuming_its_source_at_window_creation(
         cx: &mut gpui_kit::TestAppContext,
     ) {
         use super::*;
+        use snapclip_model::pixels::{
+            AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource,
+        };
         use std::{cell::Cell, rc::Rc};
-        struct Claim(Rc<Cell<usize>>);
-        impl Drop for Claim {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
         let committed = Rc::new(Cell::new(0));
-        let released = Rc::new(Cell::new(0));
         cx.update(|cx| {
             gpui_kit::init(cx);
             yue_component::init(
@@ -523,54 +607,56 @@ mod tests {
                 ),
             )
             .unwrap();
-            let (mut manager, _commands) = PinManager::new().unwrap();
-            let snapshot = Arc::new(PinSnapshot::new(PinContent::Document(
-                crate::PinDocument::new("creation-receipt".into(), crate::DocumentMode::Text),
-            )));
-            for id in 1..=3 {
-                let claim = Claim(released.clone());
-                let committed = committed.clone();
-                manager.pending.insert(
-                    id,
-                    PendingPin {
-                        snapshot: snapshot.clone(),
-                        on_created: Some(Box::new(move || {
-                            let _claim = claim;
-                            committed.set(committed.get() + 1);
-                        })),
-                    },
-                );
-            }
-            manager.apply_native_event(PinEvent::Created { id: 1 }, cx);
-            manager.apply_native_event(PinEvent::Created { id: 1 }, cx);
-            assert_eq!(
-                committed.get(),
-                1,
-                "a duplicate Created cannot consume twice"
+            let descriptor = PixelDescriptor::new(
+                snapclip_model::PixelFormat::Rgba16Float,
+                PixelEncoding::ScRgb,
+                AlphaMode::Straight,
+            )
+            .unwrap();
+            let pixels = Arc::new(
+                PixelBuffer::from_tight(
+                    1,
+                    1,
+                    descriptor,
+                    [-0.25_f32, 12.5, 0.5, 0.5]
+                        .into_iter()
+                        .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+                        .collect(),
+                )
+                .unwrap(),
             );
-            assert!(manager.open.contains_key(&1));
-            manager.apply_native_event(PinEvent::Failed { id: 2 }, cx);
-            assert!(!manager.is_open(2));
-            manager.close(3, cx);
-            manager.apply_native_event(PinEvent::Created { id: 3 }, cx);
+            let image =
+                crate::PinImage::from_pixels(PixelSource::new(descriptor, 91), pixels).unwrap();
+            let (manager, _) = PinManager::new().unwrap();
+            let owner = cx.new(|_| manager);
+            let commit = committed.clone();
+            let result = PinManager::open_selection(
+                PinSelection::new(
+                    snapclip_model::geometry::Rect::new(-10, -20, -9, -19),
+                    image,
+                ),
+                &owner,
+                cx,
+                move || commit.set(commit.get() + 1),
+            );
             assert!(
-                !manager.is_open(3),
-                "a late acknowledgement cannot resurrect a cancelled pin"
+                result.is_ok(),
+                "HDR original-position admission failed: {result:?}"
             );
-            assert!(manager.pending.is_empty());
             assert_eq!(
                 committed.get(),
-                1,
-                "failure and cancellation must not commit"
+                0,
+                "an empty HWND must not consume a screenshot source"
             );
-            assert_eq!(
-                released.get(),
-                3,
-                "every completion path must release its source claim"
-            );
+            owner.update(cx, |manager, cx| manager.close_all(cx));
         });
+        cx.run_until_parked();
+        assert_eq!(
+            committed.get(),
+            0,
+            "cancelled creation must release its claim without consuming it"
+        );
     }
-
     #[test]
     fn clipboard_images_fit_the_monitor_without_mutating_original_pixels() {
         assert_eq!(super::initial_image_zoom((100, 100), (1920, 1080)), 1.);

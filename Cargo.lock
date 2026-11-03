@@ -6797,7 +6797,6 @@ dependencies = [
  "gpui-kit",
  "half",
  "image",
- "parking_lot",
  "png 0.18.1",
  "raw-window-handle",
  "snapclip-model",

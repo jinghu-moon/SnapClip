@@ -89,22 +89,6 @@ fn spawn_tray_commands(
     .detach();
 }
 
-/// Poll the private native image host through the same registry as GPUI windows.
-fn spawn_pin_events(pins: &Entity<PinManager>, cx: &mut Context<Shell>) {
-    let pins = pins.downgrade();
-    cx.spawn(async move |_shell, cx| {
-        loop {
-            if pins.update(cx, |pins, cx| pins.poll(cx)).is_err() {
-                break;
-            }
-            cx.background_executor()
-                .timer(Duration::from_millis(50))
-                .await;
-        }
-    })
-    .detach();
-}
-
 /// The shell's root view: the history screen, or the reason it could not open.
 ///
 /// A shell that panics because a database file is busy is worse than one that says so, and
@@ -125,7 +109,7 @@ pub struct Shell {
     /// The clipboard pipeline. Holding this is what keeps it running; dropping it stops the
     /// listener and joins the worker, so it must live as long as the shell.
     clipboard: Option<snapclip_history::ingest::ClipboardIngestHandle>,
-    /// The UI-thread pin registry and its private native image host. Failure to
+    /// The UI-thread registry for shared GPUI/Yue F3 and F6 surfaces. Failure to
     /// start this feature does not disable F5 capture or clipboard history.
     pins: Option<Entity<PinManager>>,
     pin_source: Option<Arc<capture::PinSource>>,
@@ -249,7 +233,6 @@ impl Shell {
             Ok((manager, commands)) => {
                 let pins = cx.new(|_| manager);
                 clipboard_pin::drain_copies(&pins, commands, cx);
-                spawn_pin_events(&pins, cx);
                 Some(pins)
             }
             Err(error) => {

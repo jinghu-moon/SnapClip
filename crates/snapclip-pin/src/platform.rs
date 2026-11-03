@@ -10,6 +10,115 @@ use windows_sys::Win32::{
     },
 };
 
+pub(crate) fn origin(window: &Window) -> Option<(i32, i32)> {
+    let mut rect = windows_sys::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    (unsafe { GetWindowRect(hwnd(window)?, &mut rect) } != 0).then_some((rect.left, rect.top))
+}
+
+pub(crate) fn round_screenshot(window: &Window, dimensions: (i32, i32), radius: i32) {
+    use windows_sys::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
+    let Some(hwnd) = hwnd(window) else { return };
+    unsafe {
+        if radius <= 0 {
+            SetWindowRgn(hwnd, std::ptr::null_mut(), 0);
+            return;
+        }
+        let diameter = radius.saturating_mul(2).min(dimensions.0.min(dimensions.1));
+        let region = CreateRoundRectRgn(
+            0,
+            0,
+            dimensions.0.saturating_add(1),
+            dimensions.1.saturating_add(1),
+            diameter,
+            diameter,
+        );
+        if !region.is_null() && SetWindowRgn(hwnd, region, 0) == 0 {
+            DeleteObject(region);
+        }
+        // On success Windows owns and releases the HRGN.
+    }
+}
+
+pub(crate) fn wheel_delta(event: &gpui_kit::ScrollWheelEvent) -> i32 {
+    let mut lines = 3_u32;
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            (&mut lines as *mut u32).cast(),
+            0,
+        );
+    }
+    match event.delta {
+        // GPUI's Windows backend multiplies notches by the OS scroll setting.
+        // Undo that preference: image zoom is one tenth per physical notch.
+        gpui_kit::ScrollDelta::Lines(delta) => {
+            (delta.y * 120. / lines.max(1) as f32).round() as i32
+        }
+        gpui_kit::ScrollDelta::Pixels(delta) => f32::from(delta.y).round() as i32,
+    }
+}
+
+pub(crate) fn image_menu(hwnd: usize, hdr: bool, text: bool) -> u32 {
+    unsafe {
+        release_hover_capture(hwnd as HWND);
+        let menu = CreatePopupMenu();
+        if menu.is_null() {
+            return 0;
+        }
+        for (id, label) in [
+            (1, "复制图片（SDR）"),
+            (2, "复制 HDR 图片（PNG）"),
+            (3, "查看文字备选…"),
+            (4, "关闭"),
+        ] {
+            if (id == 2 && !hdr) || (id == 3 && !text) {
+                continue;
+            }
+            let wide: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+            AppendMenuW(menu, MF_STRING, id, wide.as_ptr());
+        }
+        let cursor = cursor_position();
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            cursor.0,
+            cursor.1,
+            0,
+            hwnd as HWND,
+            std::ptr::null(),
+        ) as u32;
+        DestroyMenu(menu);
+        command
+    }
+}
+
+pub(crate) fn hover_capture(window: &Window, hovered: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, SetCapture};
+    if let Some(hwnd) = hwnd(window) {
+        unsafe {
+            if hovered && GetCapture().is_null() {
+                SetCapture(hwnd);
+            } else if !hovered {
+                release_hover_capture(hwnd);
+            }
+        }
+    }
+}
+unsafe fn release_hover_capture(hwnd: HWND) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture};
+    unsafe {
+        if GetCapture() == hwnd {
+            ReleaseCapture();
+        }
+    }
+}
+
 pub(crate) fn hwnd(window: &Window) -> Option<HWND> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as HWND),

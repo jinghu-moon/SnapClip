@@ -172,7 +172,6 @@ impl ClipboardPins {
                 Ok(prepared) => {
                     let snapshot = prepared.snapshot();
                     let key = (snapshot.completed_sequence(), prepared.fingerprint());
-                    self.manager.update(cx, |manager, cx| manager.poll(cx));
                     self.opened
                         .retain(|_, id| self.manager.read(cx).is_open(*id));
                     let raised = self.opened.get(&key).is_some_and(|id| {

@@ -8,9 +8,11 @@ use snapclip_pin::{
     DocumentMode, FileKind, PinCommand, PinContent, PinDocument, PinFile, PinImage, PinManager,
     PinPlacement, PinSnapshot, PinTable,
 };
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-struct Preview(Entity<PinManager>);
+struct Preview {
+    _owner: Entity<PinManager>,
+}
 impl Global for Preview {}
 
 fn sample(mode: &str) -> PinSnapshot {
@@ -101,18 +103,6 @@ fn main() {
                 }
             })
             .detach();
-            cx.set_global(Preview(owner));
-            cx.spawn(async move |cx| {
-                loop {
-                    cx.update(|cx| {
-                        let owner = cx.global::<Preview>().0.clone();
-                        owner.update(cx, |this, cx| this.poll(cx));
-                    });
-                    cx.background_executor()
-                        .timer(Duration::from_millis(50))
-                        .await;
-                }
-            })
-            .detach();
+            cx.set_global(Preview { _owner: owner });
         });
 }

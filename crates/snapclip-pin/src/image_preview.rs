@@ -119,6 +119,10 @@ pub(crate) fn encode(image: &PinImage, thumbnail: bool) -> Result<Vec<u8>, Strin
 }
 
 #[cfg(test)]
+#[path = "image_preview_contract_tests.rs"]
+mod contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::decode_image as decode;
     use super::*;
