@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$TargetDir = 'target',
     [string]$CargoConfig = '',
     [string]$Ffmpeg = 'ffmpeg',
