@@ -81,13 +81,14 @@ impl CaptureState {
 
 /// How the captured pixels are handed to the application layer.
 ///
-/// The MVP resolves the selection to a PNG artifact on disk, so the capture module
-/// never has to hold a GPU resource across the process boundary and the application
-/// layer never has to know about D3D11.
+/// SDR may be stored losslessly as PNG8. High-precision captures use a source-format
+/// pixel master; PNG/HDR PNG are derived exports. Neither payload retains a GPU object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapturePayload {
     /// Absolute path to a PNG file inside the application artifact directory.
     PngFile { path: std::path::PathBuf },
+    /// Lossless source-format pixel master; exported images are derived artifacts.
+    PixelMaster { reference: crate::ArtifactRef },
 }
 
 /// Domain result of a finished capture session.
@@ -100,16 +101,23 @@ pub struct CaptureArtifact {
     pub width: u32,
     pub height: u32,
     pub dpi: u32,
-    pub pixel_format: PixelFormat,
+    pub source: crate::pixels::PixelSource,
     pub captured_at_unix_ms: i64,
     pub monitor_device_name: Option<String>,
     pub payload: CapturePayload,
 }
 
 impl CaptureArtifact {
+    pub fn artifact_path(&self) -> &std::path::Path {
+        match &self.payload {
+            CapturePayload::PngFile { path } => path,
+            CapturePayload::PixelMaster { reference } => &reference.absolute_path,
+        }
+    }
     pub fn png_path(&self) -> Option<&std::path::Path> {
         match &self.payload {
             CapturePayload::PngFile { path } => Some(path.as_path()),
+            CapturePayload::PixelMaster { .. } => None,
         }
     }
 }
@@ -142,7 +150,7 @@ mod tests {
             width: 100,
             height: 50,
             dpi: 96,
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: crate::pixels::PixelSource::new(crate::pixels::PixelDescriptor::bgra8(), 0),
             captured_at_unix_ms: 7,
             monitor_device_name: None,
             payload: CapturePayload::PngFile {

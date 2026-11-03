@@ -264,7 +264,10 @@ mod tests {
         let frame = snapclip_capture::session::CapturedFrame {
             width: 4,
             height: 4,
-            pixel_format: snapclip_model::PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 0,
             provider: "test",
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
@@ -273,7 +276,13 @@ mod tests {
             corner_radius: 0,
             frame,
             region: snapclip_model::geometry::Rect::new(0, 0, 2, 2),
-            bgra: vec![0; 16],
+            pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                2,
+                2,
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                vec![0; 16],
+            )
+            .unwrap(),
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         })
     }

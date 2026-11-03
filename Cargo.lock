@@ -6732,6 +6732,7 @@ name = "snapclip-capture"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "half",
  "serde",
  "serde_json",
  "snapclip-model",
@@ -6765,6 +6766,7 @@ name = "snapclip-history"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "flate2",
  "image",
  "rusqlite",
  "serde",

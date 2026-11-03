@@ -38,6 +38,13 @@ pub fn save_bands(
 /// Encodes a band source to PNG bytes without touching the disk. Separate from [`save_bands`] so
 /// the encoding can be compared with the whole-image path without a file in between.
 pub fn encode_png_bands(bands: &mut dyn BandSource, width: u32) -> Result<Vec<u8>, SaveError> {
+    let source = bands.source();
+    if source.descriptor() != snapclip_model::pixels::PixelDescriptor::bgra8() {
+        return Err(SaveError::Io(
+            "PNG8 band export requires straight SDR BGRA8; the high-precision source is preserved"
+                .into(),
+        ));
+    }
     let rows = bands.rows();
     let mut sink = PngRowBandSink::new();
     let mut writer = sink
@@ -52,7 +59,7 @@ pub fn encode_png_bands(bands: &mut dyn BandSource, width: u32) -> Result<Vec<u8
     while first < rows {
         let take = BAND_ROWS.min(rows - first);
         buffer.clear();
-        if !bands.read_rows(first, take, &mut buffer) {
+        if !bands.read_rows(first, take, &mut buffer) || bands.source() != source {
             return Err(SaveError::Io(format!(
                 "the band source refused rows {first}..{}",
                 first + take
@@ -109,6 +116,12 @@ mod tests {
     }
 
     impl BandSource for Rows {
+        fn source(&self) -> snapclip_model::pixels::PixelSource {
+            snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            )
+        }
         fn rows(&self) -> u32 {
             self.height
         }

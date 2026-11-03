@@ -93,7 +93,7 @@ impl PinSource {
         // 这里是唯一一次拷贝：`PinSelection` 要的是自己那份 `Arc<Vec<u8>>`（贴图窗口要
         // 独立的生命周期，不能用借来的切片，而 `SelectionPixels` 会随捕获侧的槽位一起走）。
         Some(
-            PinSelection::new(region, Arc::new(selection.bgra.clone()))
+            PinSelection::new(region, Arc::new(selection.sdr_bgra().ok()?.to_vec()))
                 .radius(selection.corner_radius),
         )
     }
@@ -127,7 +127,13 @@ mod tests {
             corner_radius: 0,
             frame: frame(200, 100),
             region,
-            bgra: vec![7; region.width() as usize * region.height() as usize * 4],
+            pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                region.width() as u32,
+                region.height() as u32,
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                vec![7; region.width() as usize * region.height() as usize * 4],
+            )
+            .unwrap(),
             origin,
         }
     }
@@ -224,7 +230,10 @@ mod tests {
         snapclip_capture::session::CapturedFrame {
             width,
             height,
-            pixel_format: snapclip_model::PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "test",
             origin: Some(Point::new(0, 0)),

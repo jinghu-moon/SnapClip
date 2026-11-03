@@ -12,7 +12,7 @@
 //! # Rows, not an image (`P4.03`)
 //!
 //! Until `P4.03` this function handed one whole image to an encoder, and the chain held four
-//! copies of the pixels (`docs/30 §22.1`): `prepared.bgra.clone()`, the BGRA→RGBA buffer the old
+//! copies of the pixels (`docs/30 §22.1`): the old `prepared.bgra.clone()`, the BGRA→RGBA buffer the old
 //! encoder built, the second `Vec` `RgbaImage::from_raw` took of it, and the encoder's own working
 //! set. At `1920×300,000` one copy is 2.15 GiB, so "four copies" was not slowness, it was an export
 //! that cannot finish (`F-07`).
@@ -53,11 +53,15 @@ impl HistoryArtifactWriter {
 /// The whole-image entry point is this source with one band, so both entry points run the
 /// same encoding loop (docs/35 §13.4).
 struct WholeImage<'a> {
-    bgra: &'a [u8],
+    bytes: &'a [u8],
     rows: u32,
+    source: snapclip_model::pixels::PixelSource,
 }
 
 impl snapclip_capture::ports::BandSource for WholeImage<'_> {
+    fn source(&self) -> snapclip_model::pixels::PixelSource {
+        self.source
+    }
     fn rows(&self) -> u32 {
         self.rows
     }
@@ -65,7 +69,7 @@ impl snapclip_capture::ports::BandSource for WholeImage<'_> {
     fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool {
         let start = first_row as usize * self.row_bytes();
         let len = rows as usize * self.row_bytes();
-        match self.bgra.get(start..start + len) {
+        match self.bytes.get(start..start + len) {
             Some(slice) => {
                 out.clear();
                 out.extend_from_slice(slice);
@@ -81,7 +85,7 @@ impl WholeImage<'_> {
         if self.rows == 0 {
             0
         } else {
-            self.bgra.len() / self.rows as usize
+            self.bytes.len() / self.rows as usize
         }
     }
 }
@@ -98,23 +102,28 @@ impl ArtifactWriter for HistoryArtifactWriter {
         // `Bgra8Image::new` used to be the length check; it went with the copy it was attached
         // to. Same comparison, same words — `P4.01`'s pixels are tightly packed `region`-sized
         // BGRA.
-        let expected = u64::from(width) * u64::from(height) * 4;
-        if expected != prepared.bgra.len() as u64 {
+        prepared.validate()?;
+        let expected = u64::from(width)
+            * u64::from(height)
+            * prepared.pixels.descriptor().bytes_per_pixel() as u64;
+        let bytes = prepared.pixels.as_bytes();
+        if expected != bytes.len() as u64 {
             return Err(CaptureError::EncodeFailed(format!(
-                "bgra buffer of {} bytes does not match {width}x{height}",
-                prepared.bgra.len()
+                "pixel buffer of {} bytes does not match {width}x{height}",
+                bytes.len()
             )));
         }
         let spec = snapclip_capture::ports::SelectionSpec {
             region: prepared.region,
-            pixel_format: prepared.frame.pixel_format,
+            source: prepared.source(),
             captured_at_unix_ms: prepared.frame.captured_at_unix_ms,
             origin: prepared.origin,
             corner_radius: prepared.corner_radius,
         };
         let mut whole = WholeImage {
-            bgra: &prepared.bgra,
+            bytes,
             rows: height,
+            source: prepared.source(),
         };
         self.write_bands(session_id, &spec, &mut whole, dpi, monitor_device_name)
     }
@@ -134,11 +143,63 @@ impl ArtifactWriter for HistoryArtifactWriter {
         monitor_device_name: Option<String>,
     ) -> CaptureResult<snapclip_model::CaptureArtifact> {
         let (width, height) = checked_size(spec.region)?;
+        if bands.source() != spec.source {
+            return Err(CaptureError::EncodeFailed(
+                "band source differs from its frozen generation".into(),
+            ));
+        }
         if bands.rows() != height {
             return Err(CaptureError::EncodeFailed(format!(
                 "band source has {} rows but the region is {height} tall",
                 bands.rows()
             )));
+        }
+
+        // HDR/linear/associated source bits belong to a pixel master, never PNG8.
+        // Ordinary SDR keeps its existing streaming PNG path and memory behavior.
+        if spec.source.descriptor() != snapclip_model::pixels::PixelDescriptor::bgra8() {
+            let metadata = CaptureMetadata {
+                session_id: session_id.into(),
+                width,
+                height,
+                dpi,
+                source: spec.source,
+                captured_at_unix_ms: spec.captured_at_unix_ms,
+                monitor_device_name,
+            };
+            let reference = self
+                .store
+                .write_pixel_master(&metadata, |first, count| {
+                    let mut bytes = Vec::new();
+                    if bands.source() != spec.source
+                        || !bands.read_rows(first, count, &mut bytes)
+                        || bands.source() != spec.source
+                    {
+                        return Err(snapclip_history::StoreError::InvalidPublication(
+                            "source changed or refused a master tile".into(),
+                        ));
+                    }
+                    snapclip_model::pixels::PixelBuffer::from_tight(
+                        width,
+                        count,
+                        spec.source.descriptor(),
+                        bytes,
+                    )
+                    .map_err(|message| {
+                        snapclip_history::StoreError::InvalidPublication(message.into())
+                    })
+                })
+                .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
+            return Ok(CaptureArtifact {
+                session_id: session_id.into(),
+                width,
+                height,
+                dpi,
+                source: spec.source,
+                captured_at_unix_ms: spec.captured_at_unix_ms,
+                monitor_device_name: metadata.monitor_device_name,
+                payload: CapturePayload::PixelMaster { reference },
+            });
         }
 
         let meta = ImageMeta {
@@ -160,7 +221,7 @@ impl ArtifactWriter for HistoryArtifactWriter {
         while first < height {
             let count = (height - first).min(band_rows);
             scratch.resize(count as usize * row_bytes, 0);
-            if !bands.read_rows(first, count, &mut scratch) {
+            if !bands.read_rows(first, count, &mut scratch) || bands.source() != spec.source {
                 return Err(CaptureError::EncodeFailed(format!(
                     "band source failed at row {first} of {height}"
                 )));
@@ -182,7 +243,7 @@ impl ArtifactWriter for HistoryArtifactWriter {
                 width,
                 height,
                 dpi,
-                pixel_format: spec.pixel_format,
+                source: spec.source,
                 captured_at_unix_ms: spec.captured_at_unix_ms,
                 monitor_device_name,
             },
@@ -197,7 +258,7 @@ impl ArtifactWriter for HistoryArtifactWriter {
             width,
             height,
             dpi,
-            pixel_format: spec.pixel_format,
+            source: spec.source,
             captured_at_unix_ms: spec.captured_at_unix_ms,
             monitor_device_name: output.metadata.monitor_device_name.clone(),
             payload: CapturePayload::PngFile {
@@ -235,7 +296,6 @@ mod tests {
     use snapclip_capture::ports::ArtifactWriter;
     use snapclip_capture::session::CapturedFrame;
     use snapclip_history::image::decode_to_bgra8;
-    use snapclip_model::PixelFormat;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -248,6 +308,12 @@ mod tests {
     fn a_band_source_that_fails_writes_no_artifact() {
         struct Broken;
         impl snapclip_capture::ports::BandSource for Broken {
+            fn source(&self) -> snapclip_model::pixels::PixelSource {
+                snapclip_model::pixels::PixelSource::new(
+                    snapclip_model::pixels::PixelDescriptor::bgra8(),
+                    0,
+                )
+            }
             fn rows(&self) -> u32 {
                 4
             }
@@ -260,7 +326,10 @@ mod tests {
         let writer = HistoryArtifactWriter::new(path.clone());
         let spec = snapclip_capture::ports::SelectionSpec {
             region: Rect::new(0, 0, 4, 4),
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 0,
             origin: None,
             corner_radius: 0,
@@ -296,7 +365,13 @@ mod tests {
     }
 
     impl PixelSliceSource for GridPixels {
-        fn read_bgra(&self, region: Rect) -> CaptureResult<Vec<u8>> {
+        fn source(&self) -> snapclip_model::pixels::PixelSource {
+            snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            )
+        }
+        fn read_pixels(&self, region: Rect) -> CaptureResult<snapclip_model::pixels::PixelBuffer> {
             let clipped = region.intersect(Rect::new(0, 0, self.width, self.height));
             let mut bytes = Vec::with_capacity((clipped.area() * 4) as usize);
             for y in clipped.top..clipped.bottom {
@@ -304,7 +379,13 @@ mod tests {
                     bytes.extend_from_slice(&[x as u8, y as u8, 0, 255]);
                 }
             }
-            Ok(bytes)
+            Ok(snapclip_model::pixels::PixelBuffer::from_tight(
+                clipped.width() as u32,
+                clipped.height() as u32,
+                self.source().descriptor(),
+                bytes,
+            )
+            .unwrap())
         }
     }
 
@@ -312,7 +393,10 @@ mod tests {
         CapturedFrame {
             width,
             height,
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "test",
             // These tests are about encoding, not about where the pixels came from.
@@ -337,7 +421,13 @@ mod tests {
             corner_radius: 0,
             frame: frame(width, height),
             region: Rect::new(0, 0, width as i32, height as i32),
-            bgra,
+            pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                width,
+                height,
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                bgra,
+            )
+            .unwrap(),
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         };
 
@@ -411,7 +501,13 @@ mod tests {
             corner_radius: 0,
             frame: frame(4, 4),
             region: Rect::new(0, 0, -5, 2),
-            bgra: Vec::new(),
+            pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                4,
+                4,
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                vec![0; 64],
+            )
+            .unwrap(),
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         };
 
@@ -444,6 +540,12 @@ mod tests {
         }
 
         impl snapclip_capture::ports::BandSource for Rows {
+            fn source(&self) -> snapclip_model::pixels::PixelSource {
+                snapclip_model::pixels::PixelSource::new(
+                    snapclip_model::pixels::PixelDescriptor::bgra8(),
+                    0,
+                )
+            }
             fn rows(&self) -> u32 {
                 self.rows
             }
@@ -475,7 +577,13 @@ mod tests {
             corner_radius: 0,
             frame: frame(width, height),
             region: Rect::new(0, 0, width as i32, height as i32),
-            bgra,
+            pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                width,
+                height,
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                bgra,
+            )
+            .unwrap(),
             origin: None,
         };
 
@@ -484,7 +592,7 @@ mod tests {
             .expect("whole export");
         let spec = snapclip_capture::ports::SelectionSpec {
             region: prepared.region,
-            pixel_format: prepared.frame.pixel_format,
+            source: prepared.frame.source,
             captured_at_unix_ms: prepared.frame.captured_at_unix_ms,
             origin: prepared.origin,
             corner_radius: prepared.corner_radius,
@@ -506,6 +614,144 @@ mod tests {
             bytes_of(&banded),
             "the banded entry point wrote a different file than the whole-image one",
         );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn hdr_selection_publishes_a_lossless_master_without_a_png8_conversion() {
+        use snapclip_model::pixels::{
+            AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource,
+        };
+        let directory = root("hdr-master");
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let source = PixelSource::new(descriptor, 41);
+        let bytes = [0, 0xbc, 0, 0x49, 0, 0, 0, 0x38].repeat(12);
+        let mut frame = frame(4, 3);
+        frame.source = source;
+        let selection = SelectionPixels {
+            frame,
+            region: Rect::new(0, 0, 4, 3),
+            pixels: PixelBuffer::from_tight(4, 3, descriptor, bytes.clone()).unwrap(),
+            origin: None,
+            corner_radius: 0,
+        };
+        let result = HistoryArtifactWriter::new(&directory)
+            .write("hdr-selection", &selection, 144, None)
+            .unwrap();
+        assert_eq!(result.source, source);
+        assert!(result.png_path().is_none());
+        let snapclip_model::CapturePayload::PixelMaster { reference } = &result.payload else {
+            panic!("HDR must retain a source-format master")
+        };
+        let mut master = snapclip_history::pixel_master::PixelMaster::open(reference).unwrap();
+        assert_eq!(master.metadata().source, source);
+        assert_eq!(master.read_rows(0, 3).unwrap().as_bytes(), bytes);
+        assert_eq!(
+            selection.pixels.as_bytes(),
+            bytes,
+            "persistence must not mutate the source"
+        );
+        drop(master);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn changed_source_generation_cannot_publish_a_master() {
+        use snapclip_capture::ports::{BandSource, SelectionSpec};
+        use snapclip_model::pixels::{AlphaMode, PixelDescriptor, PixelEncoding, PixelSource};
+        struct Changing(PixelSource);
+        impl BandSource for Changing {
+            fn source(&self) -> PixelSource {
+                self.0
+            }
+            fn rows(&self) -> u32 {
+                3
+            }
+            fn read_rows(&mut self, _: u32, count: u32, bytes: &mut Vec<u8>) -> bool {
+                *bytes = [0, 0xbc, 0, 0x49, 0, 0, 0, 0x3c].repeat(4 * count as usize);
+                self.0 = PixelSource::new(self.0.descriptor(), 42);
+                true
+            }
+        }
+        let directory = root("changed-master");
+        let source = PixelSource::new(
+            PixelDescriptor::new(
+                snapclip_model::PixelFormat::Rgba16Float,
+                PixelEncoding::ScRgb,
+                AlphaMode::Straight,
+            )
+            .unwrap(),
+            41,
+        );
+        let spec = SelectionSpec {
+            region: Rect::new(0, 0, 4, 3),
+            source,
+            captured_at_unix_ms: 1,
+            origin: None,
+            corner_radius: 0,
+        };
+        assert!(
+            HistoryArtifactWriter::new(&directory)
+                .write_bands("changed-source", &spec, &mut Changing(source), 96, None)
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn rounded_opaque_hdr_selection_records_the_derived_alpha_without_relabeling_the_frame() {
+        use snapclip_model::pixels::{
+            AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource,
+        };
+        let directory = root("rounded-hdr-master");
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Opaque,
+        )
+        .unwrap();
+        let source = PixelSource::new(descriptor, 41);
+        let mut frame = frame(20, 20);
+        frame.source = source;
+        let pixels = PixelBuffer::from_tight(
+            20,
+            20,
+            descriptor,
+            [0, 0xbc, 0, 0x49, 0, 0, 0, 0x3c].repeat(400),
+        )
+        .unwrap();
+        let selection = SelectionPixels {
+            frame,
+            region: Rect::new(0, 0, 20, 20),
+            origin: None,
+            corner_radius: 6,
+            pixels: snapclip_capture::artifact::round_pixel_corners(pixels, 6).unwrap(),
+        };
+        let result = HistoryArtifactWriter::new(&directory)
+            .write("rounded-hdr-selection", &selection, 144, None)
+            .unwrap();
+        assert_eq!(
+            selection.frame.source, source,
+            "the acquisition definition is immutable"
+        );
+        assert_eq!(result.source.generation(), source.generation());
+        assert_eq!(result.source.descriptor().alpha(), AlphaMode::Straight);
+        let snapclip_model::CapturePayload::PixelMaster { reference } = &result.payload else {
+            panic!("HDR must retain a source-format master")
+        };
+        let mut master = snapclip_history::pixel_master::PixelMaster::open(reference).unwrap();
+        assert_eq!(master.metadata().source, result.source);
+        assert_eq!(
+            master.read_rows(0, 20).unwrap().as_bytes(),
+            selection.pixels.as_bytes()
+        );
+        drop(master);
         let _ = fs::remove_dir_all(directory);
     }
 }

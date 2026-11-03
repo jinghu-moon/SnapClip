@@ -13,6 +13,10 @@
 //!   feature needs. It captures the target window's own content, which is what makes
 //!   "the overlay does not have to hide" true (§24.2 reason 1).
 
+use snapclip_model::{
+    PixelFormat,
+    pixels::{AlphaMode, PixelDescriptor, PixelEncoding},
+};
 use std::time::{Duration, Instant};
 
 use ::windows::Graphics::Capture::{
@@ -49,6 +53,41 @@ const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// and closes the session, so extra slots would only cost memory.
 const SESSION_POOL_BUFFERS: i32 = 3;
 
+/// WGC FP16 is absolute scRGB, never an untagged relative-linear SDR buffer.
+fn frame_pool_format(descriptor: PixelDescriptor) -> Result<DirectXPixelFormat, String> {
+    if descriptor == PixelDescriptor::bgra8() {
+        return Ok(DirectXPixelFormat::B8G8R8A8UIntNormalized);
+    }
+    let hdr = PixelDescriptor::new(
+        PixelFormat::Rgba16Float,
+        PixelEncoding::ScRgb,
+        AlphaMode::Straight,
+    )
+    .expect("fixed WGC scRGB contract");
+    if descriptor == hdr {
+        Ok(DirectXPixelFormat::R16G16B16A16Float)
+    } else {
+        Err("WGC requires straight BGRA8/sRGB or RGBA16F/scRGB".into())
+    }
+}
+
+fn validate_frame_texture(
+    description: &::windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC,
+    content: (i32, i32),
+    descriptor: PixelDescriptor,
+) -> Result<(), String> {
+    frame_pool_format(descriptor)?;
+    if content.0 <= 0
+        || content.1 <= 0
+        || content.0 as u32 > description.Width
+        || content.1 as u32 > description.Height
+        || description.Format != super::d3d11::dxgi_format(descriptor.format())
+    {
+        return Err("WGC texture does not match its content size or requested pixel format".into());
+    }
+    Ok(())
+}
+
 /// Whether this Windows build exposes Windows Graphics Capture at all.
 ///
 /// Probes the API instead of trusting a version number: the type can exist while
@@ -66,7 +105,9 @@ pub fn is_supported() -> bool {
 pub fn capture_monitor(
     device: &GraphicsDevice,
     layout: &monitor::CapturedMonitor,
+    descriptor: PixelDescriptor,
 ) -> Result<GpuFrame, String> {
+    let format = frame_pool_format(descriptor)?;
     if !is_supported() {
         return Err("Windows Graphics Capture is not supported on this system".into());
     }
@@ -87,13 +128,10 @@ pub fn capture_monitor(
         .cast()
         .map_err(|error| super::hresult("IDirect3DDevice::cast", &error))?;
 
-    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-        &direct3d_device,
-        DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        2,
-        size,
-    )
-    .map_err(|error| super::hresult("Direct3D11CaptureFramePool::CreateFreeThreaded", &error))?;
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&direct3d_device, format, 2, size)
+        .map_err(|error| {
+            super::hresult("Direct3D11CaptureFramePool::CreateFreeThreaded", &error)
+        })?;
 
     // Event-driven first-frame wait (docs/11 §3.2): `FrameArrived` signals a
     // manual-reset event and the worker parks on it, replacing the old 20 ms
@@ -159,12 +197,24 @@ pub fn capture_monitor(
     let texture: ID3D11Texture2D = unsafe { access.GetInterface() }
         .map_err(|error| super::hresult("IDirect3DDxgiInterfaceAccess::GetInterface", &error))?;
 
+    let content = frame.ContentSize();
     // Keep our own reference, then tear the capture session down immediately.
     session
         .Close()
         .map_err(|error| super::hresult("GraphicsCaptureSession::Close", &error))?;
     pool.Close()
         .map_err(|error| super::hresult("Direct3D11CaptureFramePool::Close", &error))?;
+
+    let content = content.map_err(|error| super::hresult("ContentSize", &error))?;
+    if content.Width != size.Width || content.Height != size.Height {
+        return Err("monitor dimensions changed during WGC capture".into());
+    }
+    let mut description = ::windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut description) };
+    validate_frame_texture(&description, (size.Width, size.Height), descriptor)?;
+    if description.Width != layout.width() || description.Height != layout.height() {
+        return Err("WGC monitor texture dimensions do not match the frozen frame".into());
+    }
 
     Ok(GpuFrame {
         texture,
@@ -412,9 +462,13 @@ pub struct WgcFrame {
     frame: Direct3D11CaptureFrame,
     texture: ID3D11Texture2D,
     size: (i32, i32),
+    descriptor: PixelDescriptor,
 }
 
 impl WgcFrame {
+    pub fn descriptor(&self) -> PixelDescriptor {
+        self.descriptor
+    }
     /// The captured content, valid while this frame is alive.
     pub fn texture(&self) -> &ID3D11Texture2D {
         &self.texture
@@ -569,6 +623,7 @@ impl CaptureOptionTarget for WinRtSession<'_> {
 /// Dropping the session removes the arrival handler and closes the session and pool;
 /// the caller does not have to do anything.
 pub struct WgcSession {
+    descriptor: PixelDescriptor,
     item: GraphicsCaptureItem,
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
@@ -587,8 +642,16 @@ impl WgcSession {
     /// `handle` is the monitor handle from `MonitorFromWindow`/`MonitorFromPoint`; the interop wants
     /// the `windows` handle while `windows-sys` produces the same pointer, which is why this takes an
     /// `isize` like its window twin.
-    pub fn open_monitor(device: &GraphicsDevice, monitor: isize) -> Result<Self, WgcError> {
-        Self::open_item(device, create_item_for_monitor(monitor)?)
+    pub fn open_monitor(
+        device: &GraphicsDevice,
+        monitor: isize,
+        descriptor: PixelDescriptor,
+    ) -> Result<Self, WgcError> {
+        frame_pool_format(descriptor).map_err(|detail| WgcError::Failed {
+            context: "WGC pixel contract",
+            detail,
+        })?;
+        Self::open_item(device, create_item_for_monitor(monitor)?, descriptor)
     }
 
     /// The body both constructors share: everything after the capture item exists.
@@ -596,7 +659,15 @@ impl WgcSession {
     /// Split out in `P7.13c` because the item is the *only* thing that differs between a window and a
     /// monitor session — the pool, the arrival event, the option probe and the sizing rules are the
     /// same code, and duplicating them would be two places for the pool's buffer count to drift.
-    fn open_item(device: &GraphicsDevice, item: GraphicsCaptureItem) -> Result<Self, WgcError> {
+    fn open_item(
+        device: &GraphicsDevice,
+        item: GraphicsCaptureItem,
+        descriptor: PixelDescriptor,
+    ) -> Result<Self, WgcError> {
+        let format = frame_pool_format(descriptor).map_err(|detail| WgcError::Failed {
+            context: "WGC pixel contract",
+            detail,
+        })?;
         if !is_supported() {
             return Err(WgcError::Failed {
                 context: "GraphicsCaptureSession::IsSupported",
@@ -611,7 +682,7 @@ impl WgcSession {
         let direct3d_device = direct3d_device(device)?;
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &direct3d_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            format,
             SESSION_POOL_BUFFERS,
             content,
         )
@@ -653,6 +724,7 @@ impl WgcSession {
         })?;
 
         Ok(Self {
+            descriptor,
             item,
             pool,
             session,
@@ -708,10 +780,18 @@ impl WgcSession {
                     })?;
                     let size = (content.Width, content.Height);
                     if let Sizing::Recreate { width, height } = self.sizing.observe(size) {
+                        // This frame still belongs to the old-sized pool. Release it
+                        // before rebuilding and wait for a frame of the new pool.
+                        drop(frame);
                         self.pool
                             .Recreate(
                                 &self.device,
-                                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                frame_pool_format(self.descriptor).map_err(|detail| {
+                                    WgcError::Failed {
+                                        context: "WGC pixel contract",
+                                        detail,
+                                    }
+                                })?,
                                 SESSION_POOL_BUFFERS,
                                 SizeInt32 {
                                     Width: width,
@@ -725,12 +805,26 @@ impl WgcSession {
                                     &error,
                                 ),
                             })?;
+                        if Instant::now() >= deadline {
+                            return Ok(None);
+                        }
+                        continue;
                     }
                     let texture = texture_of(&frame)?;
+                    let mut description =
+                        ::windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+                    unsafe { texture.GetDesc(&mut description) };
+                    validate_frame_texture(&description, size, self.descriptor).map_err(
+                        |detail| WgcError::Failed {
+                            context: "WGC frame texture",
+                            detail,
+                        },
+                    )?;
                     return Ok(Some(WgcFrame {
                         frame,
                         texture,
                         size,
+                        descriptor: self.descriptor,
                     }));
                 }
                 Err(error) => {
@@ -778,6 +872,73 @@ impl Drop for WgcSession {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_pool_formats_keep_sc_rgb_distinct_from_relative_linear_sdr() {
+        use ::windows::Graphics::DirectX::DirectXPixelFormat;
+        use snapclip_model::{
+            PixelFormat,
+            pixels::{AlphaMode, PixelDescriptor, PixelEncoding},
+        };
+        let hdr = PixelDescriptor::new(
+            PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        assert_eq!(
+            super::frame_pool_format(PixelDescriptor::bgra8()).unwrap(),
+            DirectXPixelFormat::B8G8R8A8UIntNormalized
+        );
+        assert_eq!(
+            super::frame_pool_format(hdr).unwrap(),
+            DirectXPixelFormat::R16G16B16A16Float
+        );
+        let relative = PixelDescriptor::new(
+            PixelFormat::Rgba16Float,
+            PixelEncoding::LinearSrgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let premultiplied = PixelDescriptor::new(
+            PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Premultiplied,
+        )
+        .unwrap();
+        assert!(super::frame_pool_format(relative).is_err());
+        assert!(super::frame_pool_format(premultiplied).is_err());
+    }
+
+    #[test]
+    fn captured_texture_contract_rejects_wrong_format_and_short_content() {
+        use ::windows::Win32::Graphics::{
+            Direct3D11::D3D11_TEXTURE2D_DESC, Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+        };
+        use snapclip_model::pixels::PixelDescriptor;
+        let mut texture = D3D11_TEXTURE2D_DESC {
+            Width: 64,
+            Height: 48,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            ..Default::default()
+        };
+        assert!(
+            super::validate_frame_texture(&texture, (64, 48), PixelDescriptor::bgra8()).is_ok()
+        );
+        // A smaller content rectangle inside a previously larger pool is valid.
+        assert!(
+            super::validate_frame_texture(&texture, (32, 24), PixelDescriptor::bgra8()).is_ok()
+        );
+        assert!(
+            super::validate_frame_texture(&texture, (65, 48), PixelDescriptor::bgra8()).is_err()
+        );
+        assert!(
+            super::validate_frame_texture(&texture, (64, 0), PixelDescriptor::bgra8()).is_err()
+        );
+        texture.Format = ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+        assert!(
+            super::validate_frame_texture(&texture, (64, 48), PixelDescriptor::bgra8()).is_err()
+        );
+    }
     use super::{
         CaptureOptionTarget, CaptureOptions, PoolSizing, Sizing, is_supported,
         probe_capture_options,

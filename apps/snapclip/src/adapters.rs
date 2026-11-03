@@ -436,15 +436,22 @@ mod save_open_tests {
             frame: snapclip_capture::session::CapturedFrame {
                 width: 2,
                 height: 2,
-                pixel_format: snapclip_model::PixelFormat::Bgra8Unorm,
+                source: snapclip_model::pixels::PixelSource::new(
+                    snapclip_model::pixels::PixelDescriptor::bgra8(),
+                    0,
+                ),
                 captured_at_unix_ms: 0,
                 provider: "test",
                 origin: Some(snapclip_model::Point::new(0, 0)),
             },
             region: snapclip_model::Rect::new(0, 0, 2, 2),
-            bgra: vec![
-                0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
-            ],
+            pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                2,
+                2,
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                [0, 0, 255, 255].repeat(4),
+            )
+            .unwrap(),
             origin: Some(snapclip_model::Point::new(0, 0)),
             corner_radius: 0,
         }
@@ -463,7 +470,11 @@ mod save_open_tests {
             *recorder.lock().unwrap_or_else(|p| p.into_inner()) = Some((
                 pixels.region.right - pixels.region.left,
                 pixels.region.bottom - pixels.region.top,
-                pixels.bgra.get(..4).map(|px| [px[0], px[1], px[2], px[3]]),
+                pixels
+                    .pixels
+                    .as_bytes()
+                    .get(..4)
+                    .map(|px| [px[0], px[1], px[2], px[3]]),
             ));
             Ok(())
         }));

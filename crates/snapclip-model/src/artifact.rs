@@ -29,7 +29,7 @@ pub struct CaptureMetadata {
     pub width: u32,
     pub height: u32,
     pub dpi: u32,
-    pub pixel_format: crate::capture::PixelFormat,
+    pub source: crate::pixels::PixelSource,
     pub captured_at_unix_ms: i64,
     /// Absent when the capture was not tied to one display (kept from today's model).
     pub monitor_device_name: Option<String>,
@@ -63,7 +63,6 @@ pub struct ArtifactRef {
 #[cfg(test)]
 mod tests {
     use super::{ArtifactRef, CaptureMetadata, CaptureOutput};
-    use crate::capture::PixelFormat;
     use crate::geometry::ImageDimensions;
     use std::path::PathBuf;
 
@@ -73,7 +72,7 @@ mod tests {
             width: 320,
             height: 200,
             dpi: 144,
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: crate::pixels::PixelSource::new(crate::pixels::PixelDescriptor::bgra8(), 0),
             captured_at_unix_ms: 1_700_000_000_000,
             monitor_device_name: Some(r"\\.\DISPLAY1".into()),
         }

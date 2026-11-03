@@ -22,16 +22,13 @@
 
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_COMPOSITE_MODE_SOURCE_OVER,
-    D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1ColorMatrix, CLSID_D2D12DAffineTransform,
     D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX, D2D1_BITMAP_OPTIONS_TARGET,
-    D2D1_BITMAP_PROPERTIES1, D2D1_COLORMATRIX_PROP_COLOR_MATRIX,
-    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_PROPERTY_TYPE_UNKNOWN, ID2D1Bitmap1,
-    ID2D1DeviceContext, ID2D1Effect, ID2D1Image,
+    D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+    D2D1_PROPERTY_TYPE_UNKNOWN, ID2D1Bitmap1, ID2D1DeviceContext, ID2D1Effect, ID2D1Image,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmapSource, IWICImagingFactory,
     IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
@@ -42,6 +39,7 @@ use windows::Win32::System::Com::{
 };
 use windows::core::Interface;
 
+use super::color::OverlayColor;
 use super::helpers::to_d2d;
 use snapclip_model::geometry::Rect;
 use snapclip_ui::panel::{Glyph, ICON_BAKED_PX};
@@ -50,7 +48,7 @@ use snapclip_ui::panel::{Glyph, ICON_BAKED_PX};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Tinted {
     glyph: Glyph,
-    colour: u32,
+    colour: [u32; 4],
     flipped: bool,
 }
 
@@ -94,11 +92,13 @@ impl PanelIcons {
         &mut self,
         context: &ID2D1DeviceContext,
         colours: &[D2D1_COLOR_F],
+        color: OverlayColor,
     ) -> Result<(), String> {
         if !self.tinted.is_empty() {
             // 幂等：调用方在每帧之前问一次，只有第一次真的做（`reset` 之后——比如设备重建——会重做）。
             return Ok(());
         }
+        let mut prepared = Vec::new();
         for colour in colours {
             for glyph in Glyph::ALL {
                 // The chevron is the one glyph drawn both ways: the dropdown's arrow points up while
@@ -109,8 +109,8 @@ impl PanelIcons {
                     &[false]
                 };
                 for flipped in flips {
-                    let bitmap = self.tint_one(context, glyph, *colour, *flipped)?;
-                    self.tinted.push((
+                    let bitmap = self.tint_one(context, glyph, *colour, *flipped, color)?;
+                    prepared.push((
                         Tinted {
                             glyph,
                             colour: colour_key(*colour),
@@ -121,6 +121,7 @@ impl PanelIcons {
                 }
             }
         }
+        self.tinted = prepared;
         Ok(())
     }
 
@@ -176,6 +177,7 @@ impl PanelIcons {
         glyph: Glyph,
         colour: D2D1_COLOR_F,
         flipped: bool,
+        color: OverlayColor,
     ) -> Result<ID2D1Bitmap1, String> {
         let source = self.source(context, glyph)?;
         let tint = self.tint_effect(context, &source, colour)?;
@@ -192,7 +194,7 @@ impl PanelIcons {
             tinted
         };
 
-        let target = offscreen(context)?;
+        let target = offscreen(context, color)?;
         // Render into the offscreen, then put the frame's target back whatever happens.
         let previous =
             unsafe { context.GetTarget() }.map_err(|error| format!("GetTarget: {error}"))?;
@@ -371,18 +373,13 @@ impl PanelIcons {
     }
 }
 
-/// A premultiplied BGRA render target of the baked size, for one tint render.
-fn offscreen(context: &ID2D1DeviceContext) -> Result<ID2D1Bitmap1, String> {
-    let properties = D2D1_BITMAP_PROPERTIES1 {
-        pixelFormat: D2D1_PIXEL_FORMAT {
-            format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-        },
-        dpiX: 96.0,
-        dpiY: 96.0,
-        bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
-        ..Default::default()
-    };
+/// A premultiplied target in the overlay's working format, for one tint render.
+fn offscreen(context: &ID2D1DeviceContext, color: OverlayColor) -> Result<ID2D1Bitmap1, String> {
+    let properties = color.properties(
+        context,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )?;
     unsafe {
         context
             .CreateBitmap(
@@ -392,19 +389,15 @@ fn offscreen(context: &ID2D1DeviceContext) -> Result<ID2D1Bitmap1, String> {
                 },
                 None,
                 0,
-                &properties,
+                properties.raw(),
             )
             .map_err(|error| format!("CreateBitmap(offscreen): {error}"))
     }
 }
 
 /// The tint cache key for a colour: the four channels' bits.
-fn colour_key(colour: D2D1_COLOR_F) -> u32 {
-    let mut key = 0u32;
-    for value in [colour.r, colour.g, colour.b, colour.a] {
-        key = key.rotate_left(8) ^ value.to_bits();
-    }
-    key
+fn colour_key(colour: D2D1_COLOR_F) -> [u32; 4] {
+    [colour.r, colour.g, colour.b, colour.a].map(f32::to_bits)
 }
 
 /// A value's bytes, which is how `ID2D1Properties::SetValue` takes them in windows-rs.

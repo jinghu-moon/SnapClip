@@ -10,7 +10,8 @@ use crate::geometry::Rect;
 use crate::ports::PixelSliceSource;
 use crate::session::CapturedFrame;
 use crate::{CaptureError, CaptureResult};
-use snapclip_model::PixelFormat;
+use snapclip_model::pixels::{PixelBuffer, PixelDescriptor, PixelSource};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::monitor::CapturedMonitor;
 use super::win::bitblt;
@@ -54,7 +55,7 @@ pub struct FrozenFrame {
     /// (BitBlt at capture time, and the pure cropping tests).
     device: Option<Arc<GraphicsDevice>>,
     /// Filled on first use. `OnceLock` because the readback must happen at most once.
-    pixels: OnceLock<Vec<u8>>,
+    pixels: OnceLock<PixelBuffer>,
 }
 
 impl FrozenFrame {
@@ -88,114 +89,67 @@ impl FrozenFrame {
     /// [`Self::read_region`] instead, so a 300x200 selection never pays for a 4K
     /// readback (docs/11 §Phase 3). Only a frame with no selection — the renderer's
     /// CPU upload path and the tests — uses this.
-    pub fn pixels(&self) -> CaptureResult<&[u8]> {
+    pub fn pixels(&self) -> CaptureResult<&PixelBuffer> {
         if let Some(pixels) = self.pixels.get() {
             return Ok(pixels);
         }
-        let Some(gpu) = self.texture.as_ref() else {
-            return Err(CaptureError::CaptureFailed(
-                "frozen frame has neither a texture nor pixels".into(),
-            ));
-        };
-        let Some(device) = self.device.as_ref() else {
-            return Err(CaptureError::CaptureFailed(
-                "frozen frame has a texture but no device to read it back with".into(),
-            ));
-        };
-        // Phase 0 observability: this transfer is always frame-sized today, whatever
-        // the eventual selection is. Phase 3 replaces it with a region readback and
-        // will be judged against these byte counts.
-        let started_at = std::time::Instant::now();
-        let pixels = device
-            .read_back_bgra(&gpu.texture)
-            .map_err(|message| classify_device_error("GPU readback", message))?;
-        eprintln!(
-            "[snapclip][capture] readback provider={} frame={}x{} bytes={} elapsed_ms={}",
-            self.frame.provider,
-            self.frame.width,
-            self.frame.height,
-            pixels.len(),
-            started_at.elapsed().as_millis()
-        );
-        // A racing reader may have won; either buffer is equivalent.
+        let pixels = self.read_region(self.frame.rect())?;
         Ok(self.pixels.get_or_init(|| pixels))
     }
 
-    /// Tightly packed BGRA pixels of one region, **without** a full-frame transfer.
-    ///
-    /// The two provider paths converge here:
-    /// * BitBlt already holds CPU pixels, so the region is a pure memory crop.
-    /// * WGC copies only the requested box (`CopySubresourceRegion`) into a
-    ///   region-sized staging texture, so `readback_bytes == region area × 4` whatever
-    ///   the monitor resolution is.
-    ///
-    /// `region` is monitor-local and is clipped to the frame; a region that cannot
-    /// supply a single pixel — fully off-frame, or degenerate after clipping — is an
-    /// error rather than an empty buffer, so no encoder ever sees a zero-size image.
-    pub fn read_region(&self, region: Rect) -> CaptureResult<Vec<u8>> {
-        let frame_rect = self.frame.rect();
-        let clipped = region.intersect(frame_rect);
+    /// Read only the requested rectangle, preserving the frozen source definition.
+    pub fn read_region(&self, region: Rect) -> CaptureResult<PixelBuffer> {
+        let clipped = region.intersect(self.frame.rect());
         if clipped.is_empty() {
-            return Err(CaptureError::InvalidState(if region.is_empty() {
-                "artifact region is empty".into()
-            } else {
-                "artifact region does not overlap the frozen frame".into()
-            }));
+            return Err(CaptureError::InvalidState(
+                "artifact region does not overlap the frozen frame".into(),
+            ));
         }
-        let width = clipped.width() as usize;
-        let height = clipped.height() as usize;
-
-        // BitBlt kept its CPU pixels, so cropping them is cheaper than any GPU round
-        // trip — and it keeps the GPU out of the export path entirely.
+        let descriptor = self.frame.source.descriptor();
+        let width = clipped.width() as u32;
+        let height = clipped.height() as u32;
         if let Some(pixels) = self.pixels.get() {
-            return crop_pixel_rows(pixels, self.frame.width as usize * 4, clipped).ok_or_else(
-                || {
-                    CaptureError::CaptureFailed(
-                        "frozen frame pixel buffer is shorter than its geometry".into(),
-                    )
-                },
-            );
+            if pixels.descriptor() != descriptor
+                || pixels.size() != [self.frame.width, self.frame.height]
+            {
+                return Err(CaptureError::CaptureFailed(
+                    "frozen CPU pixels do not match their source".into(),
+                ));
+            }
+            let bytes = crop_pixel_rows(
+                pixels.as_bytes(),
+                pixels.row_stride(),
+                descriptor.bytes_per_pixel(),
+                clipped,
+            )
+            .ok_or_else(|| {
+                CaptureError::CaptureFailed("frozen pixel crop is out of bounds".into())
+            })?;
+            return PixelBuffer::from_tight(width, height, descriptor, bytes)
+                .map_err(|message| CaptureError::CaptureFailed(message.into()));
         }
-
         let gpu = self.texture.as_ref().ok_or_else(|| {
             CaptureError::CaptureFailed("frozen frame has neither a texture nor pixels".into())
         })?;
         let device = self.device.as_ref().ok_or_else(|| {
-            CaptureError::CaptureFailed(
-                "frozen frame has a texture but no device to read it back with".into(),
-            )
+            CaptureError::CaptureFailed("frozen frame has a texture but no device".into())
         })?;
-        // Phase 3 observability: the byte count is now the selection's, not the
-        // monitor's, which is exactly the acceptance criterion for this phase.
-        let started_at = std::time::Instant::now();
+        let started_at = Instant::now();
         let pixels = device
-            .read_back_region_bgra(
+            .read_back_pixels(
                 &gpu.texture,
-                clipped.left.max(0) as u32,
-                clipped.top.max(0) as u32,
-                width as u32,
-                height as u32,
+                [clipped.left as u32, clipped.top as u32, width, height],
+                descriptor,
             )
             .map_err(|message| classify_device_error("GPU region readback", message))?;
         eprintln!(
-            "[snapclip][capture] region readback provider={} region=({},{})-{}x{} frame={}x{} bytes={} elapsed_ms={}",
+            "[snapclip][capture] region readback provider={} size={}x{} bytes={} elapsed_ms={}",
             self.frame.provider,
-            clipped.left,
-            clipped.top,
             width,
             height,
-            self.frame.width,
-            self.frame.height,
-            pixels.len(),
+            pixels.as_bytes().len(),
             started_at.elapsed().as_millis()
         );
-        if pixels.len() != width * height * 4 {
-            return Err(CaptureError::CaptureFailed(format!(
-                "region readback returned {} bytes, expected {}",
-                pixels.len(),
-                width * height * 4
-            )));
-        }
         Ok(pixels)
     }
 
@@ -247,7 +201,11 @@ impl<'a> FrozenFramePixels<'a> {
 }
 
 impl PixelSliceSource for FrozenFramePixels<'_> {
-    fn read_bgra(&self, region: Rect) -> CaptureResult<Vec<u8>> {
+    fn source(&self) -> PixelSource {
+        self.frame.frame.source
+    }
+
+    fn read_pixels(&self, region: Rect) -> CaptureResult<PixelBuffer> {
         // One code path for both providers: the frame decides whether the region is a
         // CPU crop (BitBlt) or a `CopySubresourceRegion` (WGC).
         self.frame.read_region(region)
@@ -262,21 +220,29 @@ impl PixelSliceSource for FrozenFramePixels<'_> {
 /// tested exhaustively without either.
 ///
 /// Returns `None` when `pixels` cannot supply every row of `region`.
-fn crop_pixel_rows(pixels: &[u8], stride: usize, region: Rect) -> Option<Vec<u8>> {
+fn crop_pixel_rows(
+    pixels: &[u8],
+    stride: usize,
+    bytes_per_pixel: usize,
+    region: Rect,
+) -> Option<Vec<u8>> {
     let width = usize::try_from(region.width()).ok()?;
     let height = usize::try_from(region.height()).ok()?;
     let left = usize::try_from(region.left).ok()?;
     let top = usize::try_from(region.top).ok()?;
-    if width == 0 || height == 0 || stride < width * 4 || left > stride / 4 {
+    let row_bytes = width.checked_mul(bytes_per_pixel)?;
+    let left_bytes = left.checked_mul(bytes_per_pixel)?;
+    if width == 0 || height == 0 || left_bytes.checked_add(row_bytes)? > stride {
         return None;
     }
-    let mut output = Vec::with_capacity(width * height * 4);
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(row_bytes.checked_mul(height)?)
+        .ok()?;
     for row in 0..height {
         let source_row = top.checked_add(row)?;
-        let start = source_row
-            .checked_mul(stride)?
-            .checked_add(left.checked_mul(4)?)?;
-        let end = start.checked_add(width * 4)?;
+        let start = source_row.checked_mul(stride)?.checked_add(left_bytes)?;
+        let end = start.checked_add(row_bytes)?;
         output.extend_from_slice(pixels.get(start..end)?);
     }
     Some(output)
@@ -384,18 +350,21 @@ impl CaptureProviders {
     ) -> CaptureResult<FrozenFrame> {
         match provider {
             ProviderKind::Wgc => {
+                let descriptor = PixelDescriptor::bgra8();
                 // No readback here: L0 renders from this texture and the CPU copy is
                 // produced lazily only if an artifact is actually exported.
-                let gpu = wgc::capture_monitor(&self.device, monitor).map_err(|message| {
-                    classify_device_error("Windows Graphics Capture", message)
-                })?;
-                Ok(frozen_frame(
+                let gpu =
+                    wgc::capture_monitor(&self.device, monitor, descriptor).map_err(|message| {
+                        classify_device_error("Windows Graphics Capture", message)
+                    })?;
+                frozen_frame(
                     monitor,
                     ProviderKind::Wgc,
                     Some(gpu),
                     self.device.clone(),
                     None,
-                ))
+                    descriptor,
+                )
             }
             ProviderKind::BitBlt => {
                 let captured =
@@ -409,13 +378,14 @@ impl CaptureProviders {
                     .device
                     .create_bgra_texture(captured.width, captured.height, &captured.pixels)
                     .map_err(|message| classify_device_error("texture upload", message))?;
-                Ok(frozen_frame(
+                frozen_frame(
                     monitor,
                     ProviderKind::BitBlt,
                     Some(gpu),
                     self.device.clone(),
                     Some(cpu_pixels),
-                ))
+                    PixelDescriptor::bgra8(),
+                )
             }
         }
     }
@@ -427,16 +397,23 @@ fn frozen_frame(
     texture: Option<GpuFrame>,
     device: Arc<GraphicsDevice>,
     pre_materialized_pixels: Option<Vec<u8>>,
-) -> FrozenFrame {
+    descriptor: PixelDescriptor,
+) -> CaptureResult<FrozenFrame> {
     let pixels = OnceLock::new();
     if let Some(buf) = pre_materialized_pixels {
-        let _ = pixels.set(buf);
+        let buffer = PixelBuffer::from_tight(monitor.width(), monitor.height(), descriptor, buf)
+            .map_err(|message| CaptureError::CaptureFailed(message.into()))?;
+        let _ = pixels.set(buffer);
     }
-    FrozenFrame {
+    static SOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
+    Ok(FrozenFrame {
         frame: CapturedFrame {
             width: monitor.width(),
             height: monitor.height(),
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: PixelSource::new(
+                descriptor,
+                SOURCE_GENERATION.fetch_add(1, Ordering::Relaxed),
+            ),
             captured_at_unix_ms: snapclip_model::unix_time_ms(),
             provider: provider.name(),
             origin: Some(monitor.origin()),
@@ -446,7 +423,7 @@ fn frozen_frame(
         texture,
         device: Some(device),
         pixels,
-    }
+    })
 }
 
 fn classify_device_error(context: &str, message: String) -> CaptureError {
@@ -474,7 +451,10 @@ pub(crate) fn test_frozen_frame(width: u32, height: u32) -> FrozenFrame {
         frame: CapturedFrame {
             width,
             height,
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 1,
             provider: "test",
             origin: Some(crate::geometry::Point::new(0, 0)),
@@ -499,7 +479,9 @@ pub(crate) fn test_frozen_frame(width: u32, height: u32) -> FrozenFrame {
         provider: ProviderKind::BitBlt,
         texture: None,
         device: None,
-        pixels: OnceLock::from(pixels),
+        pixels: OnceLock::from(
+            PixelBuffer::from_tight(width, height, PixelDescriptor::bgra8(), pixels).unwrap(),
+        ),
     }
 }
 
@@ -522,8 +504,9 @@ fn attempt_order(preferred: Option<ProviderKind>) -> Vec<ProviderKind> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureProviders, FrozenFrame, FrozenFramePixels, GraphicsDevice, ProviderKind,
-        attempt_order, classify_device_error, crop_pixel_rows,
+        CaptureProviders, FrozenFrame, FrozenFramePixels, GraphicsDevice, OnceLock, PixelBuffer,
+        PixelDescriptor, PixelSource, ProviderKind, attempt_order, classify_device_error,
+        crop_pixel_rows,
     };
     use crate::CaptureError;
     use crate::geometry::Rect;
@@ -539,7 +522,8 @@ mod tests {
     fn pixel_slice_crops_rows_without_padding() {
         let frame = frozen(4, 3);
         let source = FrozenFramePixels::new(&frame);
-        let pixels = source.read_bgra(Rect::new(1, 1, 3, 3)).unwrap();
+        let pixels = source.read_pixels(Rect::new(1, 1, 3, 3)).unwrap();
+        let pixels = pixels.as_bytes();
         assert_eq!(
             pixels,
             vec![1, 1, 0, 255, 2, 1, 0, 255, 1, 2, 0, 255, 2, 2, 0, 255]
@@ -550,9 +534,10 @@ mod tests {
     fn pixel_slice_clips_out_of_range_regions() {
         let frame = frozen(4, 3);
         let source = FrozenFramePixels::new(&frame);
-        let pixels = source.read_bgra(Rect::new(2, 2, 100, 100)).unwrap();
+        let pixels = source.read_pixels(Rect::new(2, 2, 100, 100)).unwrap();
+        let pixels = pixels.as_bytes();
         assert_eq!(pixels, vec![2, 2, 0, 255, 3, 2, 0, 255]);
-        assert!(source.read_bgra(Rect::new(50, 50, 60, 60)).is_err());
+        assert!(source.read_pixels(Rect::new(50, 50, 60, 60)).is_err());
     }
 
     #[test]
@@ -561,6 +546,7 @@ mod tests {
         // hands back exactly 8 bytes and never materialises the frame around it.
         let frame = frozen(4, 3);
         let pixels = frame.read_region(Rect::new(1, 2, 3, 3)).unwrap();
+        let pixels = pixels.as_bytes();
         assert_eq!(pixels, vec![1, 2, 0, 255, 2, 2, 0, 255]);
         assert_eq!(
             pixels.len(),
@@ -573,6 +559,7 @@ mod tests {
     fn read_region_clips_a_selection_hanging_off_the_right_and_bottom() {
         let frame = frozen(4, 3);
         let pixels = frame.read_region(Rect::new(3, 2, 40, 40)).unwrap();
+        let pixels = pixels.as_bytes();
         assert_eq!(pixels, vec![3, 2, 0, 255]);
     }
 
@@ -586,6 +573,7 @@ mod tests {
         // frame's half-open [0,1)x[0,1) on exactly one pixel: clipping must produce
         // that pixel, never index the buffer with a negative row or column.
         let pixels = frame.read_region(Rect::new(-5, -5, 1, 1)).unwrap();
+        let pixels = pixels.as_bytes();
         assert_eq!(pixels, vec![0, 0, 0, 255]);
         // A region clipped down to nothing is refused, not silently empty.
         assert!(matches!(
@@ -608,9 +596,9 @@ mod tests {
             10, 10, 0, 255, 11, 10, 0, 255, 0, 0, 0, 0, // row 0 + padding
             12, 10, 0, 255, 13, 10, 0, 255, 0, 0, 0, 0, // row 1 + padding
         ];
-        let cropped = crop_pixel_rows(&padded, 12, Rect::new(1, 1, 2, 2)).unwrap();
+        let cropped = crop_pixel_rows(&padded, 12, 4, Rect::new(1, 1, 2, 2)).unwrap();
         assert_eq!(cropped, vec![13, 10, 0, 255]);
-        let whole = crop_pixel_rows(&padded, 12, Rect::new(0, 0, 2, 2)).unwrap();
+        let whole = crop_pixel_rows(&padded, 12, 4, Rect::new(0, 0, 2, 2)).unwrap();
         assert_eq!(
             whole,
             vec![
@@ -620,15 +608,49 @@ mod tests {
     }
 
     #[test]
+    fn frozen_fp16_crop_retains_encoding_generation_and_negative_bits() {
+        use snapclip_model::pixels::{AlphaMode, PixelEncoding};
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let pixel = [0, 0xbc, 0, 0x49, 0, 0, 0, 0x3c];
+        let mut frame = frozen(4, 3);
+        frame.frame.source = PixelSource::new(descriptor, 41);
+        frame.pixels =
+            OnceLock::from(PixelBuffer::from_tight(4, 3, descriptor, pixel.repeat(12)).unwrap());
+        let source = FrozenFramePixels::new(&frame);
+        assert_eq!(source.source().generation(), 41);
+        let cropped = source.read_pixels(Rect::new(1, 1, 3, 3)).unwrap();
+        assert_eq!(cropped.descriptor(), descriptor);
+        assert_eq!(cropped.size(), [2, 2]);
+        assert_eq!(cropped.as_bytes(), pixel.repeat(4));
+        let mut padded = pixel.repeat(2);
+        padded.extend_from_slice(&[99; 8]);
+        padded.extend_from_slice(&pixel.repeat(2));
+        padded.extend_from_slice(&[99; 8]);
+        assert_eq!(
+            crop_pixel_rows(&padded, 24, 8, Rect::new(1, 1, 2, 2)).unwrap(),
+            pixel
+        );
+        assert!(
+            crop_pixel_rows(&padded, 24, 8, Rect::new(2, 0, 4, 1)).is_none(),
+            "a crop cannot spill into the following row"
+        );
+    }
+
+    #[test]
     fn crop_rejects_a_buffer_shorter_than_the_selection() {
         let padded = vec![10, 10, 0, 255, 11, 10, 0, 255, 0, 0, 0, 0];
         // Two rows demanded, only one present.
-        assert!(crop_pixel_rows(&padded, 12, Rect::new(0, 0, 2, 2)).is_none());
+        assert!(crop_pixel_rows(&padded, 12, 4, Rect::new(0, 0, 2, 2)).is_none());
         // Stride narrower than the region can never be cropped.
-        assert!(crop_pixel_rows(&padded, 4, Rect::new(0, 0, 2, 1)).is_none());
+        assert!(crop_pixel_rows(&padded, 4, 4, Rect::new(0, 0, 2, 1)).is_none());
         // Degenerate regions are rejected rather than producing an empty success.
-        assert!(crop_pixel_rows(&padded, 12, Rect::new(0, 0, 0, 4)).is_none());
-        assert!(crop_pixel_rows(&padded, 12, Rect::new(-1, 0, 4, 4)).is_none());
+        assert!(crop_pixel_rows(&padded, 12, 4, Rect::new(0, 0, 0, 4)).is_none());
+        assert!(crop_pixel_rows(&padded, 12, 4, Rect::new(-1, 0, 4, 4)).is_none());
     }
 
     #[test]
@@ -719,7 +741,7 @@ mod tests {
                 );
                 let pixels = frame.pixels().expect("readback must succeed on demand");
                 assert_eq!(
-                    pixels.len(),
+                    pixels.as_bytes().len(),
                     (frame.frame.width * frame.frame.height * 4) as usize
                 );
                 assert!(frame.pixels_read(), "readback must be cached");
@@ -752,6 +774,7 @@ mod tests {
             200.min(monitor.height() as i32),
         );
         let pixels = frozen.read_region(selection).unwrap();
+        let pixels = pixels.as_bytes();
         assert_eq!(
             pixels.len(),
             300 * 200 * 4,

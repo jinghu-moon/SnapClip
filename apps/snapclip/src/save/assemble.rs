@@ -313,6 +313,12 @@ struct WholeImage<'a> {
 }
 
 impl BandSource for WholeImage<'_> {
+    fn source(&self) -> snapclip_model::pixels::PixelSource {
+        snapclip_model::pixels::PixelSource::new(
+            snapclip_model::pixels::PixelDescriptor::bgra8(),
+            0,
+        )
+    }
     fn rows(&self) -> u32 {
         self.height
     }

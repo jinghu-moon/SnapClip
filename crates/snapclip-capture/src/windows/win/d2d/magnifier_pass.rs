@@ -160,16 +160,36 @@ impl OverlayRenderer {
             // cell edge plus a dark ring one pixel outside keep it readable on any
             // background.
             let cell_fill = self.require_brush(&self.info_swatch_fill_brush, "swatch fill")?;
-            {
+            if !self.color.is_linear() {
                 let (r, g, b) = view.magnifier_rgb.unwrap_or((0, 0, 0));
-                let _ = cell_fill.SetColor(&color(
+                cell_fill.SetColor(&self.color.ui(color(
                     r as f32 / 255.0,
                     g as f32 / 255.0,
                     b as f32 / 255.0,
                     1.0,
-                ));
+                )));
+                self.d2d.FillRectangle(&to_d2d(center_cell), &cell_fill);
+            } else {
+                // Restore the original FP16 pixel after drawing the aid bands/grid.
+                // The eight-bit async sampler has no authority over this source.
+                let source_cell = Rect::new(
+                    geometry.center.x,
+                    geometry.center.y,
+                    geometry.center.x + 1,
+                    geometry.center.y + 1,
+                )
+                .intersect(view.frame);
+                if !source_cell.is_empty() {
+                    self.d2d.DrawBitmap(
+                        bitmap,
+                        Some(&to_d2d(center_cell)),
+                        1.0,
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        Some(&to_d2d(source_cell)),
+                        None,
+                    );
+                }
             }
-            self.d2d.FillRectangle(&to_d2d(center_cell), &cell_fill);
             self.d2d
                 .DrawRectangle(&to_d2d(center_cell), white, 1.0, None);
             let outer_cell = Rect::new(
@@ -284,16 +304,16 @@ impl OverlayRenderer {
                 radiusX: swatch_radius,
                 radiusY: swatch_radius,
             };
-            {
+            if !self.color.is_linear() {
                 let (r, g, b) = view.magnifier_rgb.unwrap_or((0, 0, 0));
-                let _ = swatch_fill.SetColor(&color(
+                swatch_fill.SetColor(&self.color.ui(color(
                     r as f32 / 255.0,
                     g as f32 / 255.0,
                     b as f32 / 255.0,
                     1.0,
-                ));
+                )));
+                self.d2d.FillRoundedRectangle(&swatch_rect, &swatch_fill);
             }
-            self.d2d.FillRoundedRectangle(&swatch_rect, &swatch_fill);
             self.d2d
                 .DrawRoundedRectangle(&swatch_rect, &swatch_border, 1.0, None);
 
@@ -309,7 +329,11 @@ impl OverlayRenderer {
                 )
             };
             let pos_text = format!("({}, {})", cx, cy);
-            let colour_text = view.magnifier_color_text.as_deref().unwrap_or("--");
+            let colour_text = if self.color.is_linear() {
+                "--"
+            } else {
+                view.magnifier_color_text.as_deref().unwrap_or("--")
+            };
             let fixed = swatch + (INFO_SWATCH_GAP_DIP + INFO_COORD_BLOCK_GAP_DIP) * k;
             let row1_font =
                 shrink_to_fit(INFO_ROW1_FONT_MAX_DIP, INFO_ROW1_FONT_MIN_DIP, |size| {
@@ -434,7 +458,7 @@ impl OverlayRenderer {
             };
             self.d2d.DrawRoundedRectangle(&outline_rr, dark, 1.0, None);
             self.d2d.PopLayer();
-            core::mem::drop(lp);
+            let _ = std::mem::ManuallyDrop::into_inner(lp.geometricMask);
 
             // The pointer reticle is a *local* crosshair centred on the cursor.
             // The magnifier itself deliberately has no detached pixel marker: the

@@ -899,17 +899,26 @@ impl OverlayController {
             };
             renderer
                 .render_export(&export_state, None)
-                .map(|bgra| SelectionPixels {
-                    corner_radius: self.corner_radius_px as i32,
-                    // The annotated export is still this monitor's frame, so it keeps a real
-                    // screen position; no layout means the overlay is gone and the honest
-                    // answer is "no position", not "the primary monitor".
-                    origin: self
-                        .layout()
-                        .map(|layout| Point::new(layout.bounds.left, layout.bounds.top)),
-                    frame: frozen.frame.clone(),
-                    region: clipped,
-                    bgra,
+                .and_then(|pixels| {
+                    if pixels.size() != [clipped.width() as u32, clipped.height() as u32]
+                        || pixels.descriptor() != frozen.frame.source.descriptor()
+                    {
+                        return Err(
+                            "annotated export does not match the frozen source contract".into()
+                        );
+                    }
+                    Ok(SelectionPixels {
+                        corner_radius: self.corner_radius_px as i32,
+                        // The annotated export is still this monitor's frame, so it keeps a real
+                        // screen position; no layout means the overlay is gone and the honest
+                        // answer is "no position", not "the primary monitor".
+                        origin: self
+                            .layout()
+                            .map(|layout| Point::new(layout.bounds.left, layout.bounds.top)),
+                        frame: frozen.frame.clone(),
+                        region: clipped,
+                        pixels,
+                    })
                 })
                 .map_err(CaptureError::RenderFailed)
         };
@@ -932,12 +941,16 @@ impl OverlayController {
         // annotated export), and every consumer forks off the same `prepared` below — the pin
         // slot and the export worker alike. Rounding here therefore lands on both destinations
         // once, instead of once per path (docs/23 §14.55.17).
-        crate::artifact::round_corners(
-            &mut prepared.bgra,
-            prepared.region.width() as u32,
-            prepared.region.height() as u32,
-            self.corner_radius_px,
-        );
+        prepared.pixels =
+            match crate::artifact::round_pixel_corners(prepared.pixels, self.corner_radius_px) {
+                Ok(pixels) => pixels,
+                Err(error) => {
+                    self.sink.on_failed(Some(&session_id), &error, provider);
+                    self.session.fail();
+                    self.finish_session();
+                    return;
+                }
+            };
         let export_width = prepared.region.width();
         let export_height = prepared.region.height();
         // Hand the pixels to whoever pins "the thing I just captured" (`F6`). The gesture that
@@ -1010,10 +1023,7 @@ impl OverlayController {
                 eprintln!(
                     "[snapclip][capture] artifact ready session={} path={} size={}x{}",
                     session_id,
-                    artifact
-                        .png_path()
-                        .map(|path| path.to_string_lossy())
-                        .unwrap_or_default(),
+                    artifact.artifact_path().to_string_lossy(),
                     artifact.width,
                     artifact.height
                 );

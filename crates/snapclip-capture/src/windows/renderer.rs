@@ -233,16 +233,22 @@ impl Win32Renderer {
     /// When the provider produced a GPU texture the bitmap is created directly over it,
     /// so no pixels cross the PCIe bus; GPU-less frames fall back to a one-off upload.
     pub fn set_frame(&mut self, frozen: &FrozenFrame) -> Result<(), String> {
+        // The production provider is SDR. HDR must supply a verified per-output
+        // white snapshot before this entry can accept it; do not guess 80 nit.
+        self.d2d
+            .configure_source(frozen.frame.source.descriptor(), None)?;
         if let Some(texture) = frozen.render_source() {
-            return self
-                .d2d
-                .set_frame_texture(frozen.frame.width, frozen.frame.height, texture);
+            return self.d2d.set_frame_texture(
+                frozen.frame.width,
+                frozen.frame.height,
+                texture,
+                frozen.frame.source.descriptor(),
+            );
         }
         let pixels = frozen
             .pixels()
             .map_err(|error| format!("frozen frame pixels unavailable: {error}"))?;
-        self.d2d
-            .update_frame(frozen.frame.width, frozen.frame.height, pixels)
+        self.d2d.update_pixels(&pixels)
     }
 
     /// Draw and present one frame.
@@ -346,13 +352,13 @@ impl Win32Renderer {
     ///
     /// Replays the same [`AnnotationDocument`] the preview drew, but with chrome,
     /// cursor, the selection box and the draft suppressed, and reads the selected
-    /// region back to CPU BGRA. This is what keeps the PNG pixel-identical to the
+    /// region back to typed CPU pixels. This is what keeps the artifact pixel-identical to the
     /// screen crop (docs/11 §8.2 "导出和预览重放同一份文档").
     pub fn render_export(
         &mut self,
         state: &OverlayFrameState,
         annotations: Option<&AnnotationDocument>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<snapclip_model::pixels::PixelBuffer, String> {
         // An artifact carries the selection, its annotations and nothing else: no chrome, no cursor,
         // no badge, no loupe, no hints, no panel. The overrides below repeat
         // what `OverlayRenderer::render_export` and `Win32Renderer::render_export` already clear one

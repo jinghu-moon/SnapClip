@@ -171,7 +171,6 @@ fn verify_existing(path: &Path, expected_hash: &str) -> Result<u64, StoreError> 
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
     };
 
@@ -197,7 +196,7 @@ mod tests {
                 .count(),
             1
         );
-        let _ = fs::remove_dir_all(PathBuf::from(root));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

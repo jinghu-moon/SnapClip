@@ -157,7 +157,7 @@ pub fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
 /// Swaps the B and R lanes in place. The operation is its own inverse, which is why
 /// one helper serves both directions.
 fn rgba_to_bgra(bytes: &mut [u8]) {
-    for pixel in bytes.chunks_exact_mut(4) {
+    for pixel in bytes.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
 }

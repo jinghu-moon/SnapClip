@@ -332,7 +332,12 @@ fn run(spec: Spec, shared: &Shared) -> Option<Tracker> {
 
 fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Result<(), String> {
     let device = GraphicsDevice::create()?;
-    let mut session = WgcSession::open_monitor(&device, spec.monitor).map_err(|e| e.to_string())?;
+    let mut session = WgcSession::open_monitor(
+        &device,
+        spec.monitor,
+        snapclip_model::pixels::PixelDescriptor::bgra8(),
+    )
+    .map_err(|e| e.to_string())?;
     let (width, view) = (spec.region.width() as u32, spec.region.height() as u32);
     eprintln!(
         "[snapclip][scroll] started monitor_frame={:?} region={:?} aim=({},{}) options={:?} {}",
@@ -624,6 +629,11 @@ fn wake(spec: &Spec, shared: &Shared) {
 
 /// The selection's pixels out of one monitor frame: one GPU→CPU copy of the selection only.
 fn read_region(device: &GraphicsDevice, frame: &WgcFrame, region: Rect) -> Result<Vec<u8>, String> {
+    if frame.descriptor() != snapclip_model::pixels::PixelDescriptor::bgra8() {
+        return Err(
+            "scroll stitching requires its SDR frame contract; HDR scroll is not enabled".into(),
+        );
+    }
     let (frame_w, frame_h) = frame.size();
     if region.left < 0 || region.top < 0 || region.right > frame_w || region.bottom > frame_h {
         return Err(format!(

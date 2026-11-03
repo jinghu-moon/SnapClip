@@ -134,9 +134,11 @@ pub trait ClipboardWriter: Send + Sync + 'static {
 /// instead, and the source decides whether the rows come from a file, a ring buffer or a
 /// single contiguous image.
 pub trait BandSource: Send {
+    /// All bands belong to this immutable source definition and generation.
+    fn source(&self) -> snapclip_model::pixels::PixelSource;
     /// How many rows the picture has.
     fn rows(&self) -> u32;
-    /// Fill `out` with `rows` rows starting at `first_row`, top-down, tightly packed BGRA.
+    /// Fill `out` with source-format rows, top-down and tightly packed.
     ///
     /// Returns false when the rows cannot be supplied; the writer then refuses the artifact
     /// rather than writing a short one.
@@ -148,7 +150,7 @@ pub trait BandSource: Send {
 #[derive(Debug, Clone, Copy)]
 pub struct SelectionSpec {
     pub region: crate::geometry::Rect,
-    pub pixel_format: snapclip_model::PixelFormat,
+    pub source: snapclip_model::pixels::PixelSource,
     pub captured_at_unix_ms: i64,
     pub origin: Option<snapclip_model::geometry::Point>,
     pub corner_radius: i32,
@@ -206,9 +208,13 @@ pub fn whole_from_bands(
             spec.region.height()
         )));
     }
-    let mut bgra = Vec::new();
-    bgra.resize(rows as usize * width as usize * 4, 0);
-    if !bands.read_rows(0, rows, &mut bgra) {
+    if bands.source() != spec.source {
+        return Err(crate::CaptureError::EncodeFailed(
+            "band source generation differs from its selection".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    if !bands.read_rows(0, rows, &mut bytes) || bands.source() != spec.source {
         return Err(crate::CaptureError::EncodeFailed(
             "band source could not supply its rows".into(),
         ));
@@ -217,13 +223,19 @@ pub fn whole_from_bands(
         frame: crate::session::CapturedFrame {
             width,
             height: rows,
-            pixel_format: spec.pixel_format,
+            source: spec.source,
             captured_at_unix_ms: spec.captured_at_unix_ms,
             provider: "band-source",
             origin: spec.origin,
         },
         region: spec.region,
-        bgra,
+        pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+            width,
+            rows,
+            spec.source.descriptor(),
+            bytes,
+        )
+        .map_err(|message| crate::CaptureError::EncodeFailed(message.into()))?,
         origin: spec.origin,
         corner_radius: spec.corner_radius,
     };

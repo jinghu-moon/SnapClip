@@ -1,4 +1,6 @@
-//! The one owner of screenshot artifacts on disk (docs/23 T2.3).
+//! The owner of screenshot artifacts on disk (docs/23 T2.3).
+//! Source-format pixel masters extend this store in [`crate::pixel_master`]; their
+//! metadata and independent compressed tiles preserve FP16 without PNG quantization.
 //!
 //! Takes a [`CaptureOutput`] (bytes + metadata), writes it atomically under a naming
 //! scheme it owns, computes the `blake3` fingerprint **while writing**, and hands back an
@@ -93,7 +95,7 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::CaptureArtifactStore;
-    use snapclip_model::{CaptureMetadata, CaptureOutput, PixelFormat};
+    use snapclip_model::{CaptureMetadata, CaptureOutput};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -118,7 +120,10 @@ mod tests {
                 width: 640,
                 height: 480,
                 dpi: 144,
-                pixel_format: PixelFormat::Bgra8Unorm,
+                source: snapclip_model::pixels::PixelSource::new(
+                    snapclip_model::pixels::PixelDescriptor::bgra8(),
+                    0,
+                ),
                 captured_at_unix_ms: 1_700_000_000_000,
                 monitor_device_name: Some(r"\\.\DISPLAY1".to_string()),
             },

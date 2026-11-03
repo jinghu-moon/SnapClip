@@ -55,6 +55,14 @@ impl From<PixelDescriptor> for DescriptorRecord {
 }
 
 impl PixelDescriptor {
+    /// The existing SDR capture contract: encoded sRGB, straight BGRA8.
+    pub const fn bgra8() -> Self {
+        Self {
+            format: PixelFormat::Bgra8Unorm,
+            encoding: PixelEncoding::Srgb,
+            alpha: AlphaMode::Straight,
+        }
+    }
     pub fn new(
         format: PixelFormat,
         encoding: PixelEncoding,
@@ -93,16 +101,51 @@ impl PixelDescriptor {
     }
 }
 
+/// Frozen source definition. A generation belongs to one acquisition/session;
+/// its owner changes it whenever the source color interpretation changes.
+/// It is not an export-job cancellation counter or a display-output revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PixelSource {
+    descriptor: PixelDescriptor,
+    generation: u64,
+}
+impl PixelSource {
+    pub const fn new(descriptor: PixelDescriptor, generation: u64) -> Self {
+        Self {
+            descriptor,
+            generation,
+        }
+    }
+    pub fn descriptor(self) -> PixelDescriptor {
+        self.descriptor
+    }
+    pub fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
 /// Validated tightly packed top-down source pixels. Tight owned buffers move
 /// without copying; padding is removed once. All float values must be finite,
 /// alpha is [0,1], but RGB is neither clamped nor quantized.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PixelBuffer {
     size: [u32; 2],
     descriptor: PixelDescriptor,
     bytes: Vec<u8>,
 }
 impl PixelBuffer {
+    pub fn from_tight(
+        width: u32,
+        height: u32,
+        descriptor: PixelDescriptor,
+        bytes: Vec<u8>,
+    ) -> Result<Self, &'static str> {
+        let stride = descriptor
+            .row_bytes(width)
+            .ok_or("pixel row size overflow")?;
+        Self::from_bytes(width, height, stride, descriptor, bytes)
+    }
     /// A padded input includes all declared rows including final-row padding.
     pub fn from_bytes(
         width: u32,

@@ -5,7 +5,7 @@
 //!
 //! | # | 拷贝 | 位置 |
 //! |---|---|---|
-//! | 1 | `prepared.bgra.clone()` | `apps/snapclip/src/capture/artifact_writer.rs:44` |
+//! | 1 | old `prepared.bgra.clone()` | `apps/snapclip/src/capture/artifact_writer.rs:44` |
 //! | 2 | `bgra_to_rgba(...).to_vec()` | `crates/snapclip-history/src/image.rs:153` |
 //! | 3 | `RgbaImage::from_raw(rgba.to_vec())` | `crates/snapclip-history/src/image.rs:66` |
 //! | 4 | 编码器内部 | `image::DynamicImage::write_to` |
@@ -37,7 +37,6 @@ use snapclip_capture::artifact::SelectionPixels;
 use snapclip_capture::geometry::Rect;
 use snapclip_capture::ports::ArtifactWriter;
 use snapclip_capture::session::CapturedFrame;
-use snapclip_model::PixelFormat;
 
 // ---------------------------------------------------------------------------
 // The allocator: a live counter, its high-water mark, and a counter for
@@ -146,13 +145,22 @@ fn selection(width: u32, height: u32) -> SelectionPixels {
         frame: CapturedFrame {
             width,
             height,
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "p4-03",
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         },
         region: Rect::new(0, 0, width as i32, height as i32),
-        bgra,
+        pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+            width,
+            height,
+            snapclip_model::pixels::PixelDescriptor::bgra8(),
+            bgra,
+        )
+        .unwrap(),
         origin: Some(snapclip_model::geometry::Point::new(0, 0)),
     }
 }
@@ -176,7 +184,7 @@ fn artifact_len(artifact: &snapclip_model::CaptureArtifact) -> u64 {
 fn the_export_path_holds_at_most_one_row_band_at_a_time() {
     let (width, height) = (1280u32, 20_000u32);
     let prepared = selection(width, height);
-    let raw_len = prepared.bgra.len();
+    let raw_len = prepared.pixels.as_bytes().len();
     let directory = root("peak");
     let writer = HistoryArtifactWriter::new(directory.clone());
 
@@ -215,7 +223,7 @@ fn the_export_path_holds_at_most_one_row_band_at_a_time() {
 fn the_export_path_allocates_no_second_full_copy() {
     let (width, height) = (1280u32, 20_000u32);
     let prepared = selection(width, height);
-    let raw_len = prepared.bgra.len();
+    let raw_len = prepared.pixels.as_bytes().len();
     let directory = root("copies");
     let writer = HistoryArtifactWriter::new(directory.clone());
 
@@ -250,6 +258,12 @@ struct Bands<'a> {
 }
 
 impl snapclip_capture::ports::BandSource for Bands<'_> {
+    fn source(&self) -> snapclip_model::pixels::PixelSource {
+        snapclip_model::pixels::PixelSource::new(
+            snapclip_model::pixels::PixelDescriptor::bgra8(),
+            0,
+        )
+    }
     fn rows(&self) -> u32 {
         self.rows
     }
@@ -296,7 +310,10 @@ fn the_banded_export_never_owns_the_whole_image() {
     let writer = HistoryArtifactWriter::new(directory.clone());
     let spec = snapclip_capture::ports::SelectionSpec {
         region: Rect::new(0, 0, width as i32, height as i32),
-        pixel_format: PixelFormat::Bgra8Unorm,
+        source: snapclip_model::pixels::PixelSource::new(
+            snapclip_model::pixels::PixelDescriptor::bgra8(),
+            0,
+        ),
         captured_at_unix_ms: 1_700_000_000_000,
         origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         corner_radius: 0,

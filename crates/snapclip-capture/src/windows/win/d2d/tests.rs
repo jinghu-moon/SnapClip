@@ -98,7 +98,7 @@ fn composed_frame_masks_outside_the_selection_and_keeps_it_clear() {
     // A render target the test can read back.
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -188,7 +188,7 @@ fn export_crop_matches_preview_and_bakes_annotations() {
     // A preview target we can read the whole frame back from.
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -231,7 +231,8 @@ fn export_crop_matches_preview_and_bakes_annotations() {
     // The artifact crop.
     let crop_w = selection.width() as u32;
     let crop_h = selection.height() as u32;
-    let export = renderer.render_export(&view).unwrap();
+    let export_pixels = renderer.render_export(&view).unwrap();
+    let export = export_pixels.as_bytes();
     assert_eq!(
         export.len(),
         (crop_w * crop_h * 4) as usize,
@@ -248,7 +249,7 @@ fn export_crop_matches_preview_and_bakes_annotations() {
                 selection.left as u32 + x,
                 selection.top as u32 + y,
             );
-            let artifact = pixel_at(&export, crop_w, x, y);
+            let artifact = pixel_at(export, crop_w, x, y);
             assert_eq!(
                 artifact, preview,
                 "export pixel ({x},{y}) must match the presented preview crop"
@@ -259,7 +260,7 @@ fn export_crop_matches_preview_and_bakes_annotations() {
     // The annotation is baked into the artifact (not just the preview):
     // a fill-interior pixel is red, not the blue frame.
     let red = pixel_at(
-        &export,
+        export,
         crop_w,
         (30 - selection.left) as u32,
         (23 - selection.top) as u32,
@@ -271,7 +272,7 @@ fn export_crop_matches_preview_and_bakes_annotations() {
 
     // Selected-but-unannotated pixels keep the raw frame brightness: the L1 mask
     // and the L3 selection chrome never enter the artifact.
-    let clear = pixel_at(&export, crop_w, 1, 1);
+    let clear = pixel_at(export, crop_w, 1, 1);
     assert_eq!(
         clear, background,
         "selected, unannotated pixels must stay raw (no mask/chrome)"
@@ -296,7 +297,7 @@ fn chrome_stays_out_of_the_exported_pixels() {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -349,7 +350,7 @@ fn window_snap_hints_are_painted_but_never_exported() {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -489,7 +490,8 @@ fn window_snap_hints_are_painted_but_never_exported() {
     view.preview_bounds = Some(Rect::new(4, 4, 44, 36));
     view.capture_green = 1.0;
     view.selection = window;
-    let exported = renderer.render_export(&view).unwrap();
+    let exported_pixels = renderer.render_export(&view).unwrap();
+    let exported = exported_pixels.as_bytes();
     assert_eq!(
         exported.len(),
         (window.width() * window.height() * 4) as usize
@@ -520,7 +522,7 @@ fn an_element_preview_keeps_its_own_pixels_and_the_window_fallback_does_not() {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -659,7 +661,7 @@ fn the_capture_box_is_blue_at_rest_and_green_while_walking() {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -767,7 +769,7 @@ fn the_resting_capture_box_is_a_luminance_step_on_light_and_dark_content() {
         renderer.ensure_back_buffer(width, height).unwrap();
         let target = renderer
             .device()
-            .create_render_target_texture(width, height)
+            .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
             .unwrap();
         let d2d_context = renderer.device().create_d2d_context().unwrap();
         let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -838,7 +840,7 @@ fn the_level_badge_reads_as_two_directions_with_the_pinned_one_dimmed() {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -1005,7 +1007,7 @@ fn chain_rings_carry_luminance_on_light_and_dark_content() {
         renderer.ensure_back_buffer(width, height).unwrap();
         let target = renderer
             .device()
-            .create_render_target_texture(width, height)
+            .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
             .unwrap();
         let context = renderer.device().create_d2d_context().unwrap();
         let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -1085,7 +1087,7 @@ fn size_label_panel_is_painted_at_the_selection_top_left() {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -1148,7 +1150,7 @@ fn moving_the_selection_erases_the_previous_chrome() {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -1809,7 +1811,7 @@ fn the_overlay_thread_never_blocks_longer_than_eight_ms() {
         .expect("the back buffer matches the frame");
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .expect("an off-screen target");
     let context = renderer
         .device()
@@ -2053,7 +2055,7 @@ fn render_view_with_preview(
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -2275,7 +2277,7 @@ fn render_panel_frame_with_slide(
     renderer.prepare_panel_icons().unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -2386,7 +2388,7 @@ fn the_glyph_tint_follows_the_colour_it_is_given() {
     renderer.prepare_panel_icons().unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     // 用**渲染器自己的**设备上下文建标签位图：`draw_glyph` 画在它上面，测试若用另一个上下文，
     // 画出来的东西不会落到被读回的那张位图上。
@@ -2466,7 +2468,7 @@ fn the_cost_of_the_panel_icons() {
     let d2d = renderer.device().create_d2d_context().unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(
         &d2d,
@@ -2504,7 +2506,9 @@ fn the_cost_of_the_panel_icons() {
     for _ in 0..10 {
         let mut icons = super::panel_icon::PanelIcons::new();
         let started = Instant::now();
-        icons.prepare(&d2d, &colours).unwrap();
+        icons
+            .prepare(&d2d, &colours, super::color::OverlayColor::sdr())
+            .unwrap();
         prep += started.elapsed();
     }
     eprintln!(
@@ -2513,7 +2517,9 @@ fn the_cost_of_the_panel_icons() {
     );
 
     let mut icons = super::panel_icon::PanelIcons::new();
-    icons.prepare(&d2d, &colours).unwrap();
+    icons
+        .prepare(&d2d, &colours, super::color::OverlayColor::sdr())
+        .unwrap();
     let brush = renderer.panel_muted_brush.clone().expect("brush");
     let rects: Vec<Rect> = (0..8)
         .map(|i| Rect::new(60 + i * 20, 60, 74 + i * 20, 74))
@@ -2942,7 +2948,7 @@ fn render_countdown_frame() -> (Vec<u8>, u32, Rect) {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -2990,7 +2996,7 @@ fn render_masked_with(radius: i32, mask_blur: bool, checker: bool) -> (Vec<u8>, 
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -3080,7 +3086,7 @@ fn render_masked_sequence(radii: &[i32]) -> Vec<(Vec<u8>, u32)> {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -3190,7 +3196,7 @@ fn render_countdown_hud() -> (Vec<u8>, u32, Rect) {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let target_bitmap = super::super::d3d11::create_bitmap_from_texture(
@@ -3301,7 +3307,7 @@ fn with_every_label_item_off_no_badge_is_painted_and_no_menu_can_open() {
     renderer.ensure_back_buffer(width, height).unwrap();
     let target = renderer
         .device()
-        .create_render_target_texture(width, height)
+        .create_render_target_texture(width, height, snapclip_model::PixelFormat::Bgra8Unorm)
         .unwrap();
     let d2d_context = renderer.device().create_d2d_context().unwrap();
     let bitmap = super::super::d3d11::create_bitmap_from_texture(

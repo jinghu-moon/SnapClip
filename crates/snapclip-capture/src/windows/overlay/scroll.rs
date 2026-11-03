@@ -511,7 +511,7 @@ impl OverlayController {
             match clipboard.copy_image(
                 image.frame.width,
                 image.frame.height,
-                &image.bgra,
+                image.sdr_bgra()?,
                 artifact.png_path(),
             ) {
                 Ok(()) => eprintln!(
@@ -597,7 +597,7 @@ mod tests {
         use crate::ports::{ArtifactWriter, ClipboardWriter};
         use crate::session::CapturedFrame;
         use crate::windows::export_worker::ExportSource;
-        use crate::{CaptureError, CaptureResult, PixelFormat};
+        use crate::{CaptureError, CaptureResult};
         use snapclip_model::{CaptureArtifact, CapturePayload};
 
         /// Writes the raw bytes where the history store would put the PNG.
@@ -623,7 +623,10 @@ mod tests {
                     width: prepared.frame.width,
                     height: prepared.frame.height,
                     dpi,
-                    pixel_format: PixelFormat::Bgra8Unorm,
+                    source: snapclip_model::pixels::PixelSource::new(
+                        snapclip_model::pixels::PixelDescriptor::bgra8(),
+                        0,
+                    ),
                     captured_at_unix_ms: 0,
                     monitor_device_name,
                     payload: CapturePayload::PngFile {
@@ -682,13 +685,22 @@ mod tests {
                     frame: CapturedFrame {
                         width,
                         height: rows,
-                        pixel_format: PixelFormat::Bgra8Unorm,
+                        source: snapclip_model::pixels::PixelSource::new(
+                            snapclip_model::pixels::PixelDescriptor::bgra8(),
+                            0,
+                        ),
                         captured_at_unix_ms: 0,
                         provider: SCROLL_PROVIDER,
                         origin: None,
                     },
                     region: Rect::new(0, 0, width as i32, rows as i32),
-                    bgra: vec![0; width as usize * rows as usize * 4],
+                    pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                        width,
+                        rows,
+                        snapclip_model::pixels::PixelDescriptor::bgra8(),
+                        vec![0; width as usize * rows as usize * 4],
+                    )
+                    .unwrap(),
                     origin: None,
                 })),
                 dpi: 144,
@@ -739,8 +751,8 @@ mod tests {
                 vec![(
                     1250,
                     25826,
-                    pixels.bgra.as_ptr() as usize,
-                    pixels.bgra.len(),
+                    pixels.pixels.as_bytes().as_ptr() as usize,
+                    pixels.pixels.as_bytes().len(),
                     Some(dir.join("history.png"))
                 )]
             );
@@ -783,7 +795,10 @@ mod tests {
                         width: spec.region.width() as u32,
                         height: bands.rows(),
                         dpi,
-                        pixel_format: PixelFormat::Bgra8Unorm,
+                        source: snapclip_model::pixels::PixelSource::new(
+                            snapclip_model::pixels::PixelDescriptor::bgra8(),
+                            0,
+                        ),
                         captured_at_unix_ms: 0,
                         monitor_device_name: None,
                         payload: CapturePayload::PngFile {

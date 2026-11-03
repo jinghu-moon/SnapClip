@@ -17,15 +17,17 @@
 use crate::geometry::{Point, Rect};
 use crate::session::CapturedFrame;
 use crate::{CaptureError, CaptureResult};
+use snapclip_model::pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelSource};
 
 /// Supplies the pixels of the frozen frame that the overlay is displaying.
 ///
 /// Implementations borrow their frame, so consumers take `&dyn PixelSliceSource` rather
 /// than a stored trait object: the capture path never needs to keep one.
 pub trait PixelSliceSource {
-    /// Read BGRA8 pixels of `region` (monitor-local physical pixels, top-down,
-    /// tightly packed) from the frozen frame.
-    fn read_bgra(&self, region: Rect) -> CaptureResult<Vec<u8>>;
+    /// Immutable definition of the pixels being read, including source generation.
+    fn source(&self) -> PixelSource;
+    /// Read source pixels, preserving their precision, encoding and alpha mode.
+    fn read_pixels(&self, region: Rect) -> CaptureResult<PixelBuffer>;
 }
 
 /// The pixels of one validated selection, ready to be handed over.
@@ -40,7 +42,7 @@ pub struct SelectionPixels {
     /// Clipped, non-empty region the pixels cover.
     pub region: Rect,
     /// `region` sized, top-down, tightly packed.
-    pub bgra: Vec<u8>,
+    pub pixels: PixelBuffer,
     /// Where `frame`'s own `(0, 0)` sits on the virtual desktop, in physical pixels.
     ///
     /// `region` is expressed in the frame's coordinates, and a frame is one monitor, so
@@ -64,6 +66,47 @@ pub struct SelectionPixels {
 }
 
 impl SelectionPixels {
+    /// Definition of the selected content, including a corner mask's alpha.
+    /// The frozen frame retains its acquisition definition; this derived content
+    /// keeps the acquisition generation without relabeling the original frame.
+    pub fn source(&self) -> PixelSource {
+        PixelSource::new(self.pixels.descriptor(), self.frame.source.generation())
+    }
+
+    /// Validate the source/pixel/geometry seam before handing bytes to a consumer.
+    pub fn validate(&self) -> CaptureResult<()> {
+        let frozen = self.frame.source.descriptor();
+        let content = self.pixels.descriptor();
+        // A corner mask can introduce straight alpha into opaque pixels. It
+        // cannot change channel layout, color encoding or alpha association.
+        let alpha_matches = content.alpha() == frozen.alpha()
+            || (frozen.alpha() == AlphaMode::Opaque && content.alpha() == AlphaMode::Straight);
+        if content.format() != frozen.format()
+            || content.encoding() != frozen.encoding()
+            || !alpha_matches
+            || self.pixels.size() != [self.region.width() as u32, self.region.height() as u32]
+            || self.region.is_empty()
+        {
+            return Err(CaptureError::EncodeFailed(
+                "selection pixels do not match their frozen source or geometry".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Explicit boundary for consumers still restricted to straight-alpha SDR BGRA8.
+    /// This never tone maps, unpremultiplies or quantizes HDR pixels.
+    pub fn sdr_bgra(&self) -> CaptureResult<&[u8]> {
+        self.validate()?;
+        let descriptor = self.pixels.descriptor();
+        if descriptor.format() != PixelDescriptor::bgra8().format()
+            || descriptor.encoding() != PixelDescriptor::bgra8().encoding()
+            || descriptor.alpha() == AlphaMode::Premultiplied
+        {
+            return Err(CaptureError::EncodeFailed("this consumer requires straight-alpha SDR BGRA8; high-precision source is preserved".into()));
+        }
+        Ok(self.pixels.as_bytes())
+    }
     /// `region` translated back to virtual-desktop physical pixels, or `None` when this
     /// picture has no screen position (see [`SelectionPixels::origin`]).
     pub fn screen_region(&self) -> Option<Rect> {
@@ -98,22 +141,27 @@ impl CaptureService {
         pixels: &dyn PixelSliceSource,
     ) -> CaptureResult<SelectionPixels> {
         let clipped = validate(frame, selection)?;
-        let bgra = pixels.read_bgra(clipped)?;
-        let expected = clipped.width() as usize * clipped.height() as usize * 4;
-        if bgra.len() != expected {
-            return Err(CaptureError::EncodeFailed(format!(
-                "pixel readback returned {} bytes, expected {expected}",
-                bgra.len()
-            )));
+        if pixels.source() != frame.source {
+            return Err(CaptureError::InvalidState(
+                "pixel source differs from the frozen frame generation".into(),
+            ));
         }
-        Ok(SelectionPixels {
+        let buffer = pixels.read_pixels(clipped)?;
+        if pixels.source() != frame.source || buffer.descriptor() != frame.source.descriptor() {
+            return Err(CaptureError::InvalidState(
+                "pixel source changed or returned a different definition during readback".into(),
+            ));
+        }
+        let prepared = SelectionPixels {
             origin: frame.origin,
             // 面板的圆角由发布路径（overlay::session）填，这里作为产线默认。
             corner_radius: 0,
             frame: frame.clone(),
             region: clipped,
-            bgra,
-        })
+            pixels: buffer,
+        };
+        prepared.validate()?;
+        Ok(prepared)
     }
 }
 
@@ -137,6 +185,62 @@ pub const MAX_CORNER_RADIUS_PX: u32 = 128;
 /// Coverage comes from 4x4 supersampling inside the radius square: the aliasing of a mask
 /// this small is exactly what would make a rounded window corner look like a staircase.
 pub fn round_corners(bgra: &mut [u8], width: u32, height: u32, radius: u32) {
+    visit_corners(width, height, radius, |index, cov| {
+        let index = index * 4 + 3;
+        bgra[index] = (u16::from(bgra[index]) * u16::from(cov) / 255) as u8;
+    });
+}
+
+/// Round a source-format buffer without changing its RGB precision or encoding.
+/// Associated color channels follow alpha; opaque input becomes straight alpha.
+pub fn round_pixel_corners(pixels: PixelBuffer, radius: u32) -> CaptureResult<PixelBuffer> {
+    let [width, height] = pixels.size();
+    if radius == 0 {
+        return Ok(pixels);
+    }
+    let descriptor = pixels.descriptor();
+    let mut bytes = pixels.into_bytes();
+    let associated = descriptor.alpha() == AlphaMode::Premultiplied;
+    visit_corners(width, height, radius, |index, cov| {
+        match descriptor.format() {
+            snapclip_model::PixelFormat::Bgra8Unorm => {
+                let pixel = &mut bytes[index * 4..][..4];
+                for channel in if associated {
+                    &mut pixel[..]
+                } else {
+                    &mut pixel[3..]
+                } {
+                    *channel = (u16::from(*channel) * u16::from(cov) / 255) as u8;
+                }
+            }
+            snapclip_model::PixelFormat::Rgba16Float => {
+                let pixel = &mut bytes[index * 8..][..8];
+                let start = if associated { 0 } else { 3 };
+                for channel in start..4 {
+                    let at = channel * 2;
+                    let value = half::f16::from_le_bytes([pixel[at], pixel[at + 1]]).to_f32();
+                    pixel[at..at + 2].copy_from_slice(
+                        &half::f16::from_f32(value * f32::from(cov) / 255.).to_le_bytes(),
+                    );
+                }
+            }
+        }
+    });
+    let descriptor = PixelDescriptor::new(
+        descriptor.format(),
+        descriptor.encoding(),
+        if descriptor.alpha() == AlphaMode::Opaque {
+            AlphaMode::Straight
+        } else {
+            descriptor.alpha()
+        },
+    )
+    .map_err(|message| CaptureError::EncodeFailed(message.into()))?;
+    PixelBuffer::from_tight(width, height, descriptor, bytes)
+        .map_err(|message| CaptureError::EncodeFailed(message.into()))
+}
+
+fn visit_corners(width: u32, height: u32, radius: u32, mut apply: impl FnMut(usize, u8)) {
     // 与框的绘制、手柄布局共用一个上限（docs/23 §14.55.21）。
     let radius = radius.min(crate::geometry::radius_cap(width as i32, height as i32) as u32);
     if radius == 0 || width == 0 || height == 0 {
@@ -165,21 +269,20 @@ pub fn round_corners(bgra: &mut [u8], width: u32, height: u32, radius: u32) {
             coverage[(y * radius + x) as usize] = ((inside * 255) / (samples * samples)) as u8;
         }
     }
-    let mut apply = |x: u32, y: u32, cov: u8| {
-        if cov == 255 {
-            return;
-        }
-        let index = ((y * width + x) * 4 + 3) as usize;
-        let alpha = u16::from(bgra[index]) * u16::from(cov) / 255;
-        bgra[index] = alpha as u8;
-    };
     for y in 0..radius {
         for x in 0..radius {
             let cov = coverage[(y * radius + x) as usize];
-            apply(x, y, cov);
-            apply(width - 1 - x, y, cov);
-            apply(x, height - 1 - y, cov);
-            apply(width - 1 - x, height - 1 - y, cov);
+            if cov == 255 {
+                continue;
+            }
+            for (x, y) in [
+                (x, y),
+                (width - 1 - x, y),
+                (x, height - 1 - y),
+                (width - 1 - x, height - 1 - y),
+            ] {
+                apply(y as usize * width as usize + x as usize, cov);
+            }
         }
     }
 }
@@ -206,7 +309,6 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::session::CapturedFrame;
     use crate::{CaptureError, CaptureResult};
-    use snapclip_model::PixelFormat;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Frame source whose pixels encode their own coordinates, so cropping is verifiable.
@@ -227,7 +329,13 @@ mod tests {
     }
 
     impl PixelSliceSource for GridPixels {
-        fn read_bgra(&self, region: Rect) -> CaptureResult<Vec<u8>> {
+        fn source(&self) -> snapclip_model::pixels::PixelSource {
+            snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            )
+        }
+        fn read_pixels(&self, region: Rect) -> CaptureResult<snapclip_model::pixels::PixelBuffer> {
             self.reads.fetch_add(1, Ordering::Relaxed);
             let clipped = region.intersect(Rect::new(0, 0, self.width, self.height));
             let mut bytes = Vec::with_capacity((clipped.area() * 4) as usize);
@@ -236,7 +344,13 @@ mod tests {
                     bytes.extend_from_slice(&[x as u8, y as u8, 0, 255]);
                 }
             }
-            Ok(bytes)
+            Ok(snapclip_model::pixels::PixelBuffer::from_tight(
+                clipped.width() as u32,
+                clipped.height() as u32,
+                self.source().descriptor(),
+                bytes,
+            )
+            .unwrap())
         }
     }
 
@@ -244,7 +358,10 @@ mod tests {
         CapturedFrame {
             width,
             height,
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "test",
             // A frame is one monitor; its own coordinates start at (0, 0) whatever monitor
@@ -270,9 +387,12 @@ mod tests {
         let prepared = prepared(&frame(100, 50), Rect::new(10, 5, 13, 8), &pixels);
         assert_eq!(prepared.region, Rect::new(10, 5, 13, 8));
         // 3x3 pixels, tightly packed, top-down, first pixel is (10, 5).
-        assert_eq!(prepared.bgra.len(), 3 * 3 * 4);
-        assert_eq!(&prepared.bgra[..4], &[10, 5, 0, 255]);
-        assert_eq!(&prepared.bgra[prepared.bgra.len() - 4..], &[12, 7, 0, 255]);
+        assert_eq!(prepared.pixels.as_bytes().len(), 3 * 3 * 4);
+        assert_eq!(&prepared.pixels.as_bytes()[..4], &[10, 5, 0, 255]);
+        assert_eq!(
+            &prepared.pixels.as_bytes()[prepared.pixels.as_bytes().len() - 4..],
+            &[12, 7, 0, 255]
+        );
         assert_eq!(
             pixels.reads.load(Ordering::Relaxed),
             1,
@@ -286,7 +406,7 @@ mod tests {
     fn prepare_reads_only_the_selection_bytes() {
         let pixels = GridPixels::new(3840, 2160);
         let prepared = prepared(&frame(3840, 2160), Rect::new(100, 100, 400, 300), &pixels);
-        assert_eq!(prepared.bgra.len(), 300 * 200 * 4);
+        assert_eq!(prepared.pixels.as_bytes().len(), 300 * 200 * 4);
         assert_eq!(prepared.region.width(), 300);
         assert_eq!(prepared.region.height(), 200);
     }
@@ -296,7 +416,7 @@ mod tests {
         let pixels = GridPixels::new(100, 50);
         let prepared = prepared(&frame(100, 50), Rect::new(95, 45, 200, 200), &pixels);
         assert_eq!(prepared.region, Rect::new(95, 45, 100, 50));
-        assert_eq!(prepared.bgra.len(), 5 * 5 * 4);
+        assert_eq!(prepared.pixels.as_bytes().len(), 5 * 5 * 4);
     }
 
     #[test]
@@ -319,8 +439,23 @@ mod tests {
     fn readback_of_the_wrong_size_is_rejected() {
         struct WrongPixels;
         impl PixelSliceSource for WrongPixels {
-            fn read_bgra(&self, _region: Rect) -> CaptureResult<Vec<u8>> {
-                Ok(vec![0; 4])
+            fn source(&self) -> snapclip_model::pixels::PixelSource {
+                snapclip_model::pixels::PixelSource::new(
+                    snapclip_model::pixels::PixelDescriptor::bgra8(),
+                    0,
+                )
+            }
+            fn read_pixels(
+                &self,
+                _region: Rect,
+            ) -> CaptureResult<snapclip_model::pixels::PixelBuffer> {
+                Ok(snapclip_model::pixels::PixelBuffer::from_tight(
+                    1,
+                    1,
+                    self.source().descriptor(),
+                    vec![0; 4],
+                )
+                .unwrap())
             }
         }
         let error = CaptureService::new()

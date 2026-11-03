@@ -297,7 +297,10 @@ impl Shell {
                 let width = (pixels.region.right - pixels.region.left) as u32;
                 let height = (pixels.region.bottom - pixels.region.top) as u32;
                 let picture = crate::save_panel::Picture::from_selection(
-                    pixels.bgra.clone(),
+                    pixels
+                        .sdr_bgra()
+                        .map_err(|error| error.to_string())?
+                        .to_vec(),
                     crate::save::scale::Size::new(width, height),
                 );
                 requests

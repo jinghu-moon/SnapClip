@@ -94,7 +94,7 @@ impl ExportSource {
         let rows = crate::ports::BandSource::rows(&bands);
         let spec = crate::ports::SelectionSpec {
             region: crate::geometry::Rect::new(0, 0, width as i32, rows as i32),
-            pixel_format: snapclip_model::PixelFormat::Bgra8Unorm,
+            source: crate::ports::BandSource::source(&bands),
             captured_at_unix_ms: snapclip_model::unix_time_ms(),
             // A stitched long image is composed, not a monitor's frozen frame, so it has no screen
             // position to report — and `None` is not `(0, 0)`.
@@ -171,13 +171,19 @@ impl ExportSource {
                 frame: crate::session::CapturedFrame {
                     width,
                     height,
-                    pixel_format: spec.pixel_format,
+                    source: spec.source,
                     captured_at_unix_ms: spec.captured_at_unix_ms,
                     provider: "scroll-bands",
                     origin: spec.origin,
                 },
                 region: spec.region,
-                bgra,
+                pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                    width,
+                    height,
+                    spec.source.descriptor(),
+                    bgra,
+                )
+                .map_err(|message| CaptureError::EncodeFailed(message.into()))?,
                 origin: spec.origin,
                 corner_radius: spec.corner_radius,
             });
@@ -304,7 +310,7 @@ impl Mailbox {
     fn complete(&self, job: &ExportJob, event: WorkerEvent) {
         let written = match &event {
             WorkerEvent::Ready(Ok(completed)) => {
-                completed.artifact.png_path().map(Path::to_path_buf)
+                Some(completed.artifact.artifact_path().to_path_buf())
             }
             WorkerEvent::Ready(Err(_)) => None,
         };
@@ -453,10 +459,7 @@ fn worker_main(mailbox: Arc<Mailbox>) {
                 eprintln!(
                     "[snapclip][bench] stage=export session={} path={} size={}x{} encode_write_ms={}",
                     job.session_id,
-                    artifact
-                        .png_path()
-                        .map(|path| path.to_string_lossy())
-                        .unwrap_or_default(),
+                    artifact.artifact_path().to_string_lossy(),
                     artifact.width,
                     artifact.height,
                     started_at.elapsed().as_millis()
@@ -512,7 +515,7 @@ mod tests {
     use crate::geometry::Rect;
     use crate::session::CapturedFrame;
     use crate::{CaptureError, CaptureResult};
-    use snapclip_model::{CaptureArtifact, CapturePayload, PixelFormat};
+    use snapclip_model::{CaptureArtifact, CapturePayload};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -526,13 +529,22 @@ mod tests {
             frame: CapturedFrame {
                 width: 8,
                 height: 8,
-                pixel_format: PixelFormat::Bgra8Unorm,
+                source: snapclip_model::pixels::PixelSource::new(
+                    snapclip_model::pixels::PixelDescriptor::bgra8(),
+                    0,
+                ),
                 captured_at_unix_ms: 1,
                 provider: "test",
                 origin: Some(crate::geometry::Point::new(0, 0)),
             },
             region: Rect::new(0, 0, 4, 4),
-            bgra: vec![0u8; 4 * 4 * 4],
+            pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                4,
+                4,
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                vec![0; 64],
+            )
+            .unwrap(),
             origin: Some(crate::geometry::Point::new(0, 0)),
         }
     }
@@ -543,7 +555,10 @@ mod tests {
             width: 4,
             height: 4,
             dpi: 96,
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 1,
             monitor_device_name: None,
             payload: CapturePayload::PngFile { path },
@@ -709,6 +724,40 @@ mod tests {
         };
         assert_eq!(failure.stage, "export");
         assert_eq!(failure.generation, generation);
+    }
+
+    #[test]
+    fn a_cancelled_pixel_master_is_deleted_like_a_png() {
+        let mailbox = Mailbox::new();
+        let generation = mailbox
+            .submit(new_job(writing(Arc::new(AtomicUsize::new(0)))))
+            .unwrap();
+        let job = mailbox.wait_job().unwrap();
+        let path = artifact_path("discard-master", generation).with_extension("scpx");
+        std::fs::write(&path, b"master").unwrap();
+        let mut result = artifact(path.clone(), "session-test");
+        result.payload = CapturePayload::PixelMaster {
+            reference: snapclip_model::ArtifactRef {
+                absolute_path: path.clone(),
+                mime: "application/x-snapclip-pixels".into(),
+                dimensions: snapclip_model::ImageDimensions {
+                    width: 4,
+                    height: 4,
+                },
+                byte_len: 6,
+                content_fingerprint: blake3::hash(b"master").to_hex().to_string(),
+            },
+        };
+        mailbox.invalidate();
+        mailbox.complete(
+            &job,
+            WorkerEvent::Ready(Ok(CompletedExport {
+                generation,
+                artifact: result,
+            })),
+        );
+        assert!(!path.exists());
+        assert!(mailbox.take_result().is_none());
     }
 
     #[test]

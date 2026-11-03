@@ -39,7 +39,7 @@ use snapclip_model::{
 use std::sync::{Arc, OnceLock};
 use std::thread::ThreadId;
 
-/// A BGRA frame together with the texture that holds it.
+/// A captured or uploaded frame together with the texture that holds it.
 #[derive(Debug)]
 pub struct GpuFrame {
     pub texture: ID3D11Texture2D,
@@ -48,6 +48,16 @@ pub struct GpuFrame {
     pub width: u32,
     #[cfg_attr(not(test), allow(dead_code))]
     pub height: u32,
+}
+
+pub(crate) fn dxgi_format(
+    format: PixelFormat,
+) -> ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+    match format {
+        PixelFormat::Bgra8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
+        PixelFormat::Rgba16Float => DXGI_FORMAT_R16G16B16A16_FLOAT,
+    }
 }
 
 /// One D3D11 device plus the D2D device derived from it.
@@ -151,11 +161,12 @@ impl GraphicsDevice {
         &self,
         width: u32,
         height: u32,
+        format: PixelFormat,
     ) -> Result<IDXGISwapChain1, String> {
         let description = DXGI_SWAP_CHAIN_DESC1 {
             Width: width,
             Height: height,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: dxgi_format(format),
             Stereo: false.into(),
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -168,11 +179,33 @@ impl GraphicsDevice {
             AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
             Flags: 0,
         };
-        unsafe {
+        let chain = unsafe {
             self.dxgi_factory
                 .CreateSwapChainForComposition(&self.d3d, &description, None)
         }
-        .map_err(|error| super::hresult("CreateSwapChainForComposition", &error))
+        .map_err(|error| super::hresult("CreateSwapChainForComposition", &error))?;
+        use ::windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+        };
+        use ::windows::Win32::Graphics::Dxgi::{
+            DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT, IDXGISwapChain3,
+        };
+        let space = if format == PixelFormat::Rgba16Float {
+            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+        } else {
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+        };
+        let color_chain: IDXGISwapChain3 = chain
+            .cast()
+            .map_err(|e| super::hresult("IDXGISwapChain3", &e))?;
+        let support = unsafe { color_chain.CheckColorSpaceSupport(space) }
+            .map_err(|e| super::hresult("CheckColorSpaceSupport", &e))?;
+        if support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32 == 0 {
+            return Err("composition swap chain cannot present its required color space".into());
+        }
+        unsafe { color_chain.SetColorSpace1(space) }
+            .map_err(|e| super::hresult("SetColorSpace1", &e))?;
+        Ok(chain)
     }
 
     /// Wrap a swap chain back buffer as a D2D render target.
@@ -183,18 +216,16 @@ impl GraphicsDevice {
     ) -> Result<ID2D1Bitmap1, String> {
         let surface: IDXGISurface = unsafe { swap_chain.GetBuffer(0) }
             .map_err(|error| super::hresult("IDXGISwapChain::GetBuffer", &error))?;
-        let properties = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-            ..Default::default()
-        };
-        unsafe { d2d_context.CreateBitmapFromDxgiSurface(&surface, Some(&properties)) }
-            .map_err(|error| super::hresult("CreateBitmapFromDxgiSurface", &error))
+        let texture: ID3D11Texture2D = surface
+            .cast()
+            .map_err(|e| super::hresult("target texture", &e))?;
+        create_bitmap_from_texture(
+            d2d_context,
+            &texture,
+            D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )
+        .map_err(|error| super::hresult("CreateBitmapFromDxgiSurface", &error))
     }
 
     /// Create a shader-resource BGRA texture and upload `bgra` into it.
@@ -204,11 +235,37 @@ impl GraphicsDevice {
         height: u32,
         bgra: &[u8],
     ) -> Result<GpuFrame, String> {
-        let expected = width as usize * height as usize * 4;
-        if bgra.len() != expected {
+        self.upload_texture(width, height, PixelFormat::Bgra8Unorm, bgra)
+    }
+
+    /// Upload a validated, tightly packed pixel buffer without changing its bits.
+    pub fn create_pixel_texture(&self, pixels: &PixelBuffer) -> Result<GpuFrame, String> {
+        let [width, height] = pixels.size();
+        self.upload_texture(
+            width,
+            height,
+            pixels.descriptor().format(),
+            pixels.as_bytes(),
+        )
+    }
+
+    fn upload_texture(
+        &self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        bytes: &[u8],
+    ) -> Result<GpuFrame, String> {
+        let pitch = width
+            .checked_mul(format.bytes_per_pixel())
+            .ok_or("texture upload pitch overflow")?;
+        let expected = (pitch as usize)
+            .checked_mul(height as usize)
+            .ok_or("texture upload size overflow")?;
+        if width == 0 || height == 0 || bytes.len() != expected {
             return Err(format!(
-                "bgra upload of {} bytes does not match {width}x{height}",
-                bgra.len()
+                "pixel upload of {} bytes does not match {width}x{height} {format:?}",
+                bytes.len()
             ));
         }
         let description = D3D11_TEXTURE2D_DESC {
@@ -216,7 +273,7 @@ impl GraphicsDevice {
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: dxgi_format(format),
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -227,8 +284,8 @@ impl GraphicsDevice {
             MiscFlags: 0,
         };
         let initial = D3D11_SUBRESOURCE_DATA {
-            pSysMem: bgra.as_ptr() as *const _,
-            SysMemPitch: width * 4,
+            pSysMem: bytes.as_ptr() as *const _,
+            SysMemPitch: pitch,
             SysMemSlicePitch: 0,
         };
         let mut texture: Option<ID3D11Texture2D> = None;
@@ -254,13 +311,14 @@ impl GraphicsDevice {
         &self,
         width: u32,
         height: u32,
+        format: PixelFormat,
     ) -> Result<GpuFrame, String> {
         let description = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: dxgi_format(format),
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -627,6 +685,22 @@ impl AsyncSampleBuffer {
         y: u32,
         tile_size: u32,
     ) -> Result<usize, String> {
+        let mut description = D3D11_TEXTURE2D_DESC::default();
+        unsafe { source.GetDesc(&mut description) };
+        if description.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+            return Err(
+                "the SDR color sampler requires an explicit SDR derivative of this source".into(),
+            );
+        }
+        if tile_size == 0
+            || tile_size > SAMPLE_TILE
+            || x.checked_add(tile_size)
+                .is_none_or(|end| end > description.Width)
+            || y.checked_add(tile_size)
+                .is_none_or(|end| end > description.Height)
+        {
+            return Err("color sample region is outside its source or staging tile".into());
+        }
         let slot = self.next_slot;
         self.next_slot = (self.next_slot + 1) % SLOT_COUNT;
         let src_box = D3D11_BOX {
@@ -724,10 +798,20 @@ pub fn create_bitmap_from_texture(
     options: D2D1_BITMAP_OPTIONS,
     alpha_mode: D2D1_ALPHA_MODE,
 ) -> WinResult<ID2D1Bitmap1> {
+    let mut description = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut description) };
+    use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if description.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        && description.Format != DXGI_FORMAT_R16G16B16A16_FLOAT
+    {
+        return Err(::windows::core::Error::from_hresult(
+            ::windows::core::HRESULT(0x80070057u32 as i32),
+        ));
+    }
     let surface: IDXGISurface = texture.cast()?;
-    let properties = D2D1_BITMAP_PROPERTIES1 {
+    let mut properties = D2D1_BITMAP_PROPERTIES1 {
         pixelFormat: D2D1_PIXEL_FORMAT {
-            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            format: description.Format,
             alphaMode: alpha_mode,
         },
         dpiX: 96.0,
@@ -735,7 +819,17 @@ pub fn create_bitmap_from_texture(
         bitmapOptions: options,
         ..Default::default()
     };
-    unsafe { d2d_context.CreateBitmapFromDxgiSurface(&surface, Some(&properties)) }
+    if description.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+        use ::windows::Win32::Graphics::Direct2D::D2D1_COLOR_SPACE_SCRGB;
+        properties.colorContext = std::mem::ManuallyDrop::new(Some(unsafe {
+            d2d_context.CreateColorContext(D2D1_COLOR_SPACE_SCRGB, None)?
+        }));
+    }
+    let result = unsafe { d2d_context.CreateBitmapFromDxgiSurface(&surface, Some(&properties)) };
+    // windows-rs mirrors the C ABI with ManuallyDrop; the property struct does not
+    // release its COM member. The bitmap retains its own reference on success.
+    unsafe { std::mem::ManuallyDrop::drop(&mut properties.colorContext) };
+    result
 }
 
 #[cfg(test)]
@@ -915,7 +1009,9 @@ mod tests {
         });
 
         let composition = device.create_composition_target(window).unwrap();
-        let swap_chain = device.create_composition_swap_chain(320, 200).unwrap();
+        let swap_chain = device
+            .create_composition_swap_chain(320, 200, snapclip_model::PixelFormat::Bgra8Unorm)
+            .unwrap();
         composition.attach(&swap_chain).unwrap();
 
         let context = device.create_d2d_context().unwrap();
@@ -994,7 +1090,9 @@ mod tests {
     fn swap_chain_can_be_created_and_presented() {
         let device =
             GraphicsDevice::create().expect("this test needs a D3D11 device (docs/31 D-14)");
-        let swap_chain = device.create_composition_swap_chain(64, 48).unwrap();
+        let swap_chain = device
+            .create_composition_swap_chain(64, 48, snapclip_model::PixelFormat::Bgra8Unorm)
+            .unwrap();
         let context = device.create_d2d_context().unwrap();
         let target = device.create_target_bitmap(&context, &swap_chain).unwrap();
         let pixel_size = unsafe { target.GetPixelSize() };
@@ -1456,7 +1554,12 @@ mod tests {
         // is the only way to know the difference between that and a broken probe.
         let monitor = monitor::captured_monitor_at_cursor()
             .expect("this test needs a readable cursor position (docs/31 D-14)");
-        let frame = super::super::wgc::capture_monitor(&device, &monitor).unwrap();
+        let frame = super::super::wgc::capture_monitor(
+            &device,
+            &monitor,
+            snapclip_model::pixels::PixelDescriptor::bgra8(),
+        )
+        .unwrap();
         probe_async_sample(&device, &frame.texture);
     }
 

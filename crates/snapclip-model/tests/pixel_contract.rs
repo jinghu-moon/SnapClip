@@ -95,3 +95,19 @@ fn opaque_descriptor_requires_opaque_pixels_instead_of_silently_changing_them() 
     bytes[6..8].copy_from_slice(&0x3c00u16.to_le_bytes());
     assert!(PixelBuffer::from_bytes(1, 1, 8, opaque, bytes).is_ok());
 }
+
+#[test]
+fn serialized_source_keeps_its_frozen_encoding_and_generation() {
+    use snapclip_model::pixels::PixelSource;
+    let source = PixelSource::new(hdr(), 41);
+    let json = serde_json::to_string(&source).unwrap();
+    assert!(json.contains("sc_rgb"));
+    assert_eq!(serde_json::from_str::<PixelSource>(&json).unwrap(), source);
+    let invalid = json.replace("rgba16_float", "bgra8_unorm");
+    assert!(serde_json::from_str::<PixelSource>(&invalid).is_err());
+    let invalid = json.replace(",\"generation\":41", "");
+    assert!(
+        serde_json::from_str::<PixelSource>(&invalid).is_err(),
+        "a source generation cannot be silently invented"
+    );
+}

@@ -1438,7 +1438,10 @@ mod tests {
         crate::session::CapturedFrame {
             width: 1920,
             height: 1080,
-            pixel_format: snapclip_model::PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "test",
             origin: Some(crate::geometry::Point::new(0, 0)),
@@ -1540,7 +1543,13 @@ mod tests {
             shared.selection = Some(std::sync::Arc::new(crate::artifact::SelectionPixels {
                 frame: frame(),
                 region,
-                bgra,
+                pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                    region.width() as u32,
+                    region.height() as u32,
+                    snapclip_model::pixels::PixelDescriptor::bgra8(),
+                    bgra,
+                )
+                .unwrap(),
                 origin: Some(crate::geometry::Point::new(0, 0)),
                 corner_radius: 0,
             }));
@@ -1602,7 +1611,13 @@ mod tests {
                     right: 4,
                     bottom: 4,
                 },
-                bgra: vec![0u8; 4 * 4 * 4],
+                pixels: snapclip_model::pixels::PixelBuffer::from_tight(
+                    4,
+                    4,
+                    snapclip_model::pixels::PixelDescriptor::bgra8(),
+                    vec![0; 64],
+                )
+                .unwrap(),
                 origin: Some(crate::geometry::Point::new(0, 0)),
                 corner_radius: 0,
             }));

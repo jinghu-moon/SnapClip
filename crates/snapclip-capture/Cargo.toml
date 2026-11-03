@@ -19,6 +19,7 @@ seal-faults = []
 snapclip-model = { path = "../snapclip-model" }
 snapclip-ui = { path = "../snapclip-ui" }
 blake3 = "1.5"
+half = "2.7"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 

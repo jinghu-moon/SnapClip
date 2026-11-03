@@ -253,13 +253,11 @@ where
         };
         let clip_id = publication.publication_id.clone();
         let hash = image.content_hash.clone();
-        match self.source.enqueue_ocr(clip_id.clone(), hash.clone()) {
-            Ok(QueueDecision::Enqueued { attempt }) => {
-                if !self.ocr.try_enqueue(&clip_id, &hash) {
-                    let _ = self.source.release_queued(clip_id, attempt);
-                }
-            }
-            Ok(_) | Err(_) => {}
+        if let Ok(QueueDecision::Enqueued { attempt }) =
+            self.source.enqueue_ocr(clip_id.clone(), hash.clone())
+            && !self.ocr.try_enqueue(&clip_id, &hash)
+        {
+            let _ = self.source.release_queued(clip_id, attempt);
         }
     }
 

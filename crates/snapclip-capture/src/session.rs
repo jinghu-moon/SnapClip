@@ -7,7 +7,7 @@ use super::CaptureError;
 use super::geometry::{
     MonitorLayout, Point, Rect, ResizeMode, SelectionDrag, SelectionGeometry, SelectionSnapshot,
 };
-use snapclip_model::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat};
+use snapclip_model::{CaptureArtifact, CapturePayload, CaptureState};
 
 /// One frozen back-buffer frame: exactly what the overlay presents while the user
 /// selects. It is captured once, before the overlay becomes visible, so the
@@ -16,7 +16,8 @@ use snapclip_model::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat}
 pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
-    pub pixel_format: PixelFormat,
+    /// Captured definition, never reinterpreted using later monitor/output state.
+    pub source: snapclip_model::pixels::PixelSource,
     pub captured_at_unix_ms: i64,
     pub provider: &'static str,
     /// The monitor's origin on the virtual desktop, in physical pixels.
@@ -432,7 +433,7 @@ impl CaptureSession {
             width: clipped.width() as u32,
             height: clipped.height() as u32,
             dpi: self.dpi(),
-            pixel_format: frame.pixel_format,
+            source: frame.source,
             captured_at_unix_ms: frame.captured_at_unix_ms,
             monitor_device_name: None,
             payload,
@@ -479,7 +480,7 @@ impl CaptureSession {
 mod tests {
     use super::{CaptureSession, CapturedFrame, ExportOutcome, OverlayGeometry, ScrollStart};
     use crate::geometry::{Handle, MonitorLayout, Point, Rect, ResizeMode, SelectionGeometry};
-    use snapclip_model::{CapturePayload, CaptureState, PixelFormat};
+    use snapclip_model::{CapturePayload, CaptureState};
 
     fn layout() -> MonitorLayout {
         MonitorLayout {
@@ -494,7 +495,10 @@ mod tests {
         CapturedFrame {
             width: 1920,
             height: 1080,
-            pixel_format: PixelFormat::Bgra8Unorm,
+            source: snapclip_model::pixels::PixelSource::new(
+                snapclip_model::pixels::PixelDescriptor::bgra8(),
+                0,
+            ),
             captured_at_unix_ms: 1_700_000_000_000,
             provider: "test",
             origin: Some(Point::new(0, 0)),

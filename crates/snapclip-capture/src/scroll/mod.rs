@@ -1122,6 +1122,12 @@ impl ScrollBands {
 }
 
 impl crate::ports::BandSource for ScrollBands {
+    fn source(&self) -> snapclip_model::pixels::PixelSource {
+        snapclip_model::pixels::PixelSource::new(
+            snapclip_model::pixels::PixelDescriptor::bgra8(),
+            0,
+        )
+    }
     fn rows(&self) -> u32 {
         self.tracker.rows()
     }

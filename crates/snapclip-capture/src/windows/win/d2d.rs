@@ -44,6 +44,7 @@ use ::windows::Win32::Graphics::DirectWrite::{
 use ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use ::windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
 use ::windows::core::{Interface, PCWSTR};
+use snapclip_model::pixels::{PixelBuffer, PixelDescriptor};
 use std::sync::Arc;
 use windows_numerics::Vector2;
 
@@ -72,6 +73,10 @@ use snapclip_ui::font as overlay_font;
 use snapclip_ui::panel::TagColors;
 use snapclip_ui::panel::d2d::{PanelPainter, SegmentColors};
 use snapclip_ui::panel::{Glyph, PanelTheme, Segment, SegmentState, Tag, TagState};
+
+mod color;
+#[cfg(test)]
+mod hdr_tests;
 
 /// The font family used for the size label, per the tasklist (§6.3) — the same two families the
 /// overlay's typeface falls back to.
@@ -424,6 +429,7 @@ struct ChromeResources {
 
 /// Overlay renderer: owns the D2D/DirectWrite resources and the swap chain.
 pub struct OverlayRenderer {
+    color: color::OverlayColor,
     device: Arc<GraphicsDevice>,
     d2d: ID2D1DeviceContext,
     dwrite: IDWriteFactory,
@@ -666,6 +672,7 @@ impl OverlayRenderer {
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_ISOLATED) }
                 .map_err(|error| super::hresult("DWriteCreateFactory", &error))?;
         Ok(Self {
+            color: color::OverlayColor::sdr(),
             device,
             d2d,
             dwrite,
@@ -740,6 +747,31 @@ impl OverlayRenderer {
         self.metrics
     }
 
+    /// Change the native target contract using a verified output-white snapshot.
+    /// The production capture entry remains SDR until it supplies that snapshot.
+    fn configure_color(&mut self, color: color::OverlayColor) -> Result<(), String> {
+        if self.color == color {
+            return Ok(());
+        }
+        let size = self.size;
+        self.release_target();
+        self.frame_bitmap = None;
+        self.color = color;
+        self.color.apply_precision(&self.d2d);
+        if size != (0, 0) {
+            self.ensure_back_buffer(size.0, size.1)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn configure_source(
+        &mut self,
+        descriptor: PixelDescriptor,
+        sdr_white_nits: Option<f32>,
+    ) -> Result<(), String> {
+        self.configure_color(color::OverlayColor::for_source(descriptor, sdr_white_nits)?)
+    }
+
     /// (Re)create the swap chain for a monitor-sized back buffer.
     ///
     /// Keeps the D3D11 device alive for the current session: only the swap chain and
@@ -752,13 +784,19 @@ impl OverlayRenderer {
             return Ok(());
         }
         self.release_target();
-        let swap_chain = self.device.create_composition_swap_chain(width, height)?;
+        self.color.apply_precision(&self.d2d);
+        let swap_chain =
+            self.device
+                .create_composition_swap_chain(width, height, self.color.format())?;
         let target = self.device.create_target_bitmap(&self.d2d, &swap_chain)?;
         unsafe { self.d2d.SetTarget(&target) };
         self.swap_chain = Some(swap_chain);
         self.target = Some(target);
         self.size = (width, height);
-        self.recreate_resources()?;
+        if let Err(error) = self.recreate_resources() {
+            self.release_target();
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -792,7 +830,19 @@ impl OverlayRenderer {
         width: u32,
         height: u32,
         texture: &ID3D11Texture2D,
+        descriptor: PixelDescriptor,
     ) -> Result<(), String> {
+        self.validate_source(descriptor)?;
+        let mut actual = ::windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut actual) };
+        if actual.Width != width
+            || actual.Height != height
+            || actual.Format != super::d3d11::dxgi_format(descriptor.format())
+        {
+            return Err(
+                "overlay source texture does not match its dimensions or pixel format".into(),
+            );
+        }
         let bitmap = super::d3d11::create_bitmap_from_texture(
             &self.d2d,
             texture,
@@ -802,7 +852,6 @@ impl OverlayRenderer {
             D2D1_ALPHA_MODE_IGNORE,
         )
         .map_err(|error| super::hresult("CreateBitmapFromDxgiSurface", &error))?;
-        let _ = (width, height);
         self.frame_bitmap = Some(bitmap);
         self.blurred_frame = None;
         Ok(())
@@ -813,31 +862,50 @@ impl OverlayRenderer {
     /// Only used where CPU pixels are the source of truth (BitBlt at capture time and
     /// the headless visual regression tests).
     pub fn update_frame(&mut self, width: u32, height: u32, bgra: &[u8]) -> Result<(), String> {
-        let expected = width as usize * height as usize * 4;
-        if bgra.len() != expected {
-            return Err(format!(
-                "frame upload of {} bytes does not match {width}x{height}",
-                bgra.len()
-            ));
+        self.upload_frame(width, height, PixelDescriptor::bgra8(), bgra)
+    }
+
+    pub(crate) fn update_pixels(&mut self, pixels: &PixelBuffer) -> Result<(), String> {
+        let [width, height] = pixels.size();
+        self.upload_frame(width, height, pixels.descriptor(), pixels.as_bytes())
+    }
+
+    fn validate_source(&self, descriptor: PixelDescriptor) -> Result<(), String> {
+        if descriptor != self.color.descriptor() {
+            return Err(
+                "overlay source does not match the configured target color contract".into(),
+            );
         }
-        let properties = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                // The captured desktop is opaque and is copied verbatim, so its alpha
-                // channel must not participate in the source-over blend: treating it as
-                // premultiplied would darken every pixel by its own coverage.
-                alphaMode: D2D1_ALPHA_MODE_IGNORE,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            ..Default::default()
-        };
+        Ok(())
+    }
+
+    fn upload_frame(
+        &mut self,
+        width: u32,
+        height: u32,
+        descriptor: PixelDescriptor,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.validate_source(descriptor)?;
+        let pitch = width
+            .checked_mul(descriptor.format().bytes_per_pixel())
+            .ok_or("overlay upload pitch overflow")?;
+        let expected = (pitch as usize)
+            .checked_mul(height as usize)
+            .ok_or("overlay upload size overflow")?;
+        if width == 0 || height == 0 || bytes.len() != expected {
+            return Err("overlay upload dimensions or buffer length mismatch".into());
+        }
+        // Desktop alpha is ignored, just as in the original SDR capture path.
+        let properties =
+            self.color
+                .properties(&self.d2d, D2D1_BITMAP_OPTIONS_NONE, D2D1_ALPHA_MODE_IGNORE)?;
         let bitmap = unsafe {
             self.d2d.CreateBitmap(
                 D2D_SIZE_U { width, height },
-                Some(bgra.as_ptr() as *const _),
-                width * 4,
-                &properties,
+                Some(bytes.as_ptr() as *const _),
+                pitch,
+                properties.raw(),
             )
         }
         .map_err(|error| super::hresult("ID2D1DeviceContext::CreateBitmap", &error))?;
@@ -862,7 +930,7 @@ impl OverlayRenderer {
     }
 
     /// Render the exportable composition into a fresh frame-sized offscreen target
-    /// and crop `view.selection` back to CPU BGRA.
+    /// and crop `view.selection` back to a typed CPU pixel buffer.
     ///
     /// Reuses the exact [`Self::draw_to`] layer code the preview presents, so the
     /// exported pixels are the same geometry + style path (docs/11 §8.3). The caller
@@ -870,7 +938,7 @@ impl OverlayRenderer {
     /// the crop is the selected region's frozen frame plus its committed annotations —
     /// never the mask, chrome, grips, magnifier or control points, which must not enter
     /// the artifact (docs/11 §8.2/§8.4).
-    pub fn render_export(&mut self, view: &RenderView) -> Result<Vec<u8>, String> {
+    pub fn render_export(&mut self, view: &RenderView) -> Result<PixelBuffer, String> {
         // Artifact pixels never contain interactive hints. Enforced here — the one place
         // that produces them — so the invariant does not depend on every caller
         // remembering to clear them (docs/14 §8).
@@ -896,9 +964,11 @@ impl OverlayRenderer {
         }
         let selection = view.selection.intersect(view.frame);
         if selection.is_empty() {
-            return Ok(Vec::new());
+            return Err("overlay export selection is empty".into());
         }
-        let gpu = self.device.create_render_target_texture(frame_w, frame_h)?;
+        let gpu =
+            self.device
+                .create_render_target_texture(frame_w, frame_h, self.color.format())?;
         let target = super::d3d11::create_bitmap_from_texture(
             &self.d2d,
             &gpu.texture,
@@ -907,7 +977,7 @@ impl OverlayRenderer {
         )
         .map_err(|error| super::hresult("CreateBitmapFromDxgiSurface(export)", &error))?;
 
-        self.draw_to(&target, view)?;
+        let drawn = self.draw_to(&target, view);
 
         // draw_to repoints the shared device context at the offscreen target; restore
         // it to the swap chain so any later preview draw is unaffected.
@@ -917,13 +987,16 @@ impl OverlayRenderer {
                 None => self.d2d.SetTarget(None),
             }
         }
-
-        self.device.read_back_region_bgra(
+        drawn?;
+        self.device.read_back_pixels(
             &gpu.texture,
-            selection.left.max(0) as u32,
-            selection.top.max(0) as u32,
-            selection.width() as u32,
-            selection.height() as u32,
+            [
+                selection.left.max(0) as u32,
+                selection.top.max(0) as u32,
+                selection.width() as u32,
+                selection.height() as u32,
+            ],
+            self.color.descriptor(),
         )
     }
 
@@ -971,17 +1044,12 @@ impl OverlayRenderer {
             return Ok(());
         };
         let size = unsafe { frame.GetPixelSize() };
-        let properties = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
-            ..Default::default()
-        };
-        let blurred = unsafe { self.d2d.CreateBitmap(size, None, 0, &properties) }
+        let properties = self.color.properties(
+            &self.d2d,
+            D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1_ALPHA_MODE_PREMULTIPLIED,
+        )?;
+        let blurred = unsafe { self.d2d.CreateBitmap(size, None, 0, properties.raw()) }
             .map_err(|error| super::hresult("ID2D1DeviceContext::CreateBitmap(blur)", &error))?;
         let input: ID2D1Image = frame
             .cast()
@@ -1023,6 +1091,9 @@ impl OverlayRenderer {
     ///
     /// 必须在帧之外调用（内部自己 `BeginDraw`/`EndDraw`）；耗时由调用方测量。
     pub(crate) fn countdown_dim_source(&mut self, divisor: u32) -> Result<DimSource, String> {
+        if self.color.is_linear() {
+            return Err("HDR countdown requires a composition surface; the BGRA8 layered path is unsupported".into());
+        }
         self.ensure_blurred_frame()?;
         let (Some(frame), Some(blurred)) = (self.frame_bitmap.clone(), self.blurred_frame.clone())
         else {
@@ -1460,8 +1531,8 @@ impl OverlayRenderer {
                     let fill =
                         self.require_brush(&self.preview_fill_brush, "preview fill brush")?;
                     unsafe {
-                        let _ = mix.SetColor(&capture_mix_color(walking, appear));
-                        let _ = fill.SetColor(&capture_wash_color(walking, appear));
+                        mix.SetColor(&self.color.ui(capture_mix_color(walking, appear)));
+                        fill.SetColor(&self.color.ui(capture_wash_color(walking, appear)));
                     }
                     (fill, mix, width * 2.0)
                 };
@@ -1668,7 +1739,7 @@ impl OverlayRenderer {
                     width + CHAIN_RING_SHADOW_WIDTH,
                     None,
                 );
-                let _ = brush.SetColor(&chain_ring_color(ring.alpha));
+                brush.SetColor(&self.color.ui(chain_ring_color(ring.alpha)));
                 self.d2d.DrawRectangle(&to_d2d(rect), &brush, width, None);
             }
         }
@@ -2893,24 +2964,37 @@ impl OverlayRenderer {
                 preview.rows
             ));
         }
-        let properties = D2D1_BITMAP_PROPERTIES1 {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_IGNORE,
-            },
-            dpiX: 96.0,
-            dpiY: 96.0,
-            ..Default::default()
+        let converted = if self.color.is_linear() {
+            let pixels = PixelBuffer::from_tight(
+                preview.width,
+                preview.rows,
+                PixelDescriptor::bgra8(),
+                preview.bytes.clone(),
+            )
+            .map_err(str::to_string)?;
+            Some(self.color.thumbnail(&pixels)?)
+        } else {
+            None
         };
+        let bytes = converted
+            .as_ref()
+            .map_or(preview.bytes.as_slice(), PixelBuffer::as_bytes);
+        let pitch = preview
+            .width
+            .checked_mul(self.color.format().bytes_per_pixel())
+            .ok_or("scroll thumbnail pitch overflow")?;
+        let properties =
+            self.color
+                .properties(&self.d2d, D2D1_BITMAP_OPTIONS_NONE, D2D1_ALPHA_MODE_IGNORE)?;
         let bitmap = unsafe {
             self.d2d.CreateBitmap(
                 D2D_SIZE_U {
                     width: preview.width,
                     height: preview.rows,
                 },
-                Some(preview.bytes.as_ptr() as *const _),
-                preview.width * 4,
-                &properties,
+                Some(bytes.as_ptr() as *const _),
+                pitch,
+                properties.raw(),
             )
         }
         .map_err(|error| {
@@ -2963,11 +3047,11 @@ impl OverlayRenderer {
         let opacity = item.style.opacity;
         let sc = item.style.stroke_color;
         let stroke_color = color(sc[0], sc[1], sc[2], sc[3] * opacity);
-        let _ = unsafe { stroke.SetColor(&stroke_color) };
+        unsafe { stroke.SetColor(&self.color.ui(stroke_color)) };
 
         if let Some(fc) = item.style.fill_color {
             let fill_color = color(fc[0], fc[1], fc[2], fc[3] * opacity);
-            let _ = unsafe { fill.SetColor(&fill_color) };
+            unsafe { fill.SetColor(&self.color.ui(fill_color)) };
         }
         let has_fill = item.style.fill_color.is_some();
         let sw = item.style.stroke_width;
@@ -3057,7 +3141,7 @@ impl OverlayRenderer {
                     if alpha_mult < 1.0 {
                         let hl_color =
                             color(base[0], base[1], base[2], base[3] * alpha_mult * opacity);
-                        let _ = stroke.SetColor(&hl_color);
+                        stroke.SetColor(&self.color.ui(hl_color));
                     }
                     for w in points.windows(2) {
                         self.d2d.DrawLine(
@@ -3237,7 +3321,7 @@ impl OverlayRenderer {
             .into_iter()
             .filter_map(|brush| brush.as_ref().map(|brush| unsafe { brush.GetColor() }))
             .collect();
-        self.panel_icons.prepare(&self.d2d, &colours)
+        self.panel_icons.prepare(&self.d2d, &colours, self.color)
     }
 
     fn recreate_resources(&mut self) -> Result<(), String> {
@@ -3385,14 +3469,39 @@ impl OverlayRenderer {
                     ..SCROLL_PANEL
                 },
             },
-        ];
-        // The render target's overload: the device context's own takes straight-alpha stops in a
-        // different signature.
+        ]
+        .map(|stop| D2D1_GRADIENT_STOP {
+            color: self.color.ui(stop.color),
+            ..stop
+        });
         let target: &ID2D1RenderTarget = &self.d2d;
         let fade = unsafe {
-            let collection = target
-                .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
-                .map_err(|e| super::hresult("CreateGradientStopCollection", &e))?;
+            let collection: ::windows::Win32::Graphics::Direct2D::ID2D1GradientStopCollection =
+                if self.color.is_linear() {
+                    use ::windows::Win32::Graphics::Direct2D::{
+                        D2D1_BUFFER_PRECISION_16BPC_FLOAT, D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT,
+                        D2D1_COLOR_SPACE_SCRGB,
+                    };
+                    self.d2d
+                        .CreateGradientStopCollection(
+                            &stops,
+                            D2D1_COLOR_SPACE_SCRGB,
+                            D2D1_COLOR_SPACE_SCRGB,
+                            D2D1_BUFFER_PRECISION_16BPC_FLOAT,
+                            D2D1_EXTEND_MODE_CLAMP,
+                            D2D1_COLOR_INTERPOLATION_MODE_STRAIGHT,
+                        )
+                        .map_err(|e| super::hresult("CreateGradientStopCollection(scRGB)", &e))?
+                        .into()
+                } else {
+                    target
+                        .CreateGradientStopCollection(
+                            &stops,
+                            D2D1_GAMMA_2_2,
+                            D2D1_EXTEND_MODE_CLAMP,
+                        )
+                        .map_err(|e| super::hresult("CreateGradientStopCollection", &e))?
+                };
             target
                 .CreateLinearGradientBrush(
                     &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
@@ -3409,7 +3518,7 @@ impl OverlayRenderer {
     }
 
     fn create_brush(&self, color: &D2D1_COLOR_F) -> Result<ID2D1SolidColorBrush, String> {
-        unsafe { self.d2d.CreateSolidColorBrush(color, None) }
+        unsafe { self.d2d.CreateSolidColorBrush(&self.color.ui(*color), None) }
             .map_err(|error| super::hresult("CreateSolidColorBrush", &error))
     }
 
