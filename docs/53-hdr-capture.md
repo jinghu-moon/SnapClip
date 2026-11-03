@@ -1,6 +1,6 @@
 # 53 · HDR 捕获、母版、保存面板与贴图接入方案
 
-初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源、有界导出与登记失败恢复已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§26。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；workspace 两种模式的 all-targets strict Clippy 已通过。AVIF 已修复 Identity/GBR 解码、16 位彩色编码及 ICC 顺序问题，独立 CPU 格式矩阵通过；整帧资源预算仍失败，尚未生产接线；真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
+初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源、有界导出与登记失败恢复已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§27。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；workspace 两种模式的 all-targets strict Clippy 已通过。AVIF 的 CPU 格式矩阵和有界 grid/Alpha/ICC 资格验证通过，包括 4K/45MP 合成色块、噪声超限拒绝及运行中取消；整帧预算仍失败，grid 仍有 4 MiB payload／5 MiB 文件限制，尚未生产接线。真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
 
 通用像素、色彩、GPUI／Windows输出、依赖选择及官方资料统一见相邻Yue仓库的 [27 · Windows HDR图片与显示管线](../../GPUI-Yue-Component/docs/27-hdr-pipeline.md)。本文只定义SnapClip的业务和迁移，不复制第二套HDR框架。
 
@@ -880,3 +880,72 @@ cargo test -p snapclip-app --lib capture::artifact_writer::tests --locked --offl
 **仍未完成的软件工作**：有界 AVIF tile/grid 或另一确定候选的实际高位深／ICC／Alpha 行带接线、资源和运行中取消验收，以及其后的生产导出／预览／原子保存合同。现有 API 的全图输入＋完整输出在空间上随像素数增长，加线程或改变 UI 无法消除这个事实；下一步须先证明可按有限 tile/band 处理，不能用隐藏继续运行的任务或丢弃结果宣称取消。
 
 AVIF、生产 HDR 捕获入口继续关闭。真实 HDR／跨屏／DPI／设备恢复／实际剪贴板接收方仍按 §22.4 验收；本节已经完成的 CPU 格式矩阵与资源诊断不依赖实机，也不能替代那些显示层证据。
+
+## 27. 有界 AVIF grid、Alpha 与构造阶段取消（2026-11-04）
+
+本批只推进 §26 的 CPU 软件工作，不运行真实窗口、GPU、显示设置或系统剪贴板。它交付的是可复现的资格路径，未给 App／Pin 加 AVIF 保存格式，也未给 MIT Yue 引入候选 codec。
+
+### 27.1 修改前基线与根因
+
+- 新建实际的 133×71、2 行×3 列、每块 64×64 的 10 位颜色／Alpha grid。原 parser 把它读成 `(rows=6, columns=1, width=0, height=0)`，新回归真实失败，见 `target/hdr-avif-grid-before.log`。grid 描述是 item payload，不是 ipco 属性；从 ispe 猜网格无法表达边缘裁切。
+- 仅修 parser 后，原 `decode_full` 仍把 10 位报告成 8 位；它同时保留全部 Frame 和转换后的 tile，并用 `alpha=None` 拼接。当前全图 API 改为复用逐块解码，返回实际序列／颜色元数据；新增 sink API 不创建完整输出。
+- 256×256 tile 虽通过色块，噪声输入却在拒绝前达到 **34,114,090 B** 堆增量，超过原 **32 MiB**。保留失败记录 `target/hdr-avif-grid-256-before.log`，改为 **128×128**。不是抬高内存门槛。
+- 45MP 的 2795 块索引曾在 10ms deadline 后才首次检查取消，约 53ms 返回、成功 check 为 0。新增 `ManagedAvifDecoder::new_with_stop`，将 stop 传给 parser 的构建和逐块索引；另外单独测索引完成后的 AV1 tile 取消，防止只取消解析就声称 codec 运行中取消通过。
+- serializer 原来扫描整个文件寻找 `BAAD_F00D` 占位字节，会误改相同内容的 ICC／AV1 payload。现在只更新记录下来的 iloc 字段；同时支持主 grid 的 ICC+nclx、合并有序 dimg、检查几何／Alpha 配置及 item ID／32 位长度溢出。
+
+### 27.2 当前资格合同
+
+开发工具 `tools/codec-bench/src/avif_grid.rs` 每次生成一块原始 RGBA16，不先创建全图输入；`decode_grid_tiles(stop, max_tile_pixels, consume)` 每次只交付一块借用缓冲。对应 Alpha 独立解码、保持 coverage，边缘按真实输出裁切。每块在提交 codec 前核对 ispe、AV1 序列尺寸和像素上限；块的布局、位深和颜色定义必须一致。sink 错误或取消立即终止后续交付，调用方在返回成功前不得发布部分产物。
+
+当前限定为 **10 位、Identity/RGB、Rec.2020/PQ、straight Alpha**；小 fixture 同时验证无 Alpha RGB16、ICC 保留和主图双 colr。8/12 位及其他矩阵的 48 组既有验证仍为单图格式矩阵，不升级为完整 grid 格式矩阵声明。
+
+显式上限：128×128 tile、4096 块、64 Mi 像素、64 KiB ICC、**4 MiB 累计压缩 payload／5 MiB 完整压缩容器**。parser 默认仍为 1000 块；仅资格调用通过 `grid_tile_limit(4096)` 配置更细的工作单元。行列编码仍限制 1～255，不把 0 当成 256。压缩数据仍以受限 Vec 收集，超过上限明确失败，没有整帧回退。因此这条路径还不是任意大文件的流式 muxer，不能以其预算通过放行真实大照片或所有敌意元数据。
+
+### 27.3 数值和异常验收
+
+Rust 探针 **17 passed**（原 7 项保留，新增 10 项），覆盖描述读取、每像素只交付一次、RGB16／RGBA16、ICC、Alpha 边界、sink 错误、构造／tile 取消、块数及块像素限额、损坏描述／Alpha／截断、压缩限额拒绝、偏移占位字节出现在 payload 中，以及单图既有回归。
+
+新渐变 fixture 对原图约有 **0.999039/1023** 的最大 RGB 误差；逐块重新封装为单图解码与完整 grid **逐字节相等**，Alpha 相对原图也相等。独立 FFprobe 识别两个 Tile Grid，各 6 条流；FFmpeg/libdav1d 解码全部 12 条流，再按 FFprobe 的画布与偏移合成，结果与候选 **逐字节相等**，Alpha 最大误差 0。两份 fixture 分别覆盖 PQ 和 ICC+nclx，ICC 原字节保留。原 **≤2/1023** 门槛未修改，原 48 组矩阵及 PQ 亮度门槛继续通过。
+
+FFmpeg 的 `0:v:0` 只是一块，不是完整 grid；Alpha 组的 `stream_index` 是组内索引。脚本 `tools/verify-hdr-avif-grid.py` 显式处理两者，检查全部覆盖／无重叠，不将第一块或颜色流中的默认不透明 Alpha 当作全图成功。
+
+### 27.4 Release 资源、取消与噪声拒绝
+
+Windows x86_64 MSVC、Rust 1.98.1，仍用单线程 quality/alpha quality=100、speed=10。各尺寸在独立进程测量；完整原始图像输入／输出分配均为 **0**，每个有效 RGBA 像素都与数学生成源比较，误差 **0**。
+
+| 尺寸／阶段 | 耗时 | Rust 堆增量峰值 | 最大单次分配 |
+| --- | ---: | ---: | ---: |
+| 3840×2160 编码 | 2338.725ms | 3,028,634 B | 655,360 B |
+| 3840×2160 解码 | 91.198ms | 1,863,524 B | 259,072 B |
+| 8256×5504 编码 | 12289.727ms | 3,349,996 B | 655,360 B |
+| 8256×5504 解码 | 531.419ms | 3,394,253 B | 1,048,576 B |
+
+编码文件 **90,583／494,201 B**；进程 peak working set **15,761,408／17,752,064 B**，包含压缩输入、codec、分配器保留及取消运行。父进程仍每 5ms 查询当前／进程峰值。这些是合成色块，不是照片压缩率、真实截图延迟或 VRAM；历史单次耗时不可直接推断吞吐改善。
+
+10ms deadline 下，4K 的编码／含索引解码／仅 tile 解码在 **10.511／10.216／10.030ms** 返回；45MP 为 **10.527／10.126／10.016ms**。六种运行均先有成功 check，再返回取消；无继续运行的后台任务或丢弃结果。单次时钟测量不构成任意负载下的硬实时保证，AV1 内部解码仍只能在当前小块返回后响应。
+
+高复杂度固定种子噪声使用相同 4K／45MP 几何。两次均只读取 **557,056** 个填充 tile 像素便明确拒绝 payload 超限，没有读取完整图像；堆增量 **13,454,926／13,564,820 B**，最大单分配均 **1,572,864 B**，耗时 **975.067／985.476ms**。这是“有界拒绝”，不是噪声图成功编码。成功和拒绝路径均保持原 **32 MiB 堆增量／16 MiB 单分配**硬门槛。
+
+复现：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-hdr-avif.ps1 `
+  -TargetDir C:/Users/seeyuer/AppData/Local/Temp/snapclip-hdr-avif-target `
+  -CargoConfig target/hdr-isolated.toml `
+  -Ffmpeg C:/A_Softwares/MSYS2/ucrt64/bin/ffmpeg.exe -GridResources
+```
+
+本轮在 Windows PowerShell **5.1** 实际执行，完整退出 **0**。默认入口也检查独立 grid；`-GridResources` 执行两种成功尺寸与两种噪声拒绝，缺工具／超预算／取消未被实际触发均失败。原 `-EnforceStreamingBudget` 仍测试并拒绝整帧，不改变含义。日志 `target/hdr-avif-grid-full-suite.log`、资源 JSON `target/hdr-avif-grid-resources/summary.json`；三份固定原包、91 份源文件与补丁均逐字节校验。
+
+### 27.5 回归与下一批软件工作
+
+冻结 Yue 的依赖配置不变。workspace ordinary lib **1226 passed**，App／Pin headless **311／71 passed**，UI／基线 **10／2**，History **66**，默认 codec-bench／icon-bake **28／7**；普通／headless 两组 all-targets strict Clippy、AVIF opt-in strict Clippy、第一方 fmt／diff 通过。保留原 ignored 项；合法 patch 的空白 context 与原包字节由来源校验核对，不新增 whitespace allow。此次未运行真实窗口、GPU、显示设置或剪贴板测试。
+
+接续顺序：
+
+1. 将资格工具的像素回调接到现有 `BandSource`／母版行带，明确 RGBA16 与 FP16/scRGB→目标编码的颜色合同；不能为接线重新整帧展开。
+2. 以磁盘后备或真正流写移除累计压缩 Vec 的 4 MiB 限制；sink、临时文件、取消及原子发布共用现有保存合同。不能直接增大上限代替有界设计。
+3. 补高复杂度真实输入、敌意元数据的分配预算、更多合法 grid／Alpha 布局和端到端 ICC→scRGB；当前几类明确拒绝不等于通用 AVIF 兼容性完成。
+4. 完成生产许可交付与导出／预览／错误／原子保存接线，再谈产品格式放行。真实 HDR／跨屏／DPI／VRAM 继续是独立实机验收。
+
+本批缩小的是尚未完成的软件范围，**没有完成生产 AVIF 或完整 HDR 支持**。

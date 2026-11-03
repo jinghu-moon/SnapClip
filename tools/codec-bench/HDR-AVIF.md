@@ -1,6 +1,6 @@
 # HDR AVIF 候选的 CPU 资格验证
 
-2026-11-04。**当前结论：已修复 Identity/GBR 解码、16 位编码平面顺序及 ICC/nclx 顺序依赖，CPU 像素和格式矩阵通过；整帧候选仍超出既有流式内存预算，不接入生产。** 应用仍仅提供已验证的 HDR PNG16；MIT Yue 不新增这些编解码依赖。颜色正确、资源合格、真实显示验收是三个独立条件。
+2026-11-04。**当前结论：CPU 像素和 48 组格式矩阵通过；新增有界 grid／Alpha／ICC 资格路径，独立解码已交叉核对。整帧候选仍超预算；grid 的压缩文件上限与尚未完成的生产合同见文末和消费者方案 §27，不接入生产。** 应用仍仅提供已验证的 HDR PNG16；MIT Yue 不新增这些编解码依赖。颜色正确、资源合格、真实显示验收是三个独立条件。
 
 ## 固定的候选与来源
 
@@ -17,7 +17,7 @@
 
 已实际请求 crates.io 的版本 API，将本地 `.crate` 的 SHA-256 与官方校验和逐项比较，并确认检查的源码与该压缩包内容相等；证据记录在 [hdr-avif-sources.json](hdr-avif-sources.json)。这里只记录声明和来源核对，不把它当成发行包已完成许可交付的证明。升级候选时必须重新验证，不能从上游 main 分支 README 推断已发布版本的 API。
 
-本轮将 `zenavif 0.1.6` 和 `zenavif-parse 0.6.2` 的已校验发布源码及原许可证存入 `vendor/`，通过消费者 workspace patch 使用，**未修改 Cargo registry 缓存**。版本和所有其他依赖保持不变；lock 仅移除这两个包原来的 registry source/checksum，官方原包 hash 仍保存在清单。补丁范围和许可见 [维护说明](../../vendor/SNAPCLIP-PATCHES.md)。`python tools/check-hdr-codec-vendor.py` 对原包、80 份源文件及两份本地补丁逐字节校验，拒绝未记录的新增／缺失／修改文件。
+本轮将 `zenavif 0.1.6`、`zenavif-parse 0.6.2` 和 `zenavif-serialize 0.1.4` 的已校验发布源码及原许可证存入 `vendor/`，通过消费者 workspace patch 使用，**未修改 Cargo registry 缓存**。版本和其他包保持不变；lock 移除这三个包原来的 registry source/checksum，工具新增两条可选直接依赖，官方原包 hash 仍保存在清单。补丁范围和许可见 [维护说明](../../vendor/SNAPCLIP-PATCHES.md)。`python tools/check-hdr-codec-vendor.py` 对原包、91 份源文件及三份本地补丁逐字节校验，拒绝未记录的新增／缺失／修改文件。
 
 官方固定版本源码：[zenavif encoder](https://docs.rs/crate/zenavif/0.1.6/source/src/encoder.rs)、[managed decoder](https://docs.rs/crate/zenavif/0.1.6/source/src/decoder_managed.rs)、[channel scaling](https://docs.rs/crate/zenavif/0.1.6/source/src/convert.rs)、[container serializer](https://docs.rs/crate/zenavif-serialize/0.1.4/source/src/lib.rs)。
 
@@ -63,6 +63,8 @@ Rust/Cargo 1.98.1、Windows x86_64 MSVC、Release：
 .\tools\test-hdr-avif.ps1 -Resources
 # 执行原有 32 MiB 堆增量／16 MiB 单次分配门禁：当前必须失败。
 .\tools\test-hdr-avif.ps1 -EnforceStreamingBudget
+# 验证有界 grid、独立颜色／Alpha／ICC、4K/45MP 成功及噪声超限拒绝。
+.\tools\test-hdr-avif.ps1 -GridResources
 ```
 
 第一条通过；最后一条在完成所有颜色检查和两种资源测量后退出 **1**，明确记录资源超预算。需要支持 `libaom-av1`、`libdav1d` 和 `zscale` 的 FFmpeg；本轮使用 8.1.1，可用 `-Ffmpeg` 指定路径，没有所需能力会失败。源校验默认只读本地 `.crate`；缺原包时显式运行 `python tools/check-hdr-codec-vendor.py --download`，仅下载固定版本并比较原先记录的官方 SHA-256。
@@ -103,4 +105,25 @@ Rust/Cargo 1.98.1、Windows x86_64 MSVC、Release：
 
 运行中取消在 10ms deadline 后触发；返回错误并不意味着 10ms 内响应。初测 45MP 编码／解码约在 358／271ms 返回，解码在当前 AV1 frame 结束后的检查点才能退出；managed raw decoder 没有传入 `Stop` 的接口。每行 GBR 转换中的取消不能反向中断已经进入的整帧 AV1 调用。CLI 的 debug AV1 栈帧还会超过 Windows 主线程默认栈，现用有界 4 MiB worker stack，不能将曾经的栈溢出当作颜色测试结果。
 
-剩余软件工作明确为：先证明有界 tile/grid 或其他可取消的确定实现符合现有预算，再补生产 AVIF 编解码／ICC／原子保存合同；测试不能用隐藏任务或丢弃结果冒充运行中取消。当前 AVIF 生产开关继续关闭，PNG16 和 Yue 的 MIT 依赖边界保持原样。
+以上是保留的整帧失败基线。接续 grid 验证见下；生产 AVIF 开关继续关闭，PNG16 和 Yue 的 MIT 依赖边界保持原样。
+
+## 有界 grid 接续（2026-11-04）
+
+`avif_grid.rs` 使用 **128×128** 原始 tile 和借用式逐块 sink，不创建完整原始输入／输出。parser 读取实际 grid item 描述和对应 Alpha；managed decoder 在提交 codec 前核对块尺寸／位深，裁切边缘，并返回实际 10 位／4:4:4 信息。`new_with_stop` 把取消传到网格构建；索引和已开始的 tile 编解码分别实测。默认 parser 仍为 1000 块，只有资格调用显式设置 4096 块。
+
+压缩数据仍有 **4 MiB payload／5 MiB 文件**上限，ICC 64 KiB；超过就明确失败。编码器和 decoder 只在这个资格合同内声明有界，尚未接到真实母版行带／生产原子保存，也不是任意大 AVIF 文件流式方案。
+
+修改前的 133×71、2×3 fixture 实际被猜成 6×1，修 parser 后又暴露 8 位元数据和 Alpha 丢失；这些路径均有回归。旧 serializer 的全文件占位符扫描改为只补已记录的 iloc，避免误改 ICC／压缩 payload。第三个 vendor 包也按固定原包＋最小补丁管理。
+
+结果：Rust **17 passed**，原 48 组格式矩阵通过。新 PQ 与 ICC+nclx 两个 grid fixture 均经 FFprobe 取得实际布局、FFmpeg/libdav1d 独立解码全部 **12** 条颜色／Alpha 流并合成，结果与候选逐字节相等。相对原始渐变的 RGB 最大误差 **0.999039/1023**，Alpha **0**，保留原 ≤2/1023 门槛。第一条视频流仅是一块，脚本没有将它误认为全图。
+
+| 成功路径 | 编码堆峰值 | 解码堆峰值 | 进程 peak working set |
+| --- | ---: | ---: | ---: |
+| 3840×2160 | 3,028,634 B | 1,863,524 B | 15,761,408 B |
+| 8256×5504 | 3,349,996 B | 3,394,253 B | 17,752,064 B |
+
+两图全像素误差均 0，最大单次分配分别不超过 655,360／1,048,576 B。10ms deadline 的编码／含索引解码／仅 tile 解码实际返回分别为 **10.511／10.216／10.030ms** 和 **10.527／10.126／10.016ms**；都有成功 check 后再取消，不代表硬实时保证。
+
+初次 256×256 方案在噪声拒绝前分配到 **34,114,090 B**，原门槛真实失败，因而缩小工作单元。128×128 固定噪声在读取 557,056 像素后达到压缩上限并拒绝，4K／45MP 的堆峰值 **13,454,926／13,564,820 B**，最大单分配均 **1,572,864 B**。这是有界拒绝，不是噪声编码成功；没有增大 32 MiB／16 MiB 门槛。
+
+`tools/test-hdr-avif.ps1 -GridResources` 在 Windows PowerShell 5.1 完整退出 **0**；指定 FFmpeg 路径时自动取同目录 FFprobe，也可显式 `-Ffprobe`。日志 `target/hdr-avif-grid-full-suite.log`；独立布局验证 `tools/verify-hdr-avif-grid.py`；资源 JSON `target/hdr-avif-grid-resources/summary.json`。完整基线、命令、既有 workspace 回归和后续工作统一见 [消费者方案 §27](../../docs/53-hdr-capture.md#27-有界-avif-gridalpha-与构造阶段取消2026-11-04)。
