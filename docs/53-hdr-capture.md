@@ -1016,3 +1016,114 @@ Windows PowerShell **5.1** 入口退出 **0**，保留原 48 组矩阵、独立 
 3. 完成许可交付、生产导出／预览／保存错误接线与 CPU 耗时剖析，再讨论放行产品格式。真实 HDR／跨屏／DPI／VRAM 继续独立验收。
 
 本批完成真实来源的开发资格接线，**未开放生产 AVIF 或生产 HDR 捕获**。
+
+## 29. AVIF 共享能力、磁盘后备与显式产品接线（2026-11-04）
+
+### 29.1 当前状态与修改前后
+
+本节接续 §28；此前各节的“仅探针／未接产品／4 MiB”描述保留为对应批次的历史状态，当前以本节为准。App／Pin 已在**默认关闭的 `avif` feature** 下接线，仍是开发功能。生产 HDR 桌面捕获门禁继续关闭，CPU 结果不能替代真实 HDR、跨屏、DPI、设备恢复、VRAM 或完整端到端验收。本批未运行这些实机项目。
+
+| 合同 | 修改前 | 修改后 |
+| --- | --- | --- |
+| 编码共用 | 开发工具持有 BandSource→tile 实现 | `snapclip-avif` 持有唯一 CPU codec；工具、保存面板、历史导出共用 |
+| 模块方向 | BandSource 定义在 Capture，Pin 不能依赖它 | 纯像素 trait 移到 Model；Capture reexport 同一类型，Pin 不依赖 Capture |
+| 压缩产物 | Vec 累积，4 MiB 超限拒绝 | 两个自动删除的临时文件保存颜色／Alpha，累计 payload 限 512 MiB，header 后顺序流写 |
+| 外部 AVIF | 未接共享高精度预览 | 明确色彩定义的静态 AVIF 解码为 FP16，由原 YueImagePreview 渲染 |
+| 预乘输入 | 包装层再次除 Alpha，半透明颜色偏亮 | 底层已返回 straight，包装层不重复解除预乘 |
+| 产品保存 | PNG16 为唯一已接 HDR 格式 | 显式 feature 增加 PQ10 AVIF；保留原子提交、旧目标／源母版不变与 partial 清理合同 |
+| 许可交付 | 只有候选包声明与 vendor 来源 | 固定 normal/build 闭包清单、原文、源码审计包及 SPDX；缺正文时拒绝作为完整发行包放行 |
+
+`snapclip-avif` 是 Windows CPU 能力 crate，无 GPUI、Capture 或 Pin 依赖。App feature 同时启用 Pin 的同名 feature。MIT Yue 继续只处理明确颜色合同的图片资源，依赖图不引入 AGPL codec，也不新增第二套预览组件。`SaveFormat::Avif` 是可序列化格式值，不能代替运行时／编译时编码能力检查。
+
+### 29.2 编码、保存与取消
+
+固定 **PQ10／Rec.2020／Identity／full-range／straight Alpha**，单线程、quality=100、alpha quality=100、speed=10；这些参数没有为了通过验收而调整。PQ10 为量化导出，不能代替原始 FP16/SCPX 母版。输入仍必须是绝对 scRGB，复用 Model 的颜色转换；SDR 派生结果不能仅改标签导出为 HDR AVIF。
+
+保持 128×128 tile、4096 块、每边最多 255 块、单次源读取 ≤1 MiB、最多 128 行转换缓存及严格小于 16 MiB 的单次转换分配。`GridImage::header` 只接收块长度，检查 item／偏移溢出，不创建完整 payload，也不要求目标可 seek。颜色／Alpha scratch 成功、异常、取消均自动删除；最终输出使用 64 KiB 缓冲写入既有原子提交服务。写入失败、空间不足、体积限制或取消不覆盖旧目标。scratch 与目标 partial 可能同时存在，磁盘峰值约为压缩 payload 的两倍加 header，**堆内存合格不代表磁盘零成本**。
+
+保存面板在保留 HDR 时提供 `.AVIF`，明确提示 PQ10／编码较慢；切到 SDR 回到 PNG 并禁用 AVIF。历史页从已核验的 SCPX 行带导出，校验来源身份、元数据、几何与目标路径，不能覆盖源母版。大图文件导出不先创建完整压缩 Vec；交互预览必须回读完整压缩文件与 FP16 图像，有独立预算，不能套用流式导出的低内存结论。
+
+预览变更或关闭时通过 `CancelOnDrop` 取消实际 codec，不只丢弃结果。开始、行带转换、tile、scratch 复制和返回处均检查停止信号；保留 `Cancelled` 类型并映射为 `Interrupted`。底层单个 AV1 frame、同步文件 fingerprint、块解压及 I/O 内部仍不可立即中断；没有宣称硬实时取消，也没有把使用 `Unstoppable` 的最终保存说成支持用户中途取消。
+
+### 29.3 外部输入与交互预算
+
+- 压缩输入 ≤64 MiB、输出 ≤24MP，parser memory ≤16 MiB；metadata ≤1 MiB、box ≤20000、嵌套 ≤8、items ≤8194、tiles ≤4096。先做 BMFF／ICC 预检，再进入 parser／CMS。
+- ICC ≤64 KiB、tags ≤128、TRC 点数 ≤4096、mluc 条目 ≤128；matrix/TRC RGB ICC 由固定 moxcms 0.8.1 转 relative linear Rec.709，保留 `LinearSrgb`。Rec.2020/PQ/full RGB 定义转绝对 `ScRgb`；ICC 优先，不把其相对 SDR 白误作 80 nit。
+- 明确拒绝未标色、HLG／未实现 HDR ICC 定义、LUT ICC、动画、gain/depth map、旋转／镜像／裁切、非方像素和不支持的 box／Alpha 布局，不按 SDR 猜测。该范围不构成任意 AVIF 兼容性声明。
+- 包装层只做一次正确的 Alpha 处理。新增预乘回归修改前实际得到线性 R≈0.998，正确值应为 ≈0.214；修复后通过，失败日志 `target/hdr-avif-premult-before.log` 保留。
+- 预览在 resize／encode **之前**拒绝超过 24MP 的输出，压缩 Vec 的写入也受 64 MiB 约束；两者不能等解码失败后才检查。最终文件保存沿独立的导出几何预算流写。交互路径仍持有完整 FP16 输出，24MP 即约 192 MB，另有压缩数据、codec 和上传资源，不能把约 9 MiB 的编码额外堆解释为整个预览的占用。
+
+### 29.4 独立颜色、真实内容与大产物证据
+
+共享 codec **12 项**测试覆盖 ICC／PQ、Display-P3 矩阵、8/10 位 grid、Alpha、预乘、异常元数据、取消、scratch 清理与 header 字节等价。旧探针 **27 项**保留。独立 libaom／libdav1d 的原 **48 组**8/10/12 位、矩阵、range、Alpha 组合同时通过实际共享解码器，而非仅通过开发工具的另一实现；另有 4 项构造性敌意输入拒绝并计量分配。
+
+`verify-hdr-avif-real.py` 从用户提供的两份 45MP HDR／SDR AVIF 各裁取 160×96 的真实内容，显式恢复工具丢弃的色彩标签，独立无损重编码为 12 位，再比较 FP16；两份通过。它不是原始 ICC 的逐字节往返或整幅照片交互支持。两份原图在未展开完整像素前按 24MP 门槛拒绝，堆增量分别 **7,532,682／8,522,081 B**。用户图像不提交仓库。
+
+保留独立 grid／ICC 与 FP16 BandSource／SCPX 全像素比较：RGB **0.433813/1023**、Alpha **0.507324/1023**、重建 scRGB **0.017489**，满足原两码值经传递函数和矩阵传播的包络，负 scRGB 保留。没有放宽原颜色、32 MiB 编码额外堆或16 MiB 单分配门槛。
+
+固定种子高复杂度噪声现在能成功导出，不再受旧 4 MiB Vec 限制。FFprobe 校验整幅颜色／Alpha grid 的画布和块数；libdav1d 检查第一块原生 10-bit RGBA 最大误差 **2**。此资源用例没有宣称独立回读噪声大图的每个像素；全像素颜色／边缘比较由小 grid、行带及原矩阵承担。验证器曾先转 16-bit 再反算，因两次扩展舍入把原生差 2 报成 **2.013687**；现直接读 `gbrp10le`／`gray10le` 比较，原门槛仍是 2，另断言 full-range 扩展误差 ≤1 个 16-bit LSB。FFmpeg 默认 1000 streams 小于 4K 的 510+510 条 item 流，工具显式传入可信夹具的准确流数，不把工具默认拒绝当成格式损坏。
+
+两种尺寸顺序在独立 Release 进程中测量，不与 cargo 构建／workspace 回归并行：
+
+| 噪声尺寸 | 完整输出 | 总耗时 | 填充源 tile | 编码＋metadata＋scratch I/O | 额外堆峰值 | 最大单分配 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3840×2160 | 63,762,570 B | 14337.949ms | 50.995ms | 14286.954ms | 9,311,844 B | 1,572,864 B |
+| 8256×5504 | 349,436,016 B | 77083.455ms | 275.389ms | 76808.065ms | 9,330,124 B | 1,572,864 B |
+
+两种噪声的第一块原生 RGBA 最大误差均 **2**，full-range 扩展最大差均 **1** 个 16-bit LSB。填充只占约 0.36%，主要时间在其余编码／metadata／I/O 阶段；该计时尚未拆分三者，不能把它当成 AV1 内核 profiling。45MP 高复杂度约 **77 秒**，仍不满足快速交互预期。没有用此前与编译并行的约 94 秒推断本批实现获得了性能改善。
+
+共享行带／SCPX 路径也完成重新测量，源图逐行生成；最大单次分配仍为 **8,454,144 B**，两种尺寸的完整有效像素仍检查到 **0.499519/1023** 最大误差：
+
+| 阶段 | 4K 耗时／额外堆 | 45MP 耗时／额外堆 |
+| --- | ---: | ---: |
+| 行带编码 | 5176.963ms／7,981,704 B | 27652.639ms／13,624,540 B |
+| SCPX 打开并编码 | 5339.791ms／10,491,822 B | 28876.837ms／14,910,556 B |
+| 逐块开发解码 | 112.980ms／2,260,215 B | 651.246ms／5,566,099 B |
+
+这条逐块开发解码不持有完整输出，不能作为产品交互 decoder 的总内存。行带运行中取消在 10ms deadline 后分别于 **10.258／11.225ms** 返回，均已有真实读取与成功检查。旧 grid 的 4K／45MP 成功路径、索引／tile 取消与噪声超限拒绝对照继续通过。完整 PowerShell 5.1 入口以 `-GridResources -BandResources -SpoolResources` 实际退出 **0**；日志 `target/hdr-avif-final-suite.log`，机器可读数据 `target/hdr-avif-{spool,bands,grid}-resources/summary.json`。这些 CPU 测量不涉及显示器、GPU、VRAM 或真实截图首帧。
+
+### 29.5 许可、源码和复现
+
+`tools/check-hdr-codec-licenses.py` 固定 **122** 个 normal/build 包的声明、features、原 archive checksum、原许可文本与本地源码 hash。原包未带的正文仅从其固定官方 commit 补齐，来源记录在 `tools/codec-bench/license-texts/sources.json`。原文／archive／patch 均按原字节校验；本地 UTF-8 源码和继承许可使用明确的 LF 规范形式，审计包写出同样字节，避免 Windows CRLF 检出造成假漂移，实际代码变化仍失败。
+
+**尚存发布阻塞**：`simd_helpers 0.1.0` 原包及固定上游源码仅声明 MIT，缺原始许可证正文，不能编造版权或用另一包正文替代。普通清单检查会明确打印 `RELEASE REVIEW REQUIRED`；`--bundle` 会生成源码／原文／补丁／SPDX 2.3 和 `NOT-RELEASE-READY.txt`，并**退出 1**。它是可检查的审计产物，不是完整合格发行包；还需补齐上游原文或重新选择并验证依赖，并完成整个应用的发行义务。未向第三方发送消息或发布内容。
+
+```powershell
+# 使用本地已冻结的依赖；正常开发可省略 CargoConfig／指定自己的 TargetDir。
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-hdr-avif.ps1 `
+  -TargetDir C:/Users/seeyuer/AppData/Local/Temp/snapclip-hdr-avif-target `
+  -CargoConfig target/hdr-isolated.toml `
+  -Ffmpeg C:/A_Softwares/MSYS2/ucrt64/bin/ffmpeg.exe `
+  -GridResources -BandResources -SpoolResources
+
+python tools/check-hdr-codec-licenses.py --config target/hdr-isolated.toml
+python tools/check-hdr-codec-licenses.py --config target/hdr-isolated.toml --bundle <审计目录>
+
+# 显式开发功能；不启用生产 HDR 桌面捕获门禁。
+cargo run -p snapclip-app --features avif
+```
+
+PS1 保持 UTF-8 BOM，入口在 Windows PowerShell 5.1 验证。pre-push 增加 feature 依赖方向、vendor 来源和许可清单门禁；不使用 `--no-verify`，不修改 Cargo registry 或升级第三方版本。AVIF 默认关闭、许可阻塞和显示层实机验收分别记录，不能互相替代。
+
+### 29.6 最终相关回归与尚未验收项
+
+仍使用 §12.3 的冻结 Yue 快照隔离并行组件改造，所有构建使用 `--locked --offline`，第三方版本没有升级。预览预算修复后重新跑产品测试及严格 lint，而非沿用修复前结果。
+
+| 最终验证 | 实际结果 |
+| --- | --- |
+| workspace ordinary lib | **1239 passed**：App 288、共享 codec 12、Capture 568、Clipboard 13、History 46、Model 32、Pin 59、UI 221；子进程重复项不另计 |
+| 默认 App／Pin headless | **311／71 passed**，原 5／2 ignored 保留 |
+| 显式 AVIF App／Pin ordinary | **290／60 passed**，原 5／0 ignored 保留 |
+| 显式 AVIF＋headless App／Pin | **313／72 passed**，原 5／2 ignored 保留 |
+| App UI／regression baseline，带 AVIF＋test-support | **10／2 passed**；无头交互，不是实屏外观 |
+| History lib／capture_history／capture_recovery／pixel_master | **46／6／9／5 passed**，合计 66 |
+| 默认 codec-bench／icon-bake | **28／7 passed**，原 2／0 ignored 保留 |
+| 普通／headless／AVIF＋headless＋probe all-targets strict Clippy | 三组均通过，`--no-deps -- -D warnings`，无新增 allow／ignore |
+| fmt／第一方 staged 与 unstaged 空白 | 通过；vendor patch 的合法空白 context 保留原字节，另做来源校验 |
+| 默认／AVIF 依赖方向及负对照 | 两组通过，App 负对照正确拒绝；默认 App 无 codec，feature Pin 不依赖 Capture |
+| 固定 vendor／122 包许可与源码清单 | 通过；LF／CRLF 等价与实际源码变化识别均验证 |
+| 审计包缺正文拒绝 | 实际退出 **1**，生成 NOT-RELEASE-READY；逐个核对本地源码 hash 和 SPDX 122 包，不当成完整发行通过 |
+
+日志 `target/hdr-avif-final-{ordinary,headless,product,product-headless,ui,history,tools,strict,strict-headless,strict-product,fmt,diff,vendor,license}.log`，独立真实内容与原图拒绝 `target/hdr-avif-final-{real,product-matrix}.log`。保留修复前失败记录；没有跳过失败用例、降低颜色／内存门槛或把原 ignored 实机测试改成绿色。
+
+当前已交付本节列出的软件能力与回归，仍不能宣称“完整 HDR／AVIF 产品已验收”：**缺失原始许可正文的发行阻塞未解除；45MP 高复杂度编码约 77 秒，低占用不等于低延迟，进一步 AV1／metadata／I/O 热点剖析与优化尚需独立工作；真实 HDR 亮度、跨屏／DPI、VRAM、设备恢复、系统剪贴板接收方及端到端性能仍按 §22.4 实机验收。** 默认关闭的开发 feature 不替代任何一项门禁。

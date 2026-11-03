@@ -146,3 +146,30 @@ Rust/Cargo 1.98.1、Windows x86_64 MSVC、Release：
 原 32 MiB／16 MiB 门槛通过；最大单分配 **8,454,144 B**。完整检查两图全部 RGBA，最大误差 **0.499519/1023**。45MP 编码约 **28 秒**，尚不能宣称产品延迟达标。工作集、取消边界与完整耗时见消费者方案 §28，不从堆计数推断 VRAM 或界面性能。
 
 `tools/test-hdr-avif.ps1 -GridResources -BandResources` 已在 PowerShell 5.1 完整退出 0；最终 SCPX 取消回归另行执行，27 项和 opt-in strict Clippy 均通过。完整日志 `target/hdr-avif-bands-full-suite.log`，资源 `target/hdr-avif-bands-resources/summary.json`，独立检查 `tools/verify-hdr-avif-bands.py`。仍需磁盘后备压缩数据、外部输入／ICC 验证、许可交付及生产保存接线，详见[消费者方案 §28](../../docs/53-hdr-capture.md#28-avif-接入真实行带与-scpx-母版2026-11-04)。
+
+## 共享产品 codec 与磁盘后备（2026-11-04）
+
+接续结果见[消费者方案 §29](../../docs/53-hdr-capture.md#29-avif-共享能力磁盘后备与显式产品接线2026-11-04)。此前章节保留修改前的整帧失败和 4 MiB 有界拒绝，不表示当前共享编码器仍有同一限制。
+
+- `snapclip-avif` 提供唯一的有界 BandSource／SCPX 编码与明确标色 AVIF→FP16 解码。BandSource 移到 Model，Capture 仅 reexport，Pin 不因此依赖 Capture。MIT Yue 保持 codec 无关，渲染继续用原图片预览组件。
+- 两个自动清理的临时文件代替 payload Vec，累计压缩 payload 限 **512 MiB**；serializer 根据长度流写准确 header，随后顺序复制颜色与 Alpha。source、sink、磁盘失败和取消不交付成功结果，产品沿既有原子提交发布。scratch＋partial 的磁盘峰值可接近压缩量两倍，编码堆门槛仍为 **32 MiB／16 MiB**。
+- App／Pin 的 `avif` feature 默认关闭。显式开启才提供 HDR PQ10 保存、历史 SCPX 导出与贴图解码；没有开放生产 HDR 捕获。保存不收集全文件 Vec，交互预览仍需完整压缩数据和 FP16 图像，单独限制 **64 MiB／24MP**，不能以流式编码数字声称预览总内存只有数 MiB。
+- 外部颜色／Alpha 资格使用实际共享 decoder：原 **48 组**矩阵、4 项有界敌意拒绝、ICC matrix/TRC、PQ／SDR 和 8/10 位 grid。用户两份 45MP 原图按 24MP 上限明确拒绝，另以显式标色的 160×96 真实内容 12 位裁片独立回读，HDR／SDR 均通过。没有声称原图的完整 ICC／整帧交互支持。
+- 真实预乘反例修改前线性 R≈0.998，正确应≈0.214。原因是底层已返回 straight，包装层又除 Alpha；共享解码器取消第二次操作并保留回归。
+- 大噪声资源测试验证整幅 FFprobe grid 几何与第一块原生 10-bit RGBA，**不冒充全图逐像素独立验证**。原生误差门槛仍为 2；转 16 位再反算曾因扩展舍入得到 2.013687，现分别校验原生误差和 ≤1 个 16-bit LSB 的扩展误差。`-max_streams` 设置为可信夹具准确的颜色＋Alpha 条数，避免 FFmpeg 默认 1000 streams 截断 4K／45MP 网格。
+
+复现全部 CPU 资格：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/test-hdr-avif.ps1 `
+  -TargetDir C:/Users/seeyuer/AppData/Local/Temp/snapclip-hdr-avif-target `
+  -CargoConfig target/hdr-isolated.toml `
+  -Ffmpeg C:/A_Softwares/MSYS2/ucrt64/bin/ffmpeg.exe `
+  -GridResources -BandResources -SpoolResources
+```
+
+资源输出 `target/hdr-avif-spool-resources/summary.json` 分开记录填充时间、编码＋metadata＋scratch I/O 时间、原生码误差和扩展误差。CPU 时间仍很高，不把内存合格等同于交互延迟合格；详细数字和最终回归统一记录在消费者方案 §29。
+
+固定源码／许可门禁 `tools/check-hdr-codec-licenses.py` 校验 **122** 个 normal/build 包。原文／archive／patch 使用精确 hash，本地 UTF-8 源码使用明示的 LF 规范形式，审计包写同样字节。上游原包缺失的正文仅从固定官方 commit 取回，保留来源与 hash，未修改 registry。
+
+`simd_helpers 0.1.0` 的固定原包及上游树仍缺原始 MIT 正文。因此清单会打印 `RELEASE REVIEW REQUIRED`；`--bundle <目录>` 生成原 archive、本地源、补丁、原文、SPDX 2.3 及 `NOT-RELEASE-READY.txt` 后**退出 1**。这是可审计但不完整的发行材料，不能宣称许可交付已全部解决，也不能据此公开发布完整产品。
