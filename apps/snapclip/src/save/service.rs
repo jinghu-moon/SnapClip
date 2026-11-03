@@ -144,16 +144,22 @@ impl Cancel for NoCancel {
 
 /// Saves bytes that were produced elsewhere (the banded encoder, and later the transcoder).
 pub fn commit_bytes(request: &SaveRequest, bytes: &[u8]) -> Result<SaveOutcome, SaveError> {
+    commit_stream(request, &mut NoCancel, |sink| sink.write_all(bytes))
+}
+
+/// Commit a streaming encoder through the same validation, cancellation and
+/// atomic rename as ordinary saves, without retaining its complete output.
+pub fn commit_stream(
+    request: &SaveRequest,
+    cancel: &mut dyn Cancel,
+    write_body: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<SaveOutcome, SaveError> {
     let (stem, warnings) = prepare(request)?;
-    // Bytes arrive already encoded, so there is no long write to interrupt yet; the bands path
-    // gets its own cancel signal when it grows one (`docs/41` S1 remaining).
-    commit(request, &stem, &mut NoCancel, |sink| sink.write_all(bytes)).map(|(path, written)| {
-        SaveOutcome {
-            path,
-            bytes: written,
-            format: request.format,
-            warnings,
-        }
+    commit(request, &stem, cancel, write_body).map(|(path, written)| SaveOutcome {
+        path,
+        bytes: written,
+        format: request.format,
+        warnings,
     })
 }
 
@@ -283,11 +289,14 @@ fn commit(
     }
 
     let partial = partial_path(&target);
+    // Own the temporary file before entering cleanup. A failed create_new may
+    // describe another writer's file; that file must never be removed by us.
+    let mut sink = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .map_err(io_error)?;
     let written = (|| -> std::io::Result<u64> {
-        let mut sink = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)?;
         write_body(&mut sink)?;
         // The second point: the body is on disk but the rename has not committed it. Saying so
         // as `Interrupted` keeps the cancel distinct from a real write failure further out.
@@ -620,6 +629,34 @@ mod tests {
             format: SaveFormat::Png,
             conflict: ConflictPolicy::AutoRename,
         }
+    }
+
+    #[test]
+    fn a_preexisting_partial_file_is_never_removed_by_a_failed_save() {
+        let dir = scratch("foreign-partial");
+        let request = request_with_stem(&dir, "protected");
+        let target = plain_target(&request).unwrap();
+        let partial = partial_path(&target);
+        fs::write(&partial, b"another-writer").unwrap();
+        assert!(commit_bytes(&request, b"our-bytes").is_err());
+        assert_eq!(fs::read(&partial).unwrap(), b"another-writer");
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_stream_encoder_failure_keeps_the_old_target_and_removes_only_its_own_partial() {
+        let dir = scratch("stream-failure");
+        let mut request = request_with_stem(&dir, "protected");
+        request.conflict = ConflictPolicy::Overwrite;
+        let target = plain_target(&request).unwrap();
+        fs::write(&target, b"old-file").unwrap();
+        let result = commit_stream(&request, &mut NoCancel, |file| {
+            std::io::Write::write_all(file, b"incomplete-png")?;
+            Err(std::io::Error::other("source checksum failed"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"old-file");
+        assert!(!partial_path(&target).exists());
     }
 
     /// An empty name is refused with the spec's **key**, not with a sentence of our own: the panel
