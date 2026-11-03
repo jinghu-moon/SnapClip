@@ -299,4 +299,14 @@ fn hdr_loupe_center_uses_the_source_not_the_sdr_sampler_or_crosshair() {
         .read_back_pixels(&target.texture, [0, 0, width, height], descriptor)
         .unwrap();
     close(sample(&actual, x as u32, y as u32), source);
+    // The info swatch is deliberately SDR; unlike the source pixel it goes
+    // through UI EOTF/output-white mapping. Test the actual D2D fill, not a flag.
+    let swatch_x = geometry.info_panel.left as f32 + INFO_PADDING_H_DIP + INFO_SWATCH_SIZE_DIP / 2.;
+    let swatch_y = geometry.info_panel.top as f32 + INFO_PADDING_V_DIP + INFO_SWATCH_SIZE_DIP / 2.;
+    // All three sRGB values fall on EOTF's linear segment; white is 160/80.
+    let expected = [8., 9., 10.].map(|v| v / 255. / 12.92 * 2.);
+    close(
+        sample(&actual, swatch_x as u32, swatch_y as u32),
+        [expected[0], expected[1], expected[2], 1.],
+    );
 }

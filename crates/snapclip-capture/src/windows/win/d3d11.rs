@@ -614,7 +614,9 @@ unsafe fn copy_mapped_rows(
 
 /// Three-slot async GPU staging sampler for magnifier color extraction.
 ///
-/// Each slot owns a 32×32 BGRA staging texture.
+/// Each slot owns a 32×32 staging texture with the declared source format.
+/// Polling always produces an explicit eight-bit SDR derivative for HEX/RGB/HSL;
+/// source texture bits are never modified. Only a small tile crosses the CPU boundary.
 /// `submit` copies a tile into the next slot (queued, non-blocking).
 /// `poll` uses `Map(DO_NOT_WAIT)` to check if the GPU finished without blocking.
 ///
@@ -627,6 +629,8 @@ pub struct AsyncSampleBuffer {
     slots: [ID3D11Texture2D; 3],
     next_slot: usize,
     pending: [bool; 3],
+    descriptor: PixelDescriptor,
+    source_peak_nits: f64,
 }
 
 const SAMPLE_TILE: u32 = 32;
@@ -635,12 +639,24 @@ const SLOT_COUNT: usize = 3;
 impl AsyncSampleBuffer {
     /// Allocate staging textures. Call once per overlay session.
     pub fn new(device: &GraphicsDevice) -> Result<Self, String> {
+        Self::for_source(device, PixelDescriptor::bgra8(), 100.)
+    }
+
+    /// Declare the acquisition encoding and a fixed SDR-mapping source peak.
+    /// The peak is a mapping policy, not a measured monitor/content peak. It
+    /// must stay fixed through a session, never adapt to each sampled tile.
+    pub fn for_source(
+        device: &GraphicsDevice,
+        descriptor: PixelDescriptor,
+        source_peak_nits: f64,
+    ) -> Result<Self, String> {
+        validate_sample_peak(source_peak_nits)?;
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Width: SAMPLE_TILE,
             Height: SAMPLE_TILE,
             MipLevels: 1,
             ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Format: dxgi_format(descriptor.format()),
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
@@ -669,7 +685,23 @@ impl AsyncSampleBuffer {
             slots: arr,
             next_slot: 0,
             pending: [false; SLOT_COUNT],
+            descriptor,
+            source_peak_nits,
         })
+    }
+
+    /// A source rebind invalidates every old completion, including when only
+    /// encoding/alpha/mapping changes while the DXGI storage format stays equal.
+    pub fn set_source(&mut self, descriptor: PixelDescriptor, peak: f64) -> Result<(), String> {
+        validate_sample_peak(peak)?;
+        if self.descriptor.format() != descriptor.format() {
+            *self = Self::for_source(&self.device, descriptor, peak)?;
+        } else {
+            self.reset();
+            self.descriptor = descriptor;
+            self.source_peak_nits = peak;
+        }
+        Ok(())
     }
 
     /// Copy a `tile_size × tile_size` region starting at `(x, y)` from `source`
@@ -687,13 +719,12 @@ impl AsyncSampleBuffer {
     ) -> Result<usize, String> {
         let mut description = D3D11_TEXTURE2D_DESC::default();
         unsafe { source.GetDesc(&mut description) };
-        if description.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-            return Err(
-                "the SDR color sampler requires an explicit SDR derivative of this source".into(),
-            );
+        if description.Format != dxgi_format(self.descriptor.format()) {
+            return Err("color sampler texture format differs from its declared source".into());
         }
-        if tile_size == 0
-            || tile_size > SAMPLE_TILE
+        // The cache contract is a complete 32x32 tile. Reading uninitialized
+        // staging rows after a smaller copy would report invented colors.
+        if tile_size != SAMPLE_TILE
             || x.checked_add(tile_size)
                 .is_none_or(|end| end > description.Width)
             || y.checked_add(tile_size)
@@ -701,8 +732,11 @@ impl AsyncSampleBuffer {
         {
             return Err("color sample region is outside its source or staging tile".into());
         }
-        let slot = self.next_slot;
-        self.next_slot = (self.next_slot + 1) % SLOT_COUNT;
+        let slot = (0..SLOT_COUNT)
+            .map(|offset| (self.next_slot + offset) % SLOT_COUNT)
+            .find(|slot| !self.pending[*slot])
+            .ok_or("all color sample slots are still in flight")?;
+        self.next_slot = (slot + 1) % SLOT_COUNT;
         let src_box = D3D11_BOX {
             left: x,
             top: y,
@@ -725,7 +759,7 @@ impl AsyncSampleBuffer {
     }
 
     /// Non-blocking poll: attempts `Map(DO_NOT_WAIT)` on the staging texture.
-    /// Returns the full `tile_size × tile_size` BGRA data (tightly packed) on success.
+    /// Returns a full 32×32 SDR BGRA derivative (tightly packed) on success.
     /// Returns `None` if still in flight, `Some(Err(...))` on failure.
     pub fn poll(&mut self, slot: usize) -> Option<Result<Vec<u8>, String>> {
         if slot >= SLOT_COUNT || !self.pending[slot] {
@@ -743,21 +777,24 @@ impl AsyncSampleBuffer {
         };
         match map_result {
             Ok(()) => {
-                let row_bytes = SAMPLE_TILE as usize * 4;
-                let mut pixels = vec![0u8; row_bytes * SAMPLE_TILE as usize];
-                for row in 0..SAMPLE_TILE as usize {
-                    let src =
-                        unsafe { (mapped.pData as *const u8).add(row * mapped.RowPitch as usize) };
-                    pixels[row * row_bytes..(row + 1) * row_bytes]
-                        .copy_from_slice(unsafe { std::slice::from_raw_parts(src, row_bytes) });
-                }
+                let row_bytes = SAMPLE_TILE as usize * self.descriptor.bytes_per_pixel();
+                let mut pixels = Vec::new();
+                let copied =
+                    unsafe { copy_mapped_rows(&mapped, row_bytes, SAMPLE_TILE, &mut pixels) };
                 unsafe {
                     self.device
                         .owned_context("AsyncSampleBuffer::poll")
                         .Unmap(&self.slots[slot], 0)
                 };
                 self.pending[slot] = false;
-                Some(Ok(pixels))
+                Some(copied.and_then(|()| {
+                    let source =
+                        PixelBuffer::from_tight(SAMPLE_TILE, SAMPLE_TILE, self.descriptor, pixels)
+                            .map_err(str::to_owned)?;
+                    snapclip_model::pixel_color::to_sdr_bgra8(&source, self.source_peak_nits)
+                        .map(PixelBuffer::into_bytes)
+                        .map_err(str::to_owned)
+                }))
             }
             Err(e) => {
                 // "Copy not finished yet" arrives as either S_FALSE (documented)
@@ -779,6 +816,13 @@ impl AsyncSampleBuffer {
         self.pending = [false; SLOT_COUNT];
         self.next_slot = 0;
     }
+}
+
+fn validate_sample_peak(peak: f64) -> Result<(), String> {
+    if !peak.is_finite() || !(0.0..=10_000.).contains(&peak) || peak == 0. {
+        return Err("sample SDR mapping source peak must be finite and in (0,10000] nit".into());
+    }
+    Ok(())
 }
 
 /// Create a D2D bitmap over an existing texture.
@@ -834,6 +878,121 @@ pub fn create_bitmap_from_texture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sample_mapping_peak_must_be_finite_positive_and_within_pq_range() {
+        for peak in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1., 0., 10_001.] {
+            assert!(super::validate_sample_peak(peak).is_err());
+        }
+        for peak in [80., 100., 1000., 10_000.] {
+            assert!(super::validate_sample_peak(peak).is_ok());
+        }
+    }
+    #[test]
+    #[ignore = "L4: real GPU FP16 tile readback; no desktop capture or clipboard writes"]
+    fn hdr_sampler_returns_explicit_sdr_tiles_without_changing_the_source() {
+        use super::*;
+        use std::time::{Duration, Instant};
+        let device = GraphicsDevice::create().unwrap();
+        for alpha in [AlphaMode::Straight, AlphaMode::Premultiplied] {
+            let descriptor =
+                PixelDescriptor::new(PixelFormat::Rgba16Float, PixelEncoding::ScRgb, alpha)
+                    .unwrap();
+            let values = if alpha == AlphaMode::Straight {
+                [-0.25_f32, 12.5, 0.5, 0.5]
+            } else {
+                [-0.125, 6.25, 0.25, 0.5]
+            };
+            let bytes = values
+                .into_iter()
+                .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+                .collect::<Vec<_>>()
+                .repeat(32 * 32);
+            let source = PixelBuffer::from_tight(32, 32, descriptor, bytes.clone()).unwrap();
+            let texture = device.create_pixel_texture(&source).unwrap();
+            let mut sampler = AsyncSampleBuffer::for_source(&device, descriptor, 1000.).unwrap();
+            let slots: Vec<_> = (0..3)
+                .map(|_| sampler.submit(&texture.texture, 0, 0, 32).unwrap())
+                .collect();
+            assert!(
+                sampler.submit(&texture.texture, 0, 0, 32).is_err(),
+                "in-flight slots must not be overwritten"
+            );
+            assert!(
+                sampler.submit(&texture.texture, 0, 0, 16).is_err(),
+                "a partial tile has no valid full-tile cache contract"
+            );
+            for slot in slots {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mapped = loop {
+                    if let Some(result) = sampler.poll(slot) {
+                        break result.unwrap();
+                    }
+                    assert!(Instant::now() < deadline, "async HDR sample did not land");
+                    std::thread::yield_now();
+                };
+                let expected = snapclip_model::pixel_color::to_sdr_bgra8(&source, 1000.).unwrap();
+                assert_eq!(mapped, expected.as_bytes());
+                assert!(
+                    sampler.poll(slot).is_none(),
+                    "each completed slot is consumed once"
+                );
+            }
+            let original = device
+                .read_back_pixels(&texture.texture, [0, 0, 32, 32], descriptor)
+                .unwrap();
+            assert_eq!(original.as_bytes(), bytes);
+            let slot = sampler.submit(&texture.texture, 0, 0, 32).unwrap();
+            sampler.reset();
+            assert!(sampler.poll(slot).is_none());
+            let slot = sampler.submit(&texture.texture, 0, 0, 32).unwrap();
+            assert!(sampler.set_source(descriptor, f64::NAN).is_err());
+            assert!(
+                sampler.pending[slot],
+                "a rejected rebind must preserve the pending request"
+            );
+            sampler.set_source(descriptor, 2000.).unwrap();
+            assert!(
+                sampler.poll(slot).is_none(),
+                "a policy rebind invalidates old completions"
+            );
+            let slot = sampler.submit(&texture.texture, 0, 0, 32).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mapped = loop {
+                if let Some(result) = sampler.poll(slot) {
+                    break result.unwrap();
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            };
+            assert_eq!(
+                mapped,
+                snapclip_model::pixel_color::to_sdr_bgra8(&source, 2000.)
+                    .unwrap()
+                    .as_bytes()
+            );
+            let sdr = device
+                .create_pixel_texture(
+                    &PixelBuffer::from_tight(32, 32, PixelDescriptor::bgra8(), vec![0; 4096])
+                        .unwrap(),
+                )
+                .unwrap();
+            assert!(
+                sampler.submit(&sdr.texture, 0, 0, 32).is_err(),
+                "typed staging must reject a different DXGI source format"
+            );
+            sampler.set_source(PixelDescriptor::bgra8(), 100.).unwrap();
+            let slot = sampler.submit(&sdr.texture, 0, 0, 32).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(result) = sampler.poll(slot) {
+                    assert_eq!(result.unwrap(), vec![0; 4096]);
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }
+    }
     use super::{GraphicsDevice, ID3D11Texture2D, copy_rows};
     use ::windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use ::windows::Win32::Graphics::Direct3D11::{

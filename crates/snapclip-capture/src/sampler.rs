@@ -7,7 +7,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::geometry::{Point, Rect};
+use super::geometry::Point;
 
 /// Minimum interval between GPU sample submissions (~60 Hz).
 const THROTTLE_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -80,25 +80,26 @@ impl ColorSampler {
         }
     }
 
+    /// Whether cached pixels cover this cursor, regardless of displayed stale color.
+    pub fn has_sample_at(&self, cursor: Point) -> bool {
+        self.cached
+            .as_ref()
+            .is_some_and(|tile| pixel_at(tile, cursor).is_some())
+    }
+
     /// Whether a new sample should be submitted to the GPU.
     ///
     /// Returns `false` if:
     /// - The cursor is still within the cached tile ("tile hit").
-    /// - The same tile is already pending in-flight.
+    /// - Any tile is already pending in-flight (the owner holds one completion).
     /// - Throttle prevents submission (less than ~16 ms since last submit).
-    pub fn should_request(&self, cursor: Point, tile: Rect, now: Instant) -> bool {
+    pub fn should_request(&self, cursor: Point, now: Instant) -> bool {
         // Tile hit: cursor within cached pixels.
-        if let Some(ref c) = self.cached {
-            let cached_rect = Rect::from_origin_size(c.origin, TILE_SIZE, TILE_SIZE);
-            if cached_rect.contains(cursor) {
-                return false;
-            }
+        if self.has_sample_at(cursor) {
+            return false;
         }
-        // Already pending this tile.
-        if let Some(ref p) = self.pending
-            && tile.contains(cursor)
-            && p.origin == Point::new(tile.left, tile.top)
-        {
+        // There is one pending origin, so a second request would orphan the first.
+        if self.pending.is_some() {
             return false;
         }
         // 60 Hz throttle.
@@ -293,11 +294,54 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_tile_cannot_be_replaced_by_fast_pointer_motion() {
+        let mut sampler = ColorSampler::new();
+        let now = Instant::now();
+        let origin = Point::new(84, 84);
+        let cursor = Point::new(400, 400);
+        sampler.mark_submitted(origin, now);
+        assert!(!sampler.should_request(cursor, now + Duration::from_secs(1)));
+        assert_eq!(sampler.pending_origin(), Some(origin));
+        sampler.complete(origin, solid_tile(1, 2, 3), cursor);
+        assert!(!sampler.has_sample_at(cursor));
+        assert!(sampler.should_request(cursor, now + Duration::from_secs(1)));
+        sampler.mark_submitted(Point::new(384, 384), now + Duration::from_secs(1));
+        sampler.complete(Point::new(384, 384), solid_tile(4, 5, 6), cursor);
+        assert!(sampler.has_sample_at(cursor));
+        assert_eq!(
+            sampler.formatted(ColorFormat::Hex).as_deref(),
+            Some("#040506")
+        );
+        assert!(!sampler.should_request(cursor, now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn cached_sample_coverage_checks_data_and_all_four_edges() {
+        let mut sampler = ColorSampler::new();
+        assert!(!sampler.has_sample_at(Point::new(0, 0)));
+        sampler.complete(Point::new(10, 20), solid_tile(1, 2, 3), Point::new(10, 20));
+        for point in [Point::new(10, 20), Point::new(41, 51)] {
+            assert!(sampler.has_sample_at(point));
+        }
+        for point in [
+            Point::new(9, 20),
+            Point::new(10, 19),
+            Point::new(42, 20),
+            Point::new(10, 52),
+        ] {
+            assert!(!sampler.has_sample_at(point));
+        }
+        sampler.complete(Point::new(10, 20), Vec::new(), Point::new(10, 20));
+        assert!(!sampler.has_sample_at(Point::new(10, 20)));
+        sampler.reset();
+        assert!(!sampler.has_sample_at(Point::new(10, 20)));
+    }
+
+    #[test]
     fn should_request_when_no_cache() {
         let sampler = ColorSampler::new();
         let cursor = Point::new(100, 100);
-        let tile = Rect::from_origin_size(Point::new(84, 84), 32, 32);
-        assert!(sampler.should_request(cursor, tile, Instant::now()));
+        assert!(sampler.should_request(cursor, Instant::now()));
     }
 
     #[test]
@@ -309,8 +353,7 @@ mod tests {
         sampler.complete(tile_origin, solid_tile(255, 0, 0), cursor);
         // Cursor still within tile → hit, no request
         let cursor2 = Point::new(110, 110);
-        let tile2 = Rect::from_origin_size(tile_origin, 32, 32);
-        assert!(!sampler.should_request(cursor2, tile2, Instant::now()));
+        assert!(!sampler.should_request(cursor2, Instant::now()));
     }
 
     #[test]
@@ -321,32 +364,29 @@ mod tests {
         sampler.complete(tile_origin, solid_tile(255, 0, 0), cursor);
         // Move cursor far outside cached tile
         let new_cursor = Point::new(200, 200);
-        let new_tile = Rect::from_origin_size(Point::new(184, 184), 32, 32);
-        assert!(sampler.should_request(new_cursor, new_tile, Instant::now()));
+        assert!(sampler.should_request(new_cursor, Instant::now()));
     }
 
     #[test]
     fn throttle_prevents_rapid_requests() {
         let now = Instant::now();
         let cursor = Point::new(100, 100);
-        let tile = Rect::from_origin_size(Point::new(84, 84), 32, 32);
         // Simulate a just-submitted request
         let mut sampler2 = ColorSampler::new();
         sampler2.mark_submitted(Point::new(84, 84), now);
         // Pending tile contains cursor → no request
-        assert!(!sampler2.should_request(cursor, tile, now));
+        assert!(!sampler2.should_request(cursor, now));
         // Even if cursor moves outside cached (pending counts), throttle blocks
         let later = now + Duration::from_micros(5_000); // 5ms, within 16.67ms
         let far_cursor = Point::new(300, 300);
-        let far_tile = Rect::from_origin_size(Point::new(284, 284), 32, 32);
         // No cached tile yet, but pending was different tile → check throttle
         sampler2.cached = None;
         sampler2.pending = None;
         sampler2.last_submit = Some(now);
-        assert!(!sampler2.should_request(far_cursor, far_tile, later));
+        assert!(!sampler2.should_request(far_cursor, later));
         // After 17ms, throttle releases
         let after = now + Duration::from_micros(17_000);
-        assert!(sampler2.should_request(far_cursor, far_tile, after));
+        assert!(sampler2.should_request(far_cursor, after));
     }
 
     #[test]

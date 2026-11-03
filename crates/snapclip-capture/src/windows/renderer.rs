@@ -233,6 +233,16 @@ impl Win32Renderer {
     /// When the provider produced a GPU texture the bitmap is created directly over it,
     /// so no pixels cross the PCIe bus; GPU-less frames fall back to a one-off upload.
     pub fn set_frame(&mut self, frozen: &FrozenFrame) -> Result<(), String> {
+        // This fixed 1000-nit mapping policy produces only the info-strip SDR
+        // numbers. It is not a measured peak, and never varies with the tile.
+        // The loupe itself continues sampling the original HDR GPU texture.
+        let descriptor = frozen.frame.source.descriptor();
+        let peak = if descriptor.encoding() == snapclip_model::pixels::PixelEncoding::ScRgb {
+            1000.
+        } else {
+            100.
+        };
+        self.sample_buffer.set_source(descriptor, peak)?;
         // Source encoding stays frozen. UI white belongs to the output *now*,
         // not the source snapshot taken before acquisition.
         let output = super::color_output::ColorSnapshot::query(frozen.monitor.handle).ok();

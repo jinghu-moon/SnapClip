@@ -5,6 +5,15 @@
 
 use super::*;
 
+/// Numeric formats describe the SDR derivative, never the original HDR radiance.
+fn sample_label(value: Option<&str>, hdr: bool) -> std::borrow::Cow<'_, str> {
+    match (value, hdr) {
+        (Some(value), true) => format!("SDR {value}").into(),
+        (Some(value), false) => value.into(),
+        (None, _) => "--".into(),
+    }
+}
+
 impl OverlayRenderer {
     pub(super) fn draw_magnifier(
         &mut self,
@@ -304,8 +313,7 @@ impl OverlayRenderer {
                 radiusX: swatch_radius,
                 radiusY: swatch_radius,
             };
-            if !self.color.is_linear() {
-                let (r, g, b) = view.magnifier_rgb.unwrap_or((0, 0, 0));
+            if let Some((r, g, b)) = view.magnifier_rgb {
                 swatch_fill.SetColor(&self.color.ui(color(
                     r as f32 / 255.0,
                     g as f32 / 255.0,
@@ -329,11 +337,9 @@ impl OverlayRenderer {
                 )
             };
             let pos_text = format!("({}, {})", cx, cy);
-            let colour_text = if self.color.is_linear() {
-                "--"
-            } else {
-                view.magnifier_color_text.as_deref().unwrap_or("--")
-            };
+            let colour_text =
+                sample_label(view.magnifier_color_text.as_deref(), self.color.is_linear());
+            let colour_text = colour_text.as_ref();
             let fixed = swatch + (INFO_SWATCH_GAP_DIP + INFO_COORD_BLOCK_GAP_DIP) * k;
             let row1_font =
                 shrink_to_fit(INFO_ROW1_FONT_MAX_DIP, INFO_ROW1_FONT_MIN_DIP, |size| {
@@ -692,6 +698,16 @@ fn item_width(cap: f32, label: f32, k: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_numeric_formats_are_explicitly_sdr_but_copy_values_are_unchanged() {
+        for value in ["#FF8040", "rgb(255,128,64)", "hsl(20,100%,63%)"] {
+            assert_eq!(sample_label(Some(value), true), format!("SDR {value}"));
+            assert_eq!(sample_label(Some(value), false), value);
+        }
+        assert_eq!(sample_label(None, true), "--");
+        assert_eq!(sample_label(None, false), "--");
+    }
 
     fn hints() -> Vec<LoupeHint> {
         crate::keymap::Keymap::default().loupe_hints()

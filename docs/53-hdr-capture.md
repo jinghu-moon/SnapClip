@@ -429,3 +429,32 @@ Yue core 增加 Windows `WindowOptions::is_activatable`，将持久无激活与�
 | 新测试脚本普通模式 | `tools/test-gpui-window.ps1 -CorePath ...`，1 通过／1 ignored |
 
 应用日志为 `target/hdr-p3e-{source-before,source-after,handoff-headless,workspace-final,pin-clippy}.log`。依赖隔离沿用 §12.3 快照，再叠加本批 core 激活选项与 Windows 后端；没有纳入并行虚拟列表改造，不能据此称默认依赖工作树已完整通过。没有切换系统 HDR、实际截屏或写剪贴板。真实 F6 的原位、DPI、拖动、0.1–10 倍鼠标锚定缩放、圆角、关闭／撤销与资源释放仍须迁移后逐项验收。
+
+## 14. HDR 异步取色（P3-G，2026-11-03）
+
+### 14.1 显示和数值分别负责什么
+
+- 放大镜中心格继续直接绘制原 FP16 scRGB 像素，保留负通道和高亮；不使用八位派生值覆盖它。
+- 数值栏和旁边的小色块使用明确的 SDR 派生值，HDR 时显示 `SDR #RRGGBB`、`SDR rgb(...)` 或 `SDR hsl(...)`。S 切换格式，C 复制纯数值，UI 标签不进入剪贴板载荷。
+- 采样固定使用 **1000 nit 来源峰值策略、100 nit SDR 目标**及 Model/Yue 共用的 BT.2390 数学。1000 nit 是本功能的固定映射参数，**不是**检测出的显示器／内容峰值；不随鼠标或每个 tile 改变。它不承诺与按整图内容峰值映射的导出像素完全一致。
+- 每次只异步回读 32×32 像素：SDR 是 4 KiB，FP16 是 8 KiB；不读整屏、不修改原始纹理。三块 staging 满时拒绝覆盖；格式变化重建 staging，编码／alpha／策略重绑使旧完成失效，拒绝非法重绑时保留原请求。
+
+### 14.2 同时修复的调度问题
+
+原控制器只有一个 `sample_slot` 和一个 pending origin，却允许快速移动到另一 tile 时继续提交，旧编号被覆盖后无人领取。新增纯测试先复现该失败（`hdr-p3g-scheduler-red.log`），再修改为一个在途请求。完成严格使用提交时的 origin，再检查当前鼠标是否需要补采；节流期间鼠标停止也会重试。命中缓存时不保持刷新，表单／标注／倒计时中隐藏放大镜时不启动新采样。错误仍保留最后有效数值，不自行安排无界错误重试。
+
+### 14.3 已执行验证和边界
+
+| 验证 | 实际结果 |
+| --- | --- |
+| 普通 workspace lib、串行、隔离依赖 | App 275、Capture 568、Clipboard 13、History 43、Model 31、Pin 73、UI 221，共 **1224** 通过；子进程重复项不另计 |
+| 纯 ColorSampler | **16** 通过，包括新增 pending 不覆盖、缓存数据／四边界、原有节流／格式／stale／重置 |
+| 新离屏 FP16 GPU sampler | Debug／Release 各 **1** 通过；straight／premultiplied、负通道、12.5 高亮、固定策略重绑、SDR 重绑、满槽／部分 tile 拒绝、完成只消费一次、源逐字节不变 |
+| 原有 SDR 上传纹理异步采样 | **1** 通过 |
+| D2D HDR 三项 | **3** 通过；中心格仍为 HDR 原色，数值色块实际填为经输出白映射的 SDR UI 色；原有 UI／alpha／白变化及 FP16 标注导出回归通过 |
+| 格式与差异检查 | `cargo fmt -p snapclip-capture -- --check`、`git diff --check` 通过 |
+| Capture all-targets strict Clippy | **未通过**，报告原有 `geometry`、`annotation`、滚动、Win32、测试辅助函数等问题（lib test 74 项），未添加 `allow` 或删除断言 |
+
+日志：`target/hdr-p3g-{sampler-before,scheduler-before,scheduler-red,sampler-pure,gpu,gpu-release,d2d-ui,workspace,capture-final,capture-clippy}.log`。依赖快照继续隔离并行虚拟列表改造；默认 `cargo fmt --all` 在其缺失的 showcase `virtual_list/tests.rs` 处失败，不能称默认工作树全量格式检查通过。
+
+测试使用离屏纹理，不截图、不写系统剪贴板、不切换 HDR 设置。实际 HDR 屏幕、放大镜各 DPI 下的文字可读性和真实复制操作仍需产品验收；§11 的倒计时＋取色组合项保持未勾选，直到 composition 倒计时也有对应证据。

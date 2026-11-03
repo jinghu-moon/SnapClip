@@ -1125,7 +1125,13 @@ impl OverlayController {
 
     /// Request an async tile copy if the cursor moved to a new tile and throttle allows.
     pub(super) fn request_color_sample(&mut self) {
-        if self.graphics_released || !self.cursor_visible {
+        if self.graphics_released
+            || !self.cursor_visible
+            || !self.session.shows_magnifier()
+            || self.region_panel.is_some()
+            || self.countdown_hud
+            || self.sample_slot.is_some()
+        {
             return;
         }
         let Some(renderer) = self.renderer.as_mut() else {
@@ -1147,10 +1153,15 @@ impl OverlayController {
             renderer.layout().local_work_area(),
         );
         let now = Instant::now();
-        if !self.sampler.should_request(self.cursor, geometry.tile, now) {
+        if !self.sampler.should_request(self.cursor, now) {
             // Tile hit: extract color from cached pixels without GPU.
             if self.sampler.update_cursor(self.cursor) {
                 self.invalidate();
+            }
+            // A throttled miss must be retried even if the pointer now stops.
+            // Cached hits do not keep an idle window rendering.
+            if !self.sampler.has_sample_at(self.cursor) {
+                self.arm_render_tick();
             }
             return;
         }
@@ -1161,6 +1172,7 @@ impl OverlayController {
             Ok(slot) => {
                 self.sampler.mark_submitted(tile_origin, now);
                 self.sample_slot = Some(slot);
+                self.arm_render_tick();
             }
             Err(_) => {
                 self.sampler.mark_stale();
@@ -1171,6 +1183,7 @@ impl OverlayController {
     /// Poll the pending GPU slot; if complete, feed the tile data to the sampler.
     pub(super) fn poll_color_sample(&mut self) {
         let Some(slot) = self.sample_slot.take() else {
+            self.request_color_sample();
             return;
         };
         let Some(renderer) = self.renderer.as_mut() else {
@@ -1198,6 +1211,8 @@ impl OverlayController {
                 if self.sampler.is_dirty() {
                     self.dirty = true;
                 }
+                // The completed tile may no longer cover the current cursor.
+                self.request_color_sample();
             }
             Some(Err(_)) => {
                 self.sampler.mark_stale();
