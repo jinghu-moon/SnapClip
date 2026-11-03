@@ -59,6 +59,7 @@ pub(super) fn enqueue_ocr(
                  SELECT 1 FROM clip_payloads cp
                  JOIN payloads p ON p.id = cp.payload_id
                  WHERE cp.clip_id = ?1 AND p.kind = 'image'
+                   AND NOT EXISTS(SELECT 1 FROM capture_sources WHERE clip_id = ?1)
              )",
             [clip_id],
             |row| row.get::<_, i64>(0).map(|v| v != 0),
@@ -228,6 +229,7 @@ pub(super) fn list_ocr_candidates(
                 ) AS content_hash
          FROM clip_search cs
          WHERE cs.ocr_status = ?1
+           AND NOT EXISTS(SELECT 1 FROM capture_sources WHERE clip_id = cs.clip_id)
            AND EXISTS (
              SELECT 1 FROM clip_payloads cp
              JOIN payloads p ON p.id = cp.payload_id

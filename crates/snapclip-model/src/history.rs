@@ -10,9 +10,10 @@ use crate::recognition::{OcrErrorCode, OcrStatus};
 /// and source metadata itself. Serialised to the front end and mirrored in
 /// `src/shared/contracts.ts`.
 ///
-/// There is deliberately no `thumbnail` field. `P6.03` deleted it together with the payload role
-/// nothing ever wrote (`docs/30 §19.2`, `ADR-5`): a row's preview is **derived** from the image
-/// payload it already has, not a second stored artifact that has to be kept in step with it.
+/// Clipboard rows retain their original payload, from which a preview is derived.
+/// Capture rows instead carry an explicitly SDR image payload for the list and a
+/// separate `capture_source` reference to the immutable original. Consumers must
+/// not interpret that disposable thumbnail as the capture's copy/export source.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClipSummary {
@@ -24,6 +25,9 @@ pub struct ClipSummary {
     pub source_app: Option<String>,
     pub source_exe_path: Option<String>,
     pub payloads: Vec<PayloadRef>,
+    /// Present for captures. The image payload is only an SDR row thumbnail;
+    /// copy, export and full preview must reopen this immutable original.
+    pub capture_source: Option<crate::CaptureSource>,
     pub ocr_status: OcrStatus,
     pub ocr_text: Option<String>,
     pub ocr_layout: Option<String>,

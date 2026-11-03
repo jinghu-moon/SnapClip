@@ -66,7 +66,7 @@ pub struct CaptureEvents {
     save_opener: std::sync::Mutex<
         Option<
             std::sync::Arc<
-                dyn Fn(&snapclip_capture::ports::SelectionPixels) -> Result<(), String>
+                dyn Fn(&str, &snapclip_capture::ports::SelectionPixels) -> Result<(), String>
                     + Send
                     + Sync,
             >,
@@ -98,7 +98,9 @@ impl CaptureEvents {
     pub fn set_save_opener(
         &self,
         opener: std::sync::Arc<
-            dyn Fn(&snapclip_capture::ports::SelectionPixels) -> Result<(), String> + Send + Sync,
+            dyn Fn(&str, &snapclip_capture::ports::SelectionPixels) -> Result<(), String>
+                + Send
+                + Sync,
         >,
     ) {
         *self
@@ -120,6 +122,7 @@ impl CaptureEvents {
     /// 把一次"请开保存面板"交给接好的投递器；没接上时返回 `None`（外壳的接线问题，要说出来）。
     fn post_save(
         &self,
+        session_id: &str,
         pixels: &snapclip_capture::ports::SelectionPixels,
     ) -> Option<Result<(), String>> {
         let opener = self
@@ -127,7 +130,7 @@ impl CaptureEvents {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()?;
-        Some(opener(pixels))
+        Some(opener(session_id, pixels))
     }
 
     fn state(&self, session_id: &str, state: CaptureState) -> u64 {
@@ -180,7 +183,7 @@ impl CaptureEventSink for CaptureEvents {
         session_id: &str,
         pixels: &snapclip_capture::ports::SelectionPixels,
     ) {
-        match self.post_save(pixels) {
+        match self.post_save(session_id, pixels) {
             // The success path used to print nothing, which made a real report — a second `Ctrl+S`
             // with no panel — impossible to read: "opened, and you did not see it" and "never
             // opened" looked identical. Say what happened on all three paths.
@@ -466,7 +469,8 @@ mod save_open_tests {
         let seen = Arc::new(std::sync::Mutex::new(None));
         let counter = calls.clone();
         let recorder = seen.clone();
-        events.set_save_opener(Arc::new(move |pixels| {
+        events.set_save_opener(Arc::new(move |session_id, pixels| {
+            assert_eq!(session_id, "session-1");
             counter.fetch_add(1, Ordering::AcqRel);
             *recorder.lock().unwrap_or_else(|p| p.into_inner()) = Some((
                 pixels.region.right - pixels.region.left,
@@ -504,7 +508,7 @@ mod save_open_tests {
         let events = CaptureEvents::new(EventBus::new());
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        events.set_save_opener(Arc::new(move |_| {
+        events.set_save_opener(Arc::new(move |_, _| {
             counter.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }));
@@ -531,7 +535,7 @@ mod save_open_tests {
     #[test]
     fn a_failing_opener_is_reported_rather_than_propagated() {
         let events = CaptureEvents::new(EventBus::new());
-        events.set_save_opener(Arc::new(|_| Err("宿主线程已经不在了".to_string())));
+        events.set_save_opener(Arc::new(|_, _| Err("宿主线程已经不在了".to_string())));
         events.on_save_requested("session-1", &pixels());
     }
 }

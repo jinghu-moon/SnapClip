@@ -1,6 +1,6 @@
 # 53 · HDR 捕获、母版、保存面板与贴图接入方案
 
-日期：2026-11-03。状态：**Yue 高精度资源／Windows 输出、本项目源像素／行带底座、冻结帧来源代次和压缩像素母版发布已实现；WGC 格式合同与 D2D 内部 FP16 链路已接通并有离屏 GPU 数值验证。生产捕获策略、滚动与消费迁移仍未完成，App／Capture 严格 Clippy 仍有失败，不代表 SnapClip 已支持 HDR。** Pin 已移除假色彩标签接口，为 16 位 SDR 明确生成 SDR 派生像素；仍是 RGBA8 模型，对 HDR 返回明确错误，原图不被截断或覆盖。分批修改与证据见 §8～§10，不能在后续消费链路未齐时仅打开 UI 中的 HDR 选项。
+初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制及历史保真源已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§17。AVIF 生产证据、资源性能与真实 HDR/双屏/DPI/设备恢复仍未验收，App/Capture 全仓 strict Clippy 尚未通过；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
 
 通用像素、色彩、GPUI／Windows输出、依赖选择及官方资料统一见相邻Yue仓库的 [27 · Windows HDR图片与显示管线](../../GPUI-Yue-Component/docs/27-hdr-pipeline.md)。本文只定义SnapClip的业务和迁移，不复制第二套HDR框架。
 
@@ -35,11 +35,11 @@ HDR屏且系统HDR开启时优先直接显示；内容超出目标HDR能力时�
 | `ports.rs`、`artifact.rs` | `BandSource::source()`／`PixelSliceSource` 已携带定义，FP16 圆角已实现 | 下游使用选区内容定义；读回前后校验来源代次，不能混合来源 |
 | `scroll/`、`windows/scroll_worker.rs` | 原始字节存储已可按 FP16 行宽落盘；匹配／预览／生产 session 仍为八位 | 拼接几何用分析图，保存的行带保留原始精度并传播色彩 generation |
 | `apps/snapclip/src/capture/`、`save/bands.rs` | writer 已将高精度来源写为 `.scpx`；普通 SDR 保留流式 PNG；旧消费者显式拒绝高精度 | 继续完成 HDR 编码、明确 SDR 派生及保存工作流 |
-| `apps/snapclip/src/save_panel/` | 图片资源与编码结果仍是SDR入口 | 同一revision、色彩策略、编码后真实预览和明确格式限制 |
-| `crates/snapclip-pin/src/source.rs`、`image_preview.rs`、`view.rs` | F3已走Yue；来源仍有8位限制 | 消费高精度资源，原始复制不走显示代理 |
-| `crates/snapclip-pin/src/host.rs` | F6为DIB／`UpdateLayeredWindow`原生八位宿主 | 迁移到GPUI／Yue图片窗口，见§5 |
+| `apps/snapclip/src/save_panel/` | 原图/结果/对比已保留高精度，同一 revision；HDR PNG16 与明确 SDR 策略 | 原图归档与导出分离，真实 HDR/DPI 验收 |
+| `crates/snapclip-pin/src/image_preview.rs`、`view.rs` | F3 已保留 FP16 原始 Arc，普通复制显式生成 SDR | 真实输入/显示验收，原始复制不走显示代理 |
+| `crates/snapclip-pin/src/screenshot.rs` | F6 已使用共用 Yue paint；旧 `host.rs`/`source.rs` 删除 | 保持原位/无激活/DPI 合同，见 §16 |
 | `crates/snapclip-clipboard/src/writer.rs`、`windows/reader.rs` | 输出四字节像素／PNG，输入PNG优先后DIB | 明确复制策略，优先解析原编码PNG色彩，损坏时才用可说明的备用格式 |
-| `crates/snapclip-history`及应用history入口 | 存储层已有压缩母版及有界行读取；历史 DB／重放／缩略图尚未接入 | 原始母版保留色彩，缩略图为可重建SDR派生内容 |
+| `crates/snapclip-history`及应用history入口 | SQLite 源引用、SDR 行缩略图、真正原图回放/复制已接入，见 §17 | 交互预算 256 MiB；超限保留源并明确拒绝；长母版的历史导出入口仍需补齐 |
 
 现有 `docs/49-avif-bmp-selection.md` 文末记录AVIF编码／解码已实现，不能再说“整个项目没有AVIF”。但当前GPUI应用的 `capture/convert.rs` 及Yue公共encoded入口不能据此被认定已有HDR AVIF；P0须分别核对Tauri、工具和实际生产保存路径。
 
@@ -521,7 +521,7 @@ SDR 倒计时保留原 BGRA8 内容路径，与 HDR 共用一次模糊＋遮罩�
 | workspace ordinary lib，串行、隔离依赖 | App 275、Capture 568、Clipboard 13、History 43、Model 31、Pin 59、UI 221，共 **1,210 passed**；ignored 分别 5/88/2/0/0/0/0，不计入通过 |
 | App / Pin headless lib | **295 / 71 passed**，另 5 / 1 ignored |
 | Pin all-targets strict Clippy | headless feature、`--no-deps -D warnings` 通过，包含 preview example；不是全仓 strict lint 结论 |
-| 原生生产 F6（Debug） | 精确 filter **1 passed**；原位(16,16)、NOACTIVATE/TOOLWINDOW/TOPMOST、无 LAYERED/APPWINDOW、前台不变；FP16 bits/源 Arc 保留，GPU corner alpha≈0/center≈0.5，滚轮1.1且资源复用，关闭后 Weak 释放 |
+| 原生生产 F6（Debug / Release） | 精确 filter 各 **1 passed**；原位(16,16)、NOACTIVATE/TOOLWINDOW/TOPMOST、无 LAYERED/APPWINDOW、前台不变；FP16 bits/源 Arc 保留，GPU corner alpha≈0/center≈0.5，滚轮1.1且资源复用，关闭后 Weak 释放 |
 | framework 原生窗口 | 两个独立进程各 **1 passed**：持续无激活及 synthetic DPI 保物理尺寸；禁用 preserve 分支的负对照先失败 |
 | workspace all-targets check、scoped fmt、diff check、test-count gate | 均通过；gallery 既有 9 项 must-use warnings 保留 |
 
@@ -536,3 +536,40 @@ pwsh -NoProfile -File tools/test-gpui-window.ps1 -Native -CorePath D:/100_Projec
 ```
 
 **仍未验收**：F5/F6 全链路真实热键、实际鼠标拖动/菜单、DWM 闪烁、HDR 开/关和高光观感、不同显示器/真实 DPI、屏幕 45MP 和完整设备恢复；原生小窗与无头测试不能代替这些证据。Release、RSS/VRAM、20 次替换、空闲重绘仍单独记录，未完成前不开放 production HDR 捕获门禁。
+
+## 17. 历史保真源、SDR 行缩略图与回放（P3-J，2026-11-04）
+
+### 17.1 所有权与生产接线
+
+SQLite v5 为 clips 保存真实 origin，capture_sources 与历史行在同一 transaction 中存储 CaptureSource（完整采集元数据和 ArtifactRef）。旧数据默认 clipboard；不存在的采集 DPI 明确为 0、monitor 为 None，不用当前窗口状态推测旧来源。
+
+CaptureArtifactStore 校验 owned 目录、尺寸/编码、完整文件 hash 和母版 metadata。列表中的 image payload 仅是规范化的 PNG8 缩略图；它不能作为完整预览或复制来源。两条历史引用同一母版时，删除第一条仍保留文件，删除最后一条才回收；替换/篡改的文件不擅自删除。已经打开的窗口独立拥有 Arc 像素，不受历史删除影响。
+
+缩略图随源 bands 生成，128×128 的线性光/关联 Alpha 累加器不会持有第二张大图。计算整幅峰值后，使用已有 Model/Yue BT.2390 映射为 SDR；隐藏透明色不污染边缘。列表读取/解码放在后台，最多两个在途任务；删除不提前释放任务名额，迟到结果不能复活已删除的行。capture 缩略图明确排除 OCR，避免误识别低分辨率派生内容。
+
+保存面板归档未修改的原图，与输出尺寸/格式独立；同一 Picture 的 clone 共享一次成功归档，失败允许重试。文件保存成功而归档失败时显示“图片已保存，但历史原图未归档”，不丢失保存路径或谎称文件保存失败。归档成功后通过现有事件总线刷新列表。生产面板窗口选择 AutomaticHdr。
+
+历史页新增“查看原图…”、“复制 SDR”和 HDR 来源的“复制 HDR PNG”。Space 查看、Enter 明确复制 SDR；读取/转换/复制在后台，操作中禁用重复启动。真正回放重新验证母版、按行读 FP16，PNG 源重新核对 hash；丢失/损坏/超预算不能回退缩略图。360 DIP 工具栏可折行。交互读取上限为 256 MiB；45MP FP16 超限会明确拒绝，原始保真源仍保留。历史的长母版有界导出 UI 尚未补齐，不以此宣称 45MP 交互已完成。
+
+### 17.2 一项真实的旧精度损失
+
+新增 2048×1 PNG16 用例在旧 normalize_png 上实际失败：读回变为 1920×1 PNG8（`target/hdr-history-png-red.log`）。现在 PNG 入库保留原始 bytes、尺寸、位深和 metadata，仍受 24MP/64MiB 预算约束；DIB 的既有 SDR 下采样策略未改。带 cICP/ICC 或 16bit 的预览走共享色彩 decoder，不能把 PQ 编码值直接当普通 RGBA8。真实生产 PQ PNG16→SDR 预览测试检查 Alpha 和映射像素，原始 bytes 不变。普通 PNG8 长图仍按顶部窗口流式解码，其内存合同没有换成完整解码。
+
+### 17.3 已执行验证与未通过项
+
+| 验证 | 实际结果 |
+| --- | --- |
+| workspace ordinary lib，串行、隔离依赖 | App 280、Capture 568、Clipboard 13、History 46、Model 31、Pin 59、UI 221，共 **1218 passed**；子进程重复项不另计 |
+| App / Pin headless lib | **303 / 71 passed**，另 5 / 1 ignored |
+| History 普通 lib + integration | **46 + 6 capture_history + 5 pixel_master passed**；重开 DB、原始 bits/generation、共享删除、外部/篡改拒绝、重复 ID、OCR 隔离 |
+| 新 App 原图回放/入口 | 5 项通过；真实组件点击打开 Pin，360 DIP 按钮 bounds 在视口内、缺源不退缩略图、归档失败可重试 |
+| 保存面板 UI | **22 passed**，包含缩放导出保留原始尺寸、归档失败仍返回已保存文件及原有布局/输入/IME/预览回归 |
+| Model / History all-targets strict Clippy | `--no-deps -D warnings` 通过 |
+| workspace all-targets check | 通过；gallery 既有 9 项 must-use warnings 保留 |
+| 扩展 UI integration | 9 passed / 1 failed：既有设置页 `label-unit-suffix` 超出 640×480 可视范围，尚未把此项称为通过 |
+| regression_baseline integration | 1 passed / 1 failed：A_CLASS 把已 ignore 的离屏 D2D GPU 测试列为普通测试；保留失败证据，后续修正层次与实际执行门禁 |
+| App all-targets Clippy | 仍有存量诊断；未加 allow、未声称全仓 strict clean |
+
+日志为 `target/hdr-history-{red,png-red,db-final,new-tests,replay-tests,save-ui,workspace,headless,check,clippy-final,ui-final,integration}.log` 和 `hdr-history-app-clippy.jsonl`。依赖隔离沿用 §12.3 本机快照，未混入 Yue 并行虚拟列表重构；快照/临时脚本/测试产物不提交。F6 Release probe 的新增成功证据为 `target/hdr-f6-native-release.log`。
+
+尚未验证的真实 HDR/双屏/DPI、系统剪贴板接收方行为、设备恢复、RSS/VRAM/20 次替换/空闲重绘仍保持未验收；注册失败可能留下未注册母版（明确报错并保留源，暂不自动扫除）。生产 HDR 捕获门禁继续关闭。

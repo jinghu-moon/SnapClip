@@ -19,11 +19,11 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{
     ActiveTheme, Theme, VirtualListScrollHandle, WindowExt as _, v_virtual_list,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 // Only with the `test-support` feature: it registers nodes for `window.find("id")`.
 #[cfg(feature = "test-support")]
 use gpui_kit::test::TestSupportExt;
-use snapclip_history::image::{decode_to_rgba8, png_dimensions};
 use snapclip_model::{AppEvent, ClipSummary, PayloadKind};
 
 use super::card::{PREVIEW_CHARS_PER_LINE, PREVIEW_LINES};
@@ -35,7 +35,7 @@ use super::rich::{Span, spans_to_lines, styled_line};
 // string the UI test asserts on.
 #[cfg(feature = "test-support")]
 use super::rich::spans_to_text;
-use crate::clipboard::{Channels, ClipboardImage, SystemClipboard};
+use crate::clipboard::SystemClipboard;
 use crate::events::EventBus;
 
 /// Row height in pixels. Fixed so the virtual list can size the scroll range without
@@ -61,6 +61,13 @@ const LOAD_MORE_THRESHOLD_ROWS: f32 = 3.0;
 ///
 /// The store keeps 500 for search and the dialog; a row is one line, so it needs far less.
 const PREVIEW_CHARS: usize = 160;
+
+#[derive(Clone, Copy)]
+enum CaptureAction {
+    Open,
+    CopySdr,
+    CopyHdr,
+}
 
 pub struct HistoryView {
     state: HistoryState,
@@ -99,6 +106,9 @@ pub struct HistoryView {
     /// want the arrow keys, so the screen has to say which one is typing: this handle is the
     /// list's, and the handler only navigates or deletes while it holds focus.
     list_focus: FocusHandle,
+    pins: Option<WeakEntity<snapclip_pin::PinManager>>,
+    capture_busy: bool,
+    capture_operation: Option<Task<()>>,
 }
 
 impl HistoryView {
@@ -132,7 +142,7 @@ impl HistoryView {
         let mut stream = bus.subscribe();
         let _events = cx.spawn(async move |this, cx| {
             while let Some(event) = stream.next().await {
-                if !matches!(event, AppEvent::Clipboard(_)) {
+                if !matches!(event, AppEvent::Clipboard(_) | AppEvent::Capture(_)) {
                     continue;
                 }
                 // The store read happens here and the state change happens inside
@@ -162,7 +172,81 @@ impl HistoryView {
             _events,
             _activation,
             list_focus,
+            pins: None,
+            capture_busy: false,
+            capture_operation: None,
         }
+    }
+
+    pub(crate) fn set_pins(&mut self, pins: WeakEntity<snapclip_pin::PinManager>) {
+        self.pins = Some(pins);
+    }
+
+    fn capture_action(&mut self, action: CaptureAction, cx: &mut Context<Self>) {
+        if self.capture_busy {
+            return;
+        }
+        let Some(source) = self.state.selected_capture().cloned() else {
+            return;
+        };
+        let pins = self.pins.clone();
+        let mut cursor = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor);
+        }
+        let cursor = (cursor.x, cursor.y);
+        self.capture_busy = true;
+        self.status = Some("正在读取原始图片…".into());
+        self.capture_operation = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let image = super::capture::read_source(&source)?;
+                    match action {
+                        CaptureAction::Open => Ok(Some(image)),
+                        CaptureAction::CopySdr => {
+                            SystemClipboard.copy_pin_image(&image).map(|_| None)
+                        }
+                        CaptureAction::CopyHdr => {
+                            let bytes = crate::capture::pixel_export::encode_pixels(
+                                image.pixels(),
+                                crate::capture::pixel_export::ColorExport::PreserveHdr,
+                            )?;
+                            SystemClipboard.copy_hdr_png(&bytes).map(|_| None)
+                        }
+                    }
+                })
+                .await;
+            _ = this.update(cx, |view, cx| {
+                view.capture_busy = false;
+                let result = result.and_then(|image| {
+                    if let Some(image) = image {
+                        let pins = pins
+                            .and_then(|weak| weak.upgrade())
+                            .ok_or("图片窗口服务不可用")?;
+                        snapclip_pin::PinManager::open(
+                            Arc::new(snapclip_pin::PinSnapshot::new(
+                                snapclip_pin::PinContent::Image(image),
+                            )),
+                            snapclip_pin::PinPlacement::Pointer(cursor),
+                            &pins,
+                            cx,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Ok(())
+                });
+                view.status = Some(match result {
+                    Ok(()) => match action {
+                        CaptureAction::Open => "已打开原图".into(),
+                        CaptureAction::CopySdr => "已复制 SDR 图片".into(),
+                        CaptureAction::CopyHdr => "已复制 HDR PNG".into(),
+                    },
+                    Err(e) => format!("原图操作失败：{e}"),
+                });
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     /// Read-only accessors for the rows the view is showing. Public because the UI
@@ -327,7 +411,8 @@ impl HistoryView {
         match self.state.delete_selected() {
             Ok(Some(_)) => {
                 self.thumbnails.clear();
-                self.pending_thumbnails.clear();
+                // Detached decoders are still running. Keep their reservations
+                // until completion so deletion cannot exceed the two-job budget.
                 self.status = Some("已删除".to_string());
             }
             Ok(None) => self.status = Some("没有可删除的记录".to_string()),
@@ -355,7 +440,10 @@ impl HistoryView {
         if !has_image {
             return None;
         }
-        if !self.thumbnails.contains_key(&item.id) && !self.pending_thumbnails.contains(&item.id) {
+        if !self.thumbnails.contains_key(&item.id)
+            && !self.pending_thumbnails.contains(&item.id)
+            && self.pending_thumbnails.len() < 2
+        {
             self.pending_thumbnails.insert(item.id.clone());
             let id = item.id.clone();
             cx.defer_in(window, move |this, _window, cx| {
@@ -375,7 +463,6 @@ impl HistoryView {
     }
 
     fn load_thumbnail(&mut self, clip_id: &str, cx: &mut Context<Self>) {
-        self.pending_thumbnails.remove(clip_id);
         // A preview cache that grows with the history is a leak, and the visible set is what
         // matters; dropping everything re-reads only the rows on screen.
         if self.thumbnails.len() > THUMBNAIL_CACHE_LIMIT {
@@ -388,24 +475,41 @@ impl HistoryView {
             .find(|item| item.id == clip_id)
             .cloned()
         else {
+            self.pending_thumbnails.remove(clip_id);
             return;
         };
-        let decoded = match self.state.image_bytes(&item) {
-            Some(Ok(bytes)) => match preview::row_preview_png(&bytes) {
-                Ok(preview) => Some(Arc::new(Image::from_bytes(ImageFormat::Png, preview))),
-                Err(error) => {
-                    eprintln!("[snapclip-app] history preview failed for {clip_id}: {error}");
-                    None
-                }
-            },
-            Some(Err(error)) => {
-                eprintln!("[snapclip-app] history preview failed for {clip_id}: {error}");
-                None
-            }
-            None => None,
+        let Some((store, payload)) = self.state.image_request(&item) else {
+            self.pending_thumbnails.remove(clip_id);
+            return;
         };
-        self.thumbnails.insert(clip_id.to_string(), decoded);
-        cx.notify();
+        let id = clip_id.to_owned();
+        // Independent bounded work may finish after closing. Only a weak view
+        // is retained; at most two source decoders run for this list at once.
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let bytes = store
+                        .read_payload_bytes(payload.content_hash, PayloadKind::Image)
+                        .map_err(|e| e.to_string())?;
+                    preview::row_preview_png(&bytes).map_err(|e| e.to_string())
+                })
+                .await;
+            _ = this.update(cx, |view, cx| {
+                view.pending_thumbnails.remove(&id);
+                if view.state.items().iter().any(|item| item.id == id) {
+                    let image = match result {
+                        Ok(bytes) => Some(Arc::new(Image::from_bytes(ImageFormat::Png, bytes))),
+                        Err(e) => {
+                            eprintln!("[history] thumbnail {id} failed: {e}");
+                            None
+                        }
+                    };
+                    view.thumbnails.insert(id, image);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -425,21 +529,18 @@ impl HistoryView {
     /// The write goes through the shell's adapter, which also marks it as ours so the
     /// clipboard monitor does not record our own copy as a new history entry.
     fn copy_selected(&mut self, cx: &mut Context<Self>) {
+        if self.state.selected_capture().is_some() {
+            self.capture_action(CaptureAction::CopySdr, cx);
+            return;
+        }
         let clipboard = SystemClipboard;
         self.status = Some(match self.state.selected_payload_bytes() {
             None => "没有选中的记录".to_string(),
             Some(Err(error)) => format!("读取失败：{error}"),
             Some(Ok((_payload, kind, bytes))) => {
                 let outcome = match kind {
-                    PayloadKind::Image => match decode_to_rgba8(&bytes) {
-                        Ok(decoded) => clipboard.copy_image(&ClipboardImage {
-                            width: decoded.width(),
-                            height: decoded.height(),
-                            pixels: decoded.as_raw(),
-                            channels: Channels::Rgba,
-                            // A stored PNG goes back as it is, not encoded again.
-                            png: png_dimensions(&bytes).is_some().then_some(&bytes[..]),
-                        }),
+                    PayloadKind::Image => match snapclip_pin::decode_image(&bytes) {
+                        Ok(decoded) => clipboard.copy_pin_image(&decoded),
                         Err(error) => Err(format!("图片解码失败：{error}")),
                     },
                     _ => match String::from_utf8(bytes) {
@@ -694,6 +795,9 @@ impl Render for HistoryView {
                     "down" => this.move_selection(1, cx),
                     "escape" => this.clear_query(window, cx),
                     "enter" => this.copy_selected(cx),
+                    "space" if this.state.selected_capture().is_some() => {
+                        this.capture_action(CaptureAction::Open, cx)
+                    }
                     // The list owns this key: the search field never deletes a stored clip.
                     "delete" | "backspace" => this.request_delete(window, cx),
                     _ => {}
@@ -714,6 +818,7 @@ impl Render for HistoryView {
                     .child(
                         div()
                             .h_flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_2()
                             .child(div().text_xs().text_color(theme.muted_foreground).child(
@@ -724,6 +829,43 @@ impl Render for HistoryView {
                                 },
                             ))
                             .child(div().flex_1())
+                            .when(self.state.selected_capture().is_some(), |bar| {
+                                let theme = yue_component::current_theme(cx);
+                                let disabled = self.capture_busy;
+                                let button = |id, label| {
+                                    yue_component::YueButton::text(id, theme, label)
+                                        .size(yue_component::ButtonSize::Small)
+                                        .variant(yue_component::ButtonVariant::Ghost)
+                                        .disabled(disabled)
+                                };
+                                bar.child(
+                                    button("history-open-original", "查看原图…")
+                                        .disabled(disabled || self.pins.is_none())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.capture_action(CaptureAction::Open, cx)
+                                        })),
+                                )
+                                .child(button("history-copy-sdr", "复制 SDR").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.capture_action(CaptureAction::CopySdr, cx)
+                                    }),
+                                ))
+                                .when(
+                                    self.state.selected_capture().is_some_and(|s| {
+                                        s.metadata.source.descriptor().encoding()
+                                            == snapclip_model::pixels::PixelEncoding::ScRgb
+                                    }),
+                                    |bar| {
+                                        bar.child(
+                                            button("history-copy-hdr", "复制 HDR PNG").on_click(
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.capture_action(CaptureAction::CopyHdr, cx)
+                                                }),
+                                            ),
+                                        )
+                                    },
+                                )
+                            })
                             .child(self.delete_button(theme, cx)),
                     )
                     .children(self.status.clone().map(|status| {
@@ -1090,6 +1232,7 @@ mod tests {
             preview_text: Some("hello".into()),
             source_app: Some("Windows Terminal".into()),
             source_exe_path: None,
+            capture_source: None,
             payloads: vec![PayloadRef {
                 payload_id: "payload-1".into(),
                 content_hash: "hash-1".into(),

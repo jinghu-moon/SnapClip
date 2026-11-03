@@ -26,7 +26,7 @@ pub mod publication;
 pub mod recognition;
 pub mod time;
 
-pub use artifact::{ArtifactRef, CaptureMetadata, CaptureOutput};
+pub use artifact::{ArtifactRef, CaptureMetadata, CaptureOutput, CaptureSource};
 pub use capture::{CaptureArtifact, CapturePayload, CaptureState, PixelFormat};
 pub use error::ErrorCode;
 pub use events::{AppEvent, CaptureEvent, ClipboardEvent, RecognitionEvent};

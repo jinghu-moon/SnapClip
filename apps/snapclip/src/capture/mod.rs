@@ -83,6 +83,7 @@ use crate::events::EventBus;
 /// `CaptureRuntime::set_preferences`.
 pub fn start(
     app_local_data: &Path,
+    history: Option<snapclip_history::store::Store>,
     events: EventBus,
     options: DetectionOptions,
     preferences: OverlayPreferences,
@@ -100,9 +101,11 @@ pub fn start(
     let clipboard: Arc<dyn ClipboardWriter> = Arc::new(SystemClipboardWriter);
     // Artifacts land in `<app local data>/artifacts/capture` (docs/11 §8.2); the writer is
     // the only thing that knows how to turn pixels into a file.
-    let store: Arc<dyn ArtifactWriter> = Arc::new(HistoryArtifactWriter::new(
-        app_local_data.join("artifacts").join("capture"),
-    ));
+    let mut writer = HistoryArtifactWriter::new(app_local_data.join("artifacts").join("capture"));
+    if let Some(history) = history {
+        writer = writer.with_history(history);
+    }
+    let store: Arc<dyn ArtifactWriter> = Arc::new(writer);
     // The pin source hangs off the overlay's own selection slot (`OverlayShared::selection`),
     // which the overlay fills the moment a gesture commits one — not at export time. `F6`
     // pins "the picture I just selected", and the user never has to save for it to exist.
@@ -204,6 +207,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let (runtime, pin_source, _capture_events) = start(
             &root,
+            None,
             EventBus::new(),
             DetectionOptions::default(),
             Default::default(),

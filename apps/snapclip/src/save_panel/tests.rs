@@ -249,6 +249,95 @@ mod ui {
         cx.run_until_parked();
     }
 
+    fn save_archived_picture(cx: &mut TestAppContext, invalid_metadata: bool) {
+        let directory = std::env::temp_dir().join(format!(
+            "save-archive-ui-{}-{invalid_metadata}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let history_root = directory.join("history");
+        let store = snapclip_history::store::Store::open(&history_root).unwrap();
+        let picture = Picture::synthetic();
+        let descriptor = picture.original_pixels().descriptor();
+        let archive = crate::history::capture::CaptureArchive::new(
+            history_root,
+            store.clone(),
+            snapclip_model::CaptureMetadata {
+                session_id: "panel-save".into(),
+                width: if invalid_metadata { 1 } else { 64 },
+                height: 64,
+                dpi: 0,
+                source: snapclip_model::pixels::PixelSource::new(descriptor, 73),
+                captured_at_unix_ms: 100,
+                monitor_device_name: None,
+            },
+        );
+        let (handle, panel) = setup_picture(cx, 1000., 720., picture.with_archive(archive));
+        cx.update_window(handle.into(), |_, window, cx| {
+            panel.update(cx, |panel, _| panel.after = [false; 2]);
+            window.render_frame(cx);
+            window.click("preset-50", cx);
+            window.click("save-directory", cx);
+            window.press("ctrl-a", cx);
+            window.input(&directory.to_string_lossy(), cx);
+            window.click("save-name", cx);
+            window.press("ctrl-a", cx);
+            window.input("archived", cx);
+        })
+        .unwrap();
+        settle_preview(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(!panel.read(cx).measuring);
+            window.click("commit-save", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let panel = panel.read(cx);
+            assert!(!panel.busy);
+            let output = image::open(
+                panel
+                    .saved_path
+                    .as_ref()
+                    .expect("export remains successful"),
+            )
+            .unwrap();
+            assert_eq!((output.width(), output.height()), (32, 32));
+            assert_eq!(panel.status_error, invalid_metadata);
+            let page = store.history_page(None, None).unwrap();
+            if invalid_metadata {
+                assert!(
+                    panel
+                        .status
+                        .as_deref()
+                        .unwrap()
+                        .contains("图片已保存，但历史原图未归档")
+                );
+                assert!(page.items.is_empty());
+            } else {
+                let source = page.items[0].capture_source.as_ref().unwrap();
+                assert_eq!(
+                    (source.metadata.width, source.metadata.height),
+                    (64, 64),
+                    "archive retains original size, not resized export"
+                );
+                assert_eq!(source.metadata.source.generation(), 73);
+            }
+        });
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[gpui_kit::test]
+    fn saving_a_resized_export_archives_the_unchanged_original(cx: &mut TestAppContext) {
+        save_archived_picture(cx, false);
+    }
+
+    #[gpui_kit::test]
+    fn archive_failure_reports_the_saved_file_separately(cx: &mut TestAppContext) {
+        save_archived_picture(cx, true);
+    }
+
     #[gpui_kit::test]
     fn failed_capture_uses_the_component_error_and_real_retry_action(cx: &mut TestAppContext) {
         let (handle, panel) = setup_picture(cx, 1000., 720., Picture::synthetic());

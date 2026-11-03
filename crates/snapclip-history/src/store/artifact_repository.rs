@@ -45,8 +45,21 @@ pub(super) fn sweep_orphans(
 pub(super) fn delete_publication(
     connection: &Connection,
     blob_store: &BlobStore,
+    artifacts: &crate::artifact_store::CaptureArtifactStore,
     clip_id: &str,
 ) -> Result<bool, StoreError> {
+    let source: Option<String> = connection
+        .query_row(
+            "SELECT source_json FROM capture_sources WHERE clip_id = ?1",
+            [clip_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let source: Option<snapclip_model::CaptureSource> = source
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|e| StoreError::InvalidPublication(e.to_string()))
+        })
+        .transpose()?;
     let transaction = connection.unchecked_transaction()?;
     let removed = transaction.execute("DELETE FROM clips WHERE id = ?1", params![clip_id])?;
     if removed == 0 {
@@ -59,5 +72,14 @@ pub(super) fn delete_publication(
     )?;
     transaction.commit()?;
     sweep_orphans(connection, blob_store)?;
+    if let Some(source) = source {
+        // The row is durably gone even when a replaced or externally held source
+        // cannot be removed. Do not report a failed deletion for a committed one.
+        if let Err(error) =
+            super::capture_repository::remove_unreferenced(connection, artifacts, &source)
+        {
+            eprintln!("[history] retained capture artifact after row deletion: {error}");
+        }
+    }
     Ok(true)
 }

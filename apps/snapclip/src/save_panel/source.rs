@@ -25,6 +25,7 @@ pub struct Picture {
     original: Arc<PixelBuffer>,
     sdr: Arc<OnceLock<PixelBuffer>>,
     peak_nits: f64,
+    archive: Option<Arc<crate::history::capture::CaptureArchive>>,
 }
 
 impl Picture {
@@ -143,11 +144,23 @@ impl Picture {
             original,
             sdr: Arc::new(OnceLock::new()),
             peak_nits,
+            archive: None,
         }
     }
 
     pub fn is_hdr(&self) -> bool {
         self.original.descriptor().encoding() == PixelEncoding::ScRgb
+    }
+
+    pub(crate) fn with_archive(mut self, archive: crate::history::capture::CaptureArchive) -> Self {
+        self.archive = Some(Arc::new(archive));
+        self
+    }
+
+    pub(crate) fn archive_original(&self) -> Result<(), String> {
+        self.archive
+            .as_ref()
+            .map_or(Ok(()), |archive| archive.persist(&self.original))
     }
 
     pub fn original_pixels(&self) -> &PixelBuffer {

@@ -15,6 +15,7 @@
 //! decided, this store is where it belongs.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -38,6 +39,44 @@ impl CaptureArtifactStore {
     /// The directory this store writes into.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Reject references outside this store, including symlink/junction escapes.
+    /// Source lifecycle operations may never touch a user's exported file.
+    pub fn verify_owned(&self, reference: &ArtifactRef) -> Result<(), StoreError> {
+        let root = self.root.canonicalize()?;
+        let path = reference.absolute_path.canonicalize()?;
+        if !reference.absolute_path.is_absolute() || path.parent() != Some(root.as_path()) {
+            return Err(StoreError::InvalidPublication(
+                "capture source is not owned by the artifact store".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify immutable encoded identity with bounded scratch, not a whole file Vec.
+    pub fn verify(&self, reference: &ArtifactRef) -> Result<(), StoreError> {
+        let mut file = fs::File::open(&reference.absolute_path)?;
+        if file.metadata()?.len() != reference.byte_len {
+            return Err(StoreError::InvalidPublication(
+                "artifact length differs from its reference".into(),
+            ));
+        }
+        let mut hash = blake3::Hasher::new();
+        let mut scratch = [0; 64 * 1024];
+        loop {
+            let count = file.read(&mut scratch)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&scratch[..count]);
+        }
+        if hash.finalize().to_hex().as_str() != reference.content_fingerprint {
+            return Err(StoreError::InvalidPublication(
+                "artifact fingerprint differs from its reference".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Write `output` atomically and describe what was written.

@@ -14,6 +14,7 @@ pub(super) fn insert_publication(
     blob_store: &BlobStore,
     publication: Publication,
     payloads: Vec<PayloadData>,
+    capture: Option<&snapclip_model::CaptureSource>,
 ) -> Result<(), StoreError> {
     if publication.payloads.is_empty() || publication.payloads.len() != payloads.len() {
         return Err(StoreError::InvalidPublication(
@@ -61,8 +62,8 @@ pub(super) fn insert_publication(
 
     let transaction = connection.unchecked_transaction()?;
     transaction.execute(
-        "INSERT INTO clips(id, created_at_unix_ms, primary_kind, preview_text, source_app, source_exe_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO clips(id, created_at_unix_ms, primary_kind, preview_text, source_app, source_exe_path, origin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             publication.publication_id,
             publication.captured_at_unix_ms,
@@ -70,6 +71,7 @@ pub(super) fn insert_publication(
             preview_text,
             publication.source_app,
             publication.source_exe_path,
+            publication.origin.as_str(),
         ],
     )?;
 
@@ -129,6 +131,17 @@ pub(super) fn insert_publication(
             canonical_image_hash
         ],
     )?;
+    if let Some(source) = capture {
+        transaction.execute(
+            "INSERT INTO capture_sources(clip_id, artifact_path, source_json) VALUES (?1, ?2, ?3)",
+            params![
+                publication.publication_id,
+                source.artifact.absolute_path.to_string_lossy(),
+                serde_json::to_string(source)
+                    .map_err(|e| StoreError::InvalidPublication(e.to_string()))?
+            ],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }

@@ -37,6 +37,7 @@ use super::row_band_png::{ImageMeta, PngRowBandSink};
 /// Encodes through `snapclip-history` and writes through its artifact store.
 pub struct HistoryArtifactWriter {
     store: CaptureArtifactStore,
+    history: Option<snapclip_history::store::Store>,
 }
 
 impl HistoryArtifactWriter {
@@ -44,7 +45,85 @@ impl HistoryArtifactWriter {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             store: CaptureArtifactStore::new(root),
+            history: None,
         }
+    }
+
+    /// The shell injects its one database writer; tests/export tools may omit history.
+    pub fn with_history(mut self, history: snapclip_history::store::Store) -> Self {
+        self.history = Some(history);
+        self
+    }
+
+    /// Archive a panel's unchanged original, independently of its chosen export.
+    pub fn write_pixels(
+        &self,
+        metadata: &CaptureMetadata,
+        pixels: &snapclip_model::pixels::PixelBuffer,
+    ) -> CaptureResult<CaptureArtifact> {
+        if pixels.size() != [metadata.width, metadata.height]
+            || pixels.descriptor() != metadata.source.descriptor()
+        {
+            return Err(CaptureError::EncodeFailed(
+                "capture pixels differ from archive metadata".into(),
+            ));
+        }
+        let width =
+            i32::try_from(metadata.width).map_err(|e| CaptureError::EncodeFailed(e.to_string()))?;
+        let height = i32::try_from(metadata.height)
+            .map_err(|e| CaptureError::EncodeFailed(e.to_string()))?;
+        let spec = snapclip_capture::ports::SelectionSpec {
+            region: snapclip_model::Rect::new(0, 0, width, height),
+            source: metadata.source,
+            captured_at_unix_ms: metadata.captured_at_unix_ms,
+            origin: None,
+            corner_radius: 0,
+        };
+        let mut bands = WholeImage {
+            bytes: pixels.as_bytes(),
+            rows: metadata.height,
+            source: metadata.source,
+        };
+        self.write_bands(
+            &metadata.session_id,
+            &spec,
+            &mut bands,
+            metadata.dpi,
+            metadata.monitor_device_name.clone(),
+        )
+    }
+
+    fn publish_capture(
+        &self,
+        metadata: &CaptureMetadata,
+        reference: &snapclip_model::ArtifactRef,
+        thumbnail: Option<snapclip_history::thumbnail::CaptureThumbnail>,
+    ) -> CaptureResult<()> {
+        if let (Some(history), Some(thumbnail)) = (&self.history, thumbnail) {
+            let name = reference
+                .absolute_path
+                .file_name()
+                .ok_or_else(|| {
+                    CaptureError::EncodeFailed("capture artifact has no file name".into())
+                })?
+                .to_string_lossy();
+            let id = format!("capture-{}", blake3::hash(name.as_bytes()).to_hex());
+            history
+                .save_capture(
+                    id,
+                    snapclip_model::CaptureSource {
+                        metadata: metadata.clone(),
+                        artifact: reference.clone(),
+                    },
+                    thumbnail.finish().map_err(CaptureError::EncodeFailed)?,
+                )
+                .map_err(|e| {
+                    CaptureError::EncodeFailed(format!(
+                        "capture source was written but history registration failed: {e}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -155,18 +234,25 @@ impl ArtifactWriter for HistoryArtifactWriter {
             )));
         }
 
+        let metadata = CaptureMetadata {
+            session_id: session_id.into(),
+            width,
+            height,
+            dpi,
+            source: spec.source,
+            captured_at_unix_ms: spec.captured_at_unix_ms,
+            monitor_device_name,
+        };
+        let mut thumbnail = self
+            .history
+            .as_ref()
+            .map(|_| snapclip_history::thumbnail::CaptureThumbnail::new(&metadata))
+            .transpose()
+            .map_err(|e| CaptureError::EncodeFailed(e.into()))?;
+
         // HDR/linear/associated source bits belong to a pixel master, never PNG8.
         // Ordinary SDR keeps its existing streaming PNG path and memory behavior.
         if spec.source.descriptor() != snapclip_model::pixels::PixelDescriptor::bgra8() {
-            let metadata = CaptureMetadata {
-                session_id: session_id.into(),
-                width,
-                height,
-                dpi,
-                source: spec.source,
-                captured_at_unix_ms: spec.captured_at_unix_ms,
-                monitor_device_name,
-            };
             let reference = self
                 .store
                 .write_pixel_master(&metadata, |first, count| {
@@ -179,7 +265,7 @@ impl ArtifactWriter for HistoryArtifactWriter {
                             "source changed or refused a master tile".into(),
                         ));
                     }
-                    snapclip_model::pixels::PixelBuffer::from_tight(
+                    let pixels = snapclip_model::pixels::PixelBuffer::from_tight(
                         width,
                         count,
                         spec.source.descriptor(),
@@ -187,9 +273,16 @@ impl ArtifactWriter for HistoryArtifactWriter {
                     )
                     .map_err(|message| {
                         snapclip_history::StoreError::InvalidPublication(message.into())
-                    })
+                    })?;
+                    if let Some(thumbnail) = &mut thumbnail {
+                        thumbnail.push(first, &pixels).map_err(|e| {
+                            snapclip_history::StoreError::InvalidPublication(e.into())
+                        })?;
+                    }
+                    Ok(pixels)
                 })
                 .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
+            self.publish_capture(&metadata, &reference, thumbnail)?;
             return Ok(CaptureArtifact {
                 session_id: session_id.into(),
                 width,
@@ -229,6 +322,19 @@ impl ArtifactWriter for HistoryArtifactWriter {
             writer
                 .write_rows(u64::from(first), &scratch)
                 .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
+            if let Some(thumbnail) = &mut thumbnail {
+                let pixels = snapclip_model::pixels::PixelBuffer::from_tight(
+                    width,
+                    count,
+                    spec.source.descriptor(),
+                    std::mem::take(&mut scratch),
+                )
+                .map_err(|e| CaptureError::EncodeFailed(e.into()))?;
+                thumbnail
+                    .push(first, &pixels)
+                    .map_err(|e| CaptureError::EncodeFailed(e.into()))?;
+                scratch = pixels.into_bytes();
+            }
             first += count;
         }
 
@@ -238,21 +344,14 @@ impl ArtifactWriter for HistoryArtifactWriter {
 
         let output = CaptureOutput {
             bytes: artifact.bytes,
-            metadata: CaptureMetadata {
-                session_id: session_id.to_string(),
-                width,
-                height,
-                dpi,
-                source: spec.source,
-                captured_at_unix_ms: spec.captured_at_unix_ms,
-                monitor_device_name,
-            },
+            metadata,
         };
         let reference = self
             .store
             .write(&output)
             .map_err(|error| CaptureError::EncodeFailed(error.to_string()))?;
 
+        self.publish_capture(&output.metadata, &reference, thumbnail)?;
         Ok(CaptureArtifact {
             session_id: session_id.to_string(),
             width,

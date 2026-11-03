@@ -138,6 +138,22 @@ pub(super) fn migrate(connection: &Connection) -> Result<(), StoreError> {
         )?;
     }
 
+    if current < 5 {
+        transaction.execute_batch(
+            "ALTER TABLE clips ADD COLUMN origin TEXT NOT NULL DEFAULT 'clipboard'
+                 CHECK(origin IN ('clipboard', 'capture'));
+             CREATE TABLE capture_sources (
+                 clip_id TEXT PRIMARY KEY REFERENCES clips(id) ON DELETE CASCADE,
+                 artifact_path TEXT NOT NULL,
+                 source_json TEXT NOT NULL
+             );
+             CREATE INDEX capture_sources_path ON capture_sources(artifact_path);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at_unix_ms) VALUES (5, ?1)",
+            [now],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }

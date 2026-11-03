@@ -66,8 +66,11 @@ impl std::error::Error for PreviewError {}
 ///
 /// The window is `PREVIEW_MAX_PX` **output** rows, which is `PREVIEW_MAX_PX * scale` source rows:
 /// for an image shorter than that the window is the whole image (the ordinary screenshot), and for
-/// a tall capture it is the top of it. Reading stops there — the decoder never walks the other
-/// 500,000 rows, and nothing larger than one output row is ever held.
+/// a tall capture it is the top of it. Ordinary PNG8 stops decoding at this window,
+/// retaining one source row and the small output. Color-managed PNG (16 bit, ICC,
+/// cICP) uses the shared decoder's bounded whole-image budget before producing an
+/// SDR preview. New capture history already stores this small derivative and does
+/// not decode its pixel master for a list row.
 ///
 /// It is the **top** and not a centred window on purpose: the first rows of a page capture are the
 /// part a user recognises in a list, and centring would make the preview depend on a height the
@@ -78,6 +81,30 @@ pub fn row_preview_png(source: &[u8]) -> Result<Vec<u8>, PreviewError> {
     let mut reader = decoder
         .read_info()
         .map_err(|error| PreviewError::Decode(error.to_string()))?;
+    // The streaming byte path below is for ordinary sRGB PNG8. A high-depth,
+    // ICC or cICP source must be interpreted by the shared color decoder first.
+    // Only the returned row thumbnail becomes SDR; stored bytes stay untouched.
+    if reader.info().bit_depth == png::BitDepth::Sixteen
+        || reader.info().coding_independent_code_points.is_some()
+        || reader.info().icc_profile.is_some()
+    {
+        let image = snapclip_pin::decode_image(source).map_err(PreviewError::Decode)?;
+        let metadata = snapclip_model::CaptureMetadata {
+            session_id: "history-thumbnail".into(),
+            width: image.width(),
+            height: image.height(),
+            dpi: 0,
+            source: image.pixel_source(),
+            captured_at_unix_ms: 0,
+            monitor_device_name: None,
+        };
+        let mut thumbnail = snapclip_history::thumbnail::CaptureThumbnail::new(&metadata)
+            .map_err(|e| PreviewError::Decode(e.into()))?;
+        thumbnail
+            .push(0, image.pixels())
+            .map_err(|e| PreviewError::Decode(e.into()))?;
+        return thumbnail.finish().map_err(PreviewError::Encode);
+    }
     let (width, height, color_type) = {
         let info = reader.info();
         (info.width, info.height, info.color_type)
@@ -187,6 +214,55 @@ pub fn row_preview_png(source: &[u8]) -> Result<Vec<u8>, PreviewError> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn hdr_png_preview_maps_pq_to_sdr_and_keeps_original_bytes_and_alpha() {
+        use crate::capture::pixel_export::{ColorExport, encode_pixels};
+        use snapclip_model::{PixelFormat, pixels::*};
+        let descriptor = PixelDescriptor::new(
+            PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let bytes = [1.25_f32, 1.25, 1.25, 0.5, 12.5, 12.5, 12.5, 1.0]
+            .into_iter()
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let pixels = PixelBuffer::from_tight(2, 1, descriptor, bytes).unwrap();
+        let source = encode_pixels(&pixels, ColorExport::PreserveHdr).unwrap();
+        let before = source.clone();
+        let header = png::Decoder::new(Cursor::new(&source)).read_info().unwrap();
+        assert_eq!(header.info().bit_depth, png::BitDepth::Sixteen);
+        assert_eq!(
+            header
+                .info()
+                .coding_independent_code_points
+                .unwrap()
+                .transfer_function,
+            16
+        );
+        let preview = row_preview_png(&source).unwrap();
+        assert_eq!(preview[24], 8);
+        let (w, h, actual) = decode_rgba(&preview);
+        assert_eq!((w, h), (2, 1));
+        let mut expected = snapclip_model::pixel_color::to_sdr_bgra8(&pixels, 1000.)
+            .unwrap()
+            .into_bytes();
+        for p in expected.as_chunks_mut::<4>().0 {
+            p.swap(0, 2);
+        }
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                (i16::from(actual) - i16::from(expected)).abs() <= 2,
+                "{actual} != {expected}"
+            );
+        }
+        assert_eq!(
+            source, before,
+            "a preview must not rewrite the stored HDR payload"
+        );
+    }
 
     /// A tall page: dark text runs on a light background.
     fn tall_page_png(width: u32, height: u32) -> Vec<u8> {

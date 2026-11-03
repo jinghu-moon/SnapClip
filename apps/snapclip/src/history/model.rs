@@ -182,6 +182,16 @@ impl HistoryState {
         )
     }
 
+    pub(crate) fn image_request(&self, item: &ClipSummary) -> Option<(Store, PayloadRef)> {
+        Some((
+            self.store.clone(),
+            item.payloads
+                .iter()
+                .find(|p| p.kind == PayloadKind::Image)?
+                .clone(),
+        ))
+    }
+
     /// The inline spans of `item`, when it carries rich text.
     ///
     /// RTF wins over plain text, because a source that offers both is offering the richer one
@@ -234,6 +244,11 @@ impl HistoryState {
     ) -> Option<Result<(PayloadRef, PayloadKind, Vec<u8>), StoreError>> {
         let id = self.selected.as_deref()?;
         let item = self.items.iter().find(|item| item.id == id)?;
+        if item.capture_source.is_some() {
+            return Some(Err(StoreError::InvalidPublication(
+                "capture thumbnail is not a copy source; reopen capture_source".into(),
+            )));
+        }
         let payload = item
             .payloads
             .iter()
@@ -250,6 +265,14 @@ impl HistoryState {
             Err(error) => return Some(Err(error)),
         };
         Some(Ok((payload, kind, bytes)))
+    }
+
+    pub fn selected_capture(&self) -> Option<&snapclip_model::CaptureSource> {
+        self.items
+            .iter()
+            .find(|item| Some(item.id.as_str()) == self.selected.as_deref())?
+            .capture_source
+            .as_ref()
     }
 
     /// Move the selection by `delta` rows, clamped to the loaded window.

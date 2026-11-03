@@ -27,22 +27,17 @@ pub fn dib_to_png(dib: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((png, width, height))
 }
 
-/// Normalise a PNG payload: enforce the pixel cap and downscale the long side.
-/// Dimensions come from the IHDR chunk, so small images are never decoded.
+/// Preserve the original PNG payload within the source budget. OCR and row
+/// thumbnails are consumers, not reasons to replace depth, color metadata or size.
 pub fn normalize_png(png: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let (width, height) = png_dimensions(png).ok_or_else(|| "invalid png header".to_string())?;
     if u64::from(width) * u64::from(height) > MAX_DECODE_PIXELS {
         return Err("image exceeds max decode pixels".into());
     }
-    if width.max(height) <= MAX_OCR_SIDE {
-        return Ok((png.to_vec(), width, height));
+    if png.len() > 64 * 1024 * 1024 {
+        return Err("PNG exceeds 64 MiB history payload budget".into());
     }
-    let rgba = image::decode_to_rgba8(png)?;
-    let (width, height) = rgba.dimensions();
-    let (pixels, width, height) =
-        image::downscale_rgba_to_max_side(rgba.into_raw(), width, height, MAX_OCR_SIDE)?;
-    let png = image::encode_rgba_png(&pixels, width, height)?;
-    Ok((png, width, height))
+    Ok((png.to_vec(), width, height))
 }
 
 /// Cheap PNG IHDR parse — avoids a full decode just for dimensions.
@@ -68,6 +63,26 @@ use snapclip_clipboard::image::dib_to_bmp;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_png_keeps_its_original_sixteen_bit_history_payload() {
+        let pixels = ::image::ImageBuffer::<::image::Rgba<u16>, Vec<u16>>::from_pixel(
+            2048,
+            1,
+            ::image::Rgba([12345, 32768, 65535, 32768]),
+        );
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        ::image::DynamicImage::ImageRgba16(pixels)
+            .write_to(&mut encoded, ::image::ImageFormat::Png)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        let (stored, w, h) = normalize_png(&encoded).unwrap();
+        assert_eq!((w, h), (2048, 1));
+        assert_eq!(
+            stored, encoded,
+            "history must retain original depth/metadata, not an OCR-sized RGBA8 derivative"
+        );
+    }
 
     #[test]
     fn rejects_short_dib() {

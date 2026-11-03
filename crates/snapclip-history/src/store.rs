@@ -33,6 +33,12 @@ pub struct Store {
 }
 
 enum WriterRequest {
+    SaveCapture {
+        id: String,
+        source: snapclip_model::CaptureSource,
+        thumbnail: Vec<u8>,
+        response: mpsc::Sender<Result<(), StoreError>>,
+    },
     SavePublication {
         publication: Publication,
         payloads: Vec<PayloadData>,
@@ -90,6 +96,8 @@ impl Store {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let writer_blob_store = blob_store.clone();
         let writer_database_path = database_path.clone();
+        let artifacts =
+            crate::artifact_store::CaptureArtifactStore::new(root.join("artifacts/capture"));
 
         thread::Builder::new()
             .name("snapclip-db-writer".into())
@@ -111,7 +119,7 @@ impl Store {
                     return;
                 }
 
-                writer_loop(connection, writer_blob_store, writer_rx);
+                writer_loop(connection, writer_blob_store, artifacts, writer_rx);
             })
             .map_err(StoreError::Io)?;
 
@@ -151,6 +159,22 @@ impl Store {
         self.send_request(|response| WriterRequest::EnqueueOcr {
             clip_id,
             content_hash,
+            response,
+        })
+    }
+
+    /// Save a validated app-owned source reference and its bounded SDR thumbnail
+    /// atomically in SQLite. No source pixels enter the request queue.
+    pub fn save_capture(
+        &self,
+        id: String,
+        source: snapclip_model::CaptureSource,
+        thumbnail: Vec<u8>,
+    ) -> Result<(), StoreError> {
+        self.send_request(|response| WriterRequest::SaveCapture {
+            id,
+            source,
+            thumbnail,
             response,
         })
     }
@@ -326,9 +350,11 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT clips.id, clips.created_at_unix_ms, clips.primary_kind, clips.preview_text,
                     clips.source_app, clips.source_exe_path,
-                    cs.ocr_status, cs.ocr_text, cs.ocr_layout, cs.ocr_engine, cs.ocr_updated_at, cs.ocr_error_code
+                    cs.ocr_status, cs.ocr_text, cs.ocr_layout, cs.ocr_engine, cs.ocr_updated_at, cs.ocr_error_code,
+                    clips.origin, source.source_json
              FROM clips
              LEFT JOIN clip_search cs ON cs.clip_id = clips.id
+             LEFT JOIN capture_sources source ON source.clip_id = clips.id
              WHERE (?1 IS NULL OR clips.id IN (
                  SELECT clip_id FROM clip_search
                  WHERE (?2 = 1 AND rowid IN (
@@ -367,12 +393,22 @@ impl Store {
             summaries.push(ClipSummary {
                 id: row.get(0)?,
                 created_at_unix_ms: row.get(1)?,
-                origin: snapclip_model::PublicationOrigin::Clipboard,
+                origin: snapclip_model::PublicationOrigin::parse(&row.get::<_, String>(12)?)
+                    .ok_or_else(|| {
+                        StoreError::InvalidPublication("invalid stored publication origin".into())
+                    })?,
                 primary_kind: parse_payload_kind(row.get::<_, String>(2)?.as_str())?,
                 preview_text: row.get(3)?,
                 source_app: row.get(4)?,
                 source_exe_path: row.get(5)?,
                 payloads: Vec::new(),
+                capture_source: row
+                    .get::<_, Option<String>>(13)?
+                    .map(|json| {
+                        serde_json::from_str(&json)
+                            .map_err(|e| StoreError::InvalidPublication(e.to_string()))
+                    })
+                    .transpose()?,
                 ocr_status: ocr_status_raw
                     .as_deref()
                     .and_then(OcrStatus::parse)
@@ -459,15 +495,36 @@ impl Store {
     }
 }
 
-fn writer_loop(connection: Connection, blob_store: BlobStore, receiver: Receiver<WriterRequest>) {
+fn writer_loop(
+    connection: Connection,
+    blob_store: BlobStore,
+    artifacts: crate::artifact_store::CaptureArtifactStore,
+    receiver: Receiver<WriterRequest>,
+) {
     for request in receiver {
         match request {
+            WriterRequest::SaveCapture {
+                id,
+                source,
+                thumbnail,
+                response,
+            } => {
+                let _ = response.send(capture_repository::insert_capture(
+                    &connection,
+                    &blob_store,
+                    &artifacts,
+                    id,
+                    source,
+                    thumbnail,
+                ));
+            }
             WriterRequest::SavePublication {
                 publication,
                 payloads,
                 response,
             } => {
-                let result = insert_publication(&connection, &blob_store, publication, payloads);
+                let result =
+                    insert_publication(&connection, &blob_store, publication, payloads, None);
                 let _ = response.send(result);
             }
             WriterRequest::EnqueueOcr {
@@ -522,13 +579,19 @@ fn writer_loop(connection: Connection, blob_store: BlobStore, receiver: Receiver
                 ));
             }
             WriterRequest::DeletePublication { clip_id, response } => {
-                let _ = response.send(delete_publication(&connection, &blob_store, &clip_id));
+                let _ = response.send(delete_publication(
+                    &connection,
+                    &blob_store,
+                    &artifacts,
+                    &clip_id,
+                ));
             }
         }
     }
 }
 
 mod artifact_repository;
+mod capture_repository;
 mod clip_repository;
 mod connection;
 mod migration;
@@ -940,7 +1003,16 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(max_version, 4);
+        assert_eq!(max_version, 5);
+        assert_eq!(page.items[0].origin, PublicationOrigin::Clipboard);
+        assert!(page.items[0].capture_source.is_none());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM capture_sources", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

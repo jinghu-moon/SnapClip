@@ -50,6 +50,7 @@ impl PanelWindows {
             _ = previous.update(cx, |_, window, _| window.remove_window());
         }
         let options = WindowOptions {
+            color_policy: WindowColorPolicy::AutomaticHdr,
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
                 size(px(WIDTH), px(HEIGHT)),
@@ -672,9 +673,16 @@ impl SavePanel {
         self.status = Some("正在保存…".into());
         self.operation = Some(cx.spawn_in(window, async move |this, cx| {
             let template = export.name.clone();
-            let result = cx
+            let (result, archive_error) = cx
                 .background_executor()
-                .spawn(async move { export.save() })
+                .spawn(async move {
+                    let result = export.save();
+                    let archive_error = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|_| export.picture.archive_original().err());
+                    (result, archive_error)
+                })
                 .await;
             source::note_attempt(&result, &template);
             // Closing is disabled while saving, so completion and remembered sequence stay paired.
@@ -696,6 +704,10 @@ impl SavePanel {
                             crate::save::estimate::format_bytes(outcome.bytes)
                         ));
                         panel.saved_path = Some(outcome.path);
+                        if let Some(error) = archive_error {
+                            panel.status_error = true;
+                            panel.status = Some(format!("图片已保存，但历史原图未归档：{error}"));
+                        }
                     }
                     Err(error) => {
                         panel.status_error = true;

@@ -29,6 +29,7 @@ pub mod image;
 pub mod ingest;
 pub mod pixel_master;
 pub mod store;
+pub mod thumbnail;
 
 // The clipboard adapter is Win32; the stores above are plain data code, which is why the
 // crate as a whole is not Windows-gated.

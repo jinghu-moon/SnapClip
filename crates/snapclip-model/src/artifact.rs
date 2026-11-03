@@ -28,6 +28,7 @@ pub struct CaptureMetadata {
     pub session_id: String,
     pub width: u32,
     pub height: u32,
+    /// Capture DPI, or zero when the producer does not supply physical DPI.
     pub dpi: u32,
     pub source: crate::pixels::PixelSource,
     pub captured_at_unix_ms: i64,
@@ -41,6 +42,15 @@ pub struct CaptureOutput {
     /// Encoded artifact bytes (PNG today).
     pub bytes: Vec<u8>,
     pub metadata: CaptureMetadata,
+}
+
+/// Durable capture identity. A thumbnail is a derivative, never this source.
+/// Contains no pixels or GPU handles; replay reopens the checked artifact.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureSource {
+    pub metadata: CaptureMetadata,
+    pub artifact: ArtifactRef,
 }
 
 /// Where an artifact lives, plus enough about it to use it without touching the file.

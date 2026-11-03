@@ -17,7 +17,6 @@ use gpui_kit::component::{ActiveTheme, Root, Theme, ThemeMode};
 use gpui_kit::*;
 use snapclip_pin::PinManager;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub mod adapters;
 pub mod capture;
@@ -171,6 +170,7 @@ impl Shell {
         // Capture does not know pins exist; the shell is what joins the two.
         let (capture, pin_source, capture_events) = match capture::start(
             &data,
+            store.clone(),
             events.clone(),
             initial.detection_options(),
             initial.overlay_preferences(),
@@ -249,12 +249,15 @@ impl Shell {
                 }
             }
         });
+        if let (Ok(history), Some(pins)) = (&history, &pins) {
+            history.update(cx, |view, _| view.set_pins(pins.downgrade()));
+        }
         // Delayed capture uses the same application command as F6. Capture only
         // requests pinning; this application thread consumes the selection.
-        if let Some(events) = capture_events.as_ref() {
+        if let Some(capture_events) = capture_events.as_ref() {
             {
                 let commands = command_sender;
-                events.set_pin_poster(Arc::new(move || {
+                capture_events.set_pin_poster(Arc::new(move || {
                     commands
                         .try_send(tray::TrayMessage::new(tray::TrayCommand::PinLastSelection))
                         .map_err(|error| error.to_string())
@@ -276,9 +279,35 @@ impl Shell {
                 }
             })
             .detach();
-            events.set_save_opener(std::sync::Arc::new(move |pixels| {
+            let archive_store = store.clone();
+            let archive_root = data.clone();
+            let archive_events = events.clone();
+            capture_events.set_save_opener(std::sync::Arc::new(move |session_id, pixels| {
                 pixels.validate().map_err(|error| error.to_string())?;
-                let picture = crate::save_panel::Picture::from_shared_pixels(pixels.pixels.clone());
+                let mut picture =
+                    crate::save_panel::Picture::from_shared_pixels(pixels.pixels.clone());
+                if let Some(store) = &archive_store {
+                    let [width, height] = pixels.pixels.size();
+                    let metadata = snapclip_model::CaptureMetadata {
+                        session_id: session_id.into(),
+                        width,
+                        height,
+                        // This callback has no physical-DPI/monitor contract. Preserve
+                        // unknown explicitly rather than inventing the UI window's DPI.
+                        dpi: 0,
+                        source: pixels.source(),
+                        captured_at_unix_ms: pixels.frame.captured_at_unix_ms,
+                        monitor_device_name: None,
+                    };
+                    picture = picture.with_archive(
+                        crate::history::capture::CaptureArchive::new(
+                            archive_root.clone(),
+                            store.clone(),
+                            metadata,
+                        )
+                        .with_events(archive_events.clone()),
+                    );
+                }
                 requests
                     .try_send(picture)
                     .map_err(|error| format!("{error}"))
