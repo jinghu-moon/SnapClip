@@ -3964,7 +3964,7 @@ L4 `the_countdown_hud_paints_only_the_frame_the_badge_and_the_number` → 全 ok
 
 **诉求**：倒计时期间把遮罩暗色加回来（此前为了跨进程点击穿透，主浮层只留框线/手柄/角标/数字，其余是实时画面）。
 
-**为什么不能加在主浮层上**：主浮层是 DirectComposition 窗口（`WS_EX_NOREDIRECTIONBITMAP`），不能 layered。`win/window.rs` 那张实测对照表：`WS_EX_TRANSPARENT` 单独无效（只是绘制次序位）、`WS_EX_LAYERED | WS_EX_TRANSPARENT` 只对 **layered** 窗口才真的跨进程穿透、`HTTRANSPARENT` 只同线程。
+**为什么不加在主浮层上**：主浮层保留 `WS_EX_NOREDIRECTIONBITMAP` 的输入宿主，倒计时另设 layered 穿透窗口。原先把这写成“DirectComposition 不能 layered”过于宽泛：DirectComposition 支持 layered HWND 上的独立视觉树，HDR 倒计时已采用此方式，见 `docs/53-hdr-capture.md` §15。`win/window.rs` 的实测对照表仍说明：`WS_EX_TRANSPARENT` 单独无效（只是绘制次序位），`WS_EX_LAYERED | WS_EX_TRANSPARENT` 用于跨进程穿透；单独的 `HTTRANSPARENT` 不能充当整块遮罩的跨线程点击穿透合同。
 
 **方案**：`overlay/dim_layer.rs` 另开一个普通 layered 窗口当遮罩层。
 

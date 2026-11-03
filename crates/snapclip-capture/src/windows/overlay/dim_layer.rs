@@ -1,7 +1,7 @@
 //! 倒计时期间压暗选区之外的那一层，单独开一个 **layered** 窗口。
 //!
-//! 为什么必须单独一个窗口：主浮层是 DirectComposition 窗口，**不能**是 layered；而
-//! "能看见 + 鼠标穿过去到别的应用"只有 `WS_EX_LAYERED | WS_EX_TRANSPARENT` 这一条路
+//! 为什么必须单独一个窗口：主浮层要接收选区输入，而遮罩必须让鼠标穿过到别的应用。
+//! 这里保留 `WS_EX_LAYERED | WS_EX_TRANSPARENT` 的输入合同
 //! （`win/window.rs` 的对照表：单独的 `WS_EX_TRANSPARENT` 不起作用，`HTTRANSPARENT`
 //! 只覆盖同一线程）。
 //!
@@ -19,8 +19,14 @@
 //! premultiplied，交给 `UpdateLayeredWindow(ULW_ALPHA)`。内容与窗口**同尺寸**时逐行精确拷贝；
 //! 尺寸对不上就退回纯色 —— 不做 GDI 缩放：`StretchBlt(SRCCOPY)` 会把 32bpp `BI_RGB` DIB 的
 //! alpha 清零、`AlphaBlend` 在这种 DIB 上静默失败，两者都会让整块窗口变透明（docs/23 §14.55.9.11）。
+//!
+//! HDR 不经过八位 DIB：DIB 仅提供全透明输入宿主，其上方的 DirectComposition
+//! tree 持有 FP16 scRGB swap chain。微软明确允许一个 layered HWND 同时具有自己的
+//! layered bitmap 和独立的 DirectComposition tree；树不参与 hit testing。
 
 use std::ffi::c_void;
+
+use ::windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, POINT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -41,6 +47,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::geometry::Rect;
 use crate::ring_contrast::{ACCENT_RGB, MASK_ALPHA, MASK_RGB, MASK_TINT_ALPHA};
 use crate::windows::win::d2d::DimSource;
+use crate::windows::win::d3d11::CompositionTarget;
 use crate::windows::win::window::{WindowRegion, region_from_pieces};
 
 /// 窗口类名。只在第一次显示时注册。
@@ -96,6 +103,9 @@ pub(super) struct DimLayer {
     height: i32,
     /// 当前内容是否来自模糊渲染（诊断用：`true` = 模糊帧，`false` = 纯色兜底）。
     content_is_blur: bool,
+    /// Retain the GPU surface only while a composition countdown is visible.
+    composition: Option<CompositionTarget>,
+    swap_chain: Option<IDXGISwapChain1>,
 }
 
 // 窗口与 GDI 对象都由本结构独占持有，且只在浮层线程上使用。
@@ -118,8 +128,43 @@ impl DimLayer {
             ));
         }
         self.ensure_window(monitor)?;
+        self.release_composition();
         self.paint(content);
         self.submit(Some((monitor.left, monitor.top)))?;
+        self.show_ready(monitor, selection, radius)
+    }
+
+    /// Compose above a transparent layered input host. The factory draws and
+    /// presents the matching source encoding; no HDR bytes enter the host DIB.
+    pub(super) fn show_composition(
+        &mut self,
+        monitor: Rect,
+        selection: Rect,
+        radius: i32,
+        create_surface: impl FnOnce(HWND) -> Result<(CompositionTarget, IDXGISwapChain1), String>,
+    ) -> Result<(), String> {
+        if monitor.is_empty() {
+            return Err("countdown composition needs nonempty bounds".into());
+        }
+        self.ensure_window(monitor)?;
+        self.release_composition();
+        // The layered bitmap is exclusively the input/shape host. It carries
+        // neither a tone-mapped source nor a second mask behind the HDR surface.
+        unsafe { std::ptr::write_bytes(self.bits, 0, self.width as usize * self.height as usize) };
+        self.submit(Some((monitor.left, monitor.top)))?;
+        let (composition, chain) = create_surface(self.hwnd)?;
+        let description = unsafe { chain.GetDesc1() }
+            .map_err(|error| format!("countdown surface description: {error}"))?;
+        if description.Width != self.width as u32 || description.Height != self.height as u32 {
+            return Err("countdown composition size differs from its input host".into());
+        }
+        self.composition = Some(composition);
+        self.swap_chain = Some(chain);
+        self.content_is_blur = true;
+        self.show_ready(monitor, selection, radius)
+    }
+
+    fn show_ready(&mut self, monitor: Rect, selection: Rect, radius: i32) -> Result<(), String> {
         self.apply_shape(monitor, selection, radius)?;
         self.exclude_from_capture();
         unsafe {
@@ -155,6 +200,12 @@ impl DimLayer {
         if !self.hwnd.is_null() {
             unsafe { ShowWindow(self.hwnd, SW_HIDE) };
         }
+        self.release_composition();
+    }
+
+    fn release_composition(&mut self) {
+        self.composition = None;
+        self.swap_chain = None;
     }
 
     /// 仅供测试：临时摘掉/恢复"排除出截图"，这样截图-based 观测才能看见它。
@@ -193,7 +244,13 @@ impl DimLayer {
             let pixel = unsafe { *self.bits };
             pixel.to_le_bytes()
         };
-        let content = if self.content_is_blur { "blur" } else { "flat" };
+        let content = if self.composition.is_some() {
+            "composition"
+        } else if self.content_is_blur {
+            "blur"
+        } else {
+            "flat"
+        };
         format!(
             "hwnd={:?} content={} is_window={} visible={} rect=({},{},{},{}) dib=({}, {}) first_px={:?} affinity=0x{:x}(ok={}) style_complete={}",
             self.hwnd,
@@ -214,8 +271,13 @@ impl DimLayer {
     }
 
     fn ensure_window(&mut self, monitor: Rect) -> Result<(), String> {
-        if !self.hwnd.is_null() {
+        if !self.hwnd.is_null() && self.width == monitor.width() && self.height == monitor.height()
+        {
             return Ok(());
+        }
+        if !self.hwnd.is_null() {
+            // A monitor-size change invalidates both the DIB and its GPU host.
+            *self = Self::default();
         }
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         if instance.is_null() {
@@ -435,15 +497,17 @@ impl DimLayer {
 
 impl Drop for DimLayer {
     fn drop(&mut self) {
+        self.release_composition();
         unsafe {
             if !self.hwnd.is_null() {
                 DestroyWindow(self.hwnd);
             }
-            if !self.bitmap.is_null() {
-                DeleteObject(self.bitmap as _);
-            }
+            // A selected bitmap cannot be deleted. Release the DC before its DIB.
             if !self.memory_dc.is_null() {
                 DeleteDC(self.memory_dc);
+            }
+            if !self.bitmap.is_null() {
+                DeleteObject(self.bitmap as _);
             }
         }
         self.hwnd = std::ptr::null_mut();
@@ -474,6 +538,128 @@ unsafe extern "system" fn wndproc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "L3: short-lived nonactivating test window and GPU composition; no capture or input injection"]
+    fn hdr_composition_keeps_the_click_through_window_contract_and_releases_on_hide() {
+        use crate::windows::win::{d2d::OverlayRenderer, d3d11::GraphicsDevice};
+        use snapclip_model::PixelFormat;
+        use snapclip_model::pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding};
+        use std::sync::Arc;
+        use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, GetWindowRgn, PtInRegion};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId, WindowFromPoint,
+        };
+        let foreground = unsafe { GetForegroundWindow() };
+        let point = POINT { x: 164, y: 164 };
+        let underneath = unsafe { WindowFromPoint(point) };
+        assert!(!underneath.is_null());
+        let mut underneath_process = 0;
+        assert_ne!(
+            unsafe { GetWindowThreadProcessId(underneath, &mut underneath_process) },
+            0
+        );
+        assert_ne!(
+            underneath_process,
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() },
+            "the hit-through comparison must target another process"
+        );
+        let device = Arc::new(GraphicsDevice::create().unwrap());
+        let mut renderer = OverlayRenderer::new(device.clone(), 96).unwrap();
+        let descriptor = PixelDescriptor::new(
+            PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        renderer.configure_source(descriptor, Some(160.)).unwrap();
+        renderer.ensure_back_buffer(32, 32).unwrap();
+        let bytes = [0.5_f32, 2., 0.25, 1.]
+            .into_iter()
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect::<Vec<_>>()
+            .repeat(32 * 32);
+        renderer
+            .update_pixels(&PixelBuffer::from_tight(32, 32, descriptor, bytes).unwrap())
+            .unwrap();
+        let mut layer = DimLayer::default();
+        let monitor = Rect::new(160, 160, 192, 192);
+        let selection = Rect::new(168, 168, 184, 184);
+        let create = |hwnd| {
+            let chain = renderer.countdown_swap_chain()?;
+            let composition =
+                renderer.composition_target(::windows::Win32::Foundation::HWND(hwnd))?;
+            composition.attach(&chain)?;
+            Ok((composition, chain))
+        };
+        layer
+            .show_composition(monitor, selection, 4, create)
+            .unwrap();
+        assert!(layer.composition.is_some());
+        let chain = layer.swap_chain.as_ref().unwrap();
+        let desc = unsafe { chain.GetDesc1() }.unwrap();
+        assert_eq!(
+            desc.Format,
+            ::windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT
+        );
+        assert_eq!((desc.Width, desc.Height), (32, 32));
+        assert_eq!(
+            unsafe { *layer.bits },
+            0,
+            "HDR pixels must not be copied into the eight-bit input host"
+        );
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+        assert_eq!(
+            unsafe { WindowFromPoint(point) },
+            underneath,
+            "composition must not add a mouse target"
+        );
+        assert_eq!(
+            unsafe { GetWindowLongPtrW(layer.hwnd, -20) } as u32 & ex_style_required(),
+            ex_style_required()
+        );
+        let mut affinity = 0;
+        assert_ne!(
+            unsafe { GetWindowDisplayAffinity(layer.hwnd, &mut affinity) },
+            0
+        );
+        assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE);
+        let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+        assert_ne!(unsafe { GetWindowRgn(layer.hwnd, region) }, 0);
+        assert_ne!(unsafe { PtInRegion(region, 2, 2) }, 0);
+        assert_ne!(
+            unsafe { PtInRegion(region, 8, 8) },
+            0,
+            "the rounded-hole corner wedge must remain dimmed"
+        );
+        assert_eq!(unsafe { PtInRegion(region, 16, 16) }, 0);
+        unsafe { DeleteObject(region as _) };
+        layer
+            .update(monitor, Rect::new(170, 170, 188, 188), 4)
+            .unwrap();
+        layer.hide();
+        assert_eq!(unsafe { IsWindowVisible(layer.hwnd) }, 0);
+        assert!(layer.composition.is_none() && layer.swap_chain.is_none());
+        assert!(
+            layer
+                .show_composition(monitor, selection, 4, |_| Err(
+                    "injected surface failure".into()
+                ))
+                .is_err()
+        );
+        assert!(layer.composition.is_none() && layer.swap_chain.is_none());
+        // A later SDR fallback cannot retain or double-composite the HDR surface.
+        layer.show(monitor, selection, 0, None).unwrap();
+        assert_eq!(unsafe { (*layer.bits).to_le_bytes() }, dim_pixel());
+        assert!(layer.composition.is_none());
+        // Reusing the host on another monitor size must resize the DIB as well.
+        layer
+            .show(Rect::new(160, 160, 208, 200), selection, 0, None)
+            .unwrap();
+        assert_eq!((layer.width, layer.height), (48, 40));
+        layer.hide();
+        assert_eq!(unsafe { GetForegroundWindow() }, foreground);
+    }
 
     #[test]
     fn the_dim_pixel_is_the_single_layer_equivalent_of_the_overlay_mask() {

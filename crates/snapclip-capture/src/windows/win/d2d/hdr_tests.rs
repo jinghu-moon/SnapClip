@@ -310,3 +310,86 @@ fn hdr_loupe_center_uses_the_source_not_the_sdr_sampler_or_crosshair() {
         [expected[0], expected[1], expected[2], 1.],
     );
 }
+
+#[test]
+#[ignore = "L4: offscreen HDR countdown composition; no desktop capture or system changes"]
+fn hdr_countdown_composes_fp16_without_reading_or_replacing_the_source() {
+    let device = Arc::new(GraphicsDevice::create().unwrap());
+    let mut renderer = OverlayRenderer::new(device.clone(), 96).unwrap();
+    let descriptor = color::OverlayColor::sc_rgb(160.).unwrap().descriptor();
+    renderer.configure_source(descriptor, Some(160.)).unwrap();
+    renderer.ensure_back_buffer(64, 48).unwrap();
+    let source = [-0.25, 12.5, 0.5, 1.];
+    let bytes = source
+        .into_iter()
+        .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+        .collect::<Vec<_>>()
+        .repeat(64 * 48);
+    let pixels = PixelBuffer::from_tight(64, 48, descriptor, bytes.clone()).unwrap();
+    let frame = device.create_pixel_texture(&pixels).unwrap();
+    renderer
+        .set_frame_texture(64, 48, &frame.texture, descriptor)
+        .unwrap();
+    let target = device
+        .create_render_target_texture(64, 48, PixelFormat::Rgba16Float)
+        .unwrap();
+    let bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &renderer.d2d,
+        &target.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+    let previous_target = unsafe { renderer.d2d.GetTarget() }.unwrap();
+    renderer.paint_countdown_dim(&bitmap).unwrap();
+    assert_eq!(
+        unsafe { renderer.d2d.GetTarget() }.unwrap().as_raw(),
+        previous_target.as_raw(),
+        "countdown painting must restore the main overlay target"
+    );
+    let chain = renderer.countdown_swap_chain().unwrap();
+    let description = unsafe { chain.GetDesc1() }.unwrap();
+    assert_eq!(
+        description.Format,
+        super::super::d3d11::dxgi_format(PixelFormat::Rgba16Float)
+    );
+    assert_eq!((description.Width, description.Height), (64, 48));
+    let output = device
+        .read_back_pixels(&target.texture, [0, 0, 64, 48], descriptor)
+        .unwrap();
+    let p = sample(&output, 32, 24);
+    let tint = [0.013702083, 0.17788842, 0.7083758];
+    let rgb: [f32; 3] = std::array::from_fn(|c| {
+        source[c] * (1. - MASK_ALPHA) * (1. - MASK_TINT_ALPHA) + tint[c] * 2. * MASK_TINT_ALPHA
+    });
+    close(p, [rgb[0], rgb[1], rgb[2], 1.]);
+    assert!(
+        p[0] < 0. && p[1] > 1.,
+        "the countdown surface must retain floating-point range"
+    );
+    assert_eq!(
+        device
+            .read_back_pixels(&frame.texture, [0, 0, 64, 48], descriptor)
+            .unwrap()
+            .as_bytes(),
+        bytes
+    );
+    let sdr = device
+        .create_render_target_texture(64, 48, PixelFormat::Bgra8Unorm)
+        .unwrap();
+    let sdr_bitmap = super::super::d3d11::create_bitmap_from_texture(
+        &renderer.d2d,
+        &sdr.texture,
+        D2D1_BITMAP_OPTIONS_TARGET,
+        D2D1_ALPHA_MODE_PREMULTIPLIED,
+    )
+    .unwrap();
+    assert!(
+        renderer.paint_countdown_dim(&sdr_bitmap).is_err(),
+        "an HDR source cannot be silently drawn to an SDR countdown target"
+    );
+    assert!(
+        renderer.countdown_dim_source(1).is_err(),
+        "the explicit eight-bit readback path must still reject HDR"
+    );
+}

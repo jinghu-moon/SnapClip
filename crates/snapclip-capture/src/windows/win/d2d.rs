@@ -1066,6 +1066,7 @@ impl OverlayRenderer {
             let output: ID2D1Image = blur
                 .cast()
                 .map_err(|error| super::hresult("ID2D1Effect::cast", &error))?;
+            let previous = self.d2d.GetTarget().ok();
             self.d2d.SetTarget(&blurred);
             self.d2d.BeginDraw();
             self.d2d.DrawImage(
@@ -1076,6 +1077,7 @@ impl OverlayRenderer {
                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
             let ended = self.d2d.EndDraw(None, None);
+            self.d2d.SetTarget(previous.as_ref());
             // The effect holds its input; let go of the frame so dropping it frees it.
             blur.SetInput(0, None::<&ID2D1Image>, true);
             ended.map_err(|error| super::hresult("ID2D1DeviceContext::EndDraw(blur)", &error))?;
@@ -1095,8 +1097,7 @@ impl OverlayRenderer {
             return Err("HDR countdown requires a composition surface; the BGRA8 layered path is unsupported".into());
         }
         self.ensure_blurred_frame()?;
-        let (Some(frame), Some(blurred)) = (self.frame_bitmap.clone(), self.blurred_frame.clone())
-        else {
+        let Some(frame) = self.frame_bitmap.clone() else {
             return Err("倒计时遮罩：没有冻结帧或模糊帧".to_owned());
         };
         let full = unsafe { frame.GetPixelSize() };
@@ -1119,37 +1120,7 @@ impl OverlayRenderer {
         .map_err(|error| {
             super::hresult("ID2D1DeviceContext::CreateBitmap(dim readback)", &error)
         })?;
-        let (Some(mask), tint) = (self.mask_brush.clone(), self.mask_tint_brush.clone()) else {
-            return Err("倒计时遮罩：遮罩画刷未创建".to_owned());
-        };
-        let previous = unsafe { self.d2d.GetTarget() }.ok();
-        let area = to_d2d(Rect::from_origin_size(
-            Point::new(0, 0),
-            width as i32,
-            height as i32,
-        ));
-        unsafe {
-            self.d2d.SetTarget(&target);
-            self.d2d.BeginDraw();
-            let clear = color(0.0, 0.0, 0.0, 0.0);
-            self.d2d.Clear(Some(&clear));
-            // 缩小是 4× 以上、源已经模糊过，双线性就够（没有高频可混叠）。
-            self.d2d.DrawBitmap(
-                &blurred,
-                Some(&area),
-                1.0,
-                D2D1_INTERPOLATION_MODE_LINEAR,
-                None,
-                None,
-            );
-            // 与正常截图态同一组画刷：先黑色遮罩，再那一点点主题色。
-            self.d2d.FillRectangle(&area, &mask);
-            if let Some(tint) = tint.as_ref() {
-                self.d2d.FillRectangle(&area, tint);
-            }
-            self.d2d.EndDraw(None, None)
-        }
-        .map_err(|error| super::hresult("ID2D1DeviceContext::EndDraw(dim)", &error))?;
+        self.paint_countdown_dim(&target)?;
         unsafe { readback.CopyFromBitmap(None, &target, None) }
             .map_err(|error| super::hresult("ID2D1Bitmap1::CopyFromBitmap(dim)", &error))?;
         let mapped = unsafe { readback.Map(D2D1_MAP_OPTIONS_READ) }
@@ -1166,14 +1137,77 @@ impl OverlayRenderer {
             };
         }
         let _ = unsafe { readback.Unmap() };
-        if let Some(previous) = previous {
-            unsafe { self.d2d.SetTarget(&previous) };
-        }
         Ok(DimSource {
             width,
             height,
             pixels,
         })
+    }
+
+    /// Paint the existing blurred frame and mask to a matching-color GPU target.
+    /// No readback occurs. Always restore the prior D2D target, including draw failure.
+    pub(crate) fn paint_countdown_dim(&mut self, target: &ID2D1Bitmap1) -> Result<(), String> {
+        if unsafe { target.GetPixelFormat() }.format
+            != super::d3d11::dxgi_format(self.color.format())
+        {
+            return Err("countdown target differs from the source color contract".into());
+        }
+        self.ensure_blurred_frame()?;
+        let blurred = self
+            .blurred_frame
+            .clone()
+            .ok_or("countdown has no blurred source")?;
+        let mask = self
+            .mask_brush
+            .clone()
+            .ok_or("countdown mask brush is missing")?;
+        let tint = self.mask_tint_brush.clone();
+        let size = unsafe { target.GetPixelSize() };
+        let area = to_d2d(Rect::from_origin_size(
+            Point::new(0, 0),
+            size.width as i32,
+            size.height as i32,
+        ));
+        let previous = unsafe { self.d2d.GetTarget() }.ok();
+        let drawn = unsafe {
+            self.d2d.SetTarget(target);
+            self.d2d.BeginDraw();
+            self.d2d.Clear(Some(&color(0., 0., 0., 0.)));
+            self.d2d.DrawBitmap(
+                &blurred,
+                Some(&area),
+                1.,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                None,
+                None,
+            );
+            self.d2d.FillRectangle(&area, &mask);
+            if let Some(tint) = tint.as_ref() {
+                self.d2d.FillRectangle(&area, tint);
+            }
+            let result = self.d2d.EndDraw(None, None);
+            self.d2d.SetTarget(previous.as_ref());
+            result
+        };
+        drawn.map_err(|error| super::hresult("ID2D1DeviceContext::EndDraw(dim)", &error))
+    }
+
+    /// A composition-only countdown surface in the frozen source encoding.
+    pub(crate) fn countdown_swap_chain(&mut self) -> Result<IDXGISwapChain1, String> {
+        let frame = self
+            .frame_bitmap
+            .as_ref()
+            .ok_or("countdown has no frozen source")?;
+        let size = unsafe { frame.GetPixelSize() };
+        let chain = self.device.create_composition_swap_chain(
+            size.width,
+            size.height,
+            self.color.format(),
+        )?;
+        let target = self.device.create_target_bitmap(&self.d2d, &chain)?;
+        self.paint_countdown_dim(&target)?;
+        self.device.present(&chain)?;
+        Ok(chain)
     }
 
     /// 遮罩层那两张位图的属性：一张可画（目标），一张只能读（读回）。

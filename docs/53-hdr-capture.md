@@ -458,3 +458,33 @@ Yue core 增加 Windows `WindowOptions::is_activatable`，将持久无激活与�
 日志：`target/hdr-p3g-{sampler-before,scheduler-before,scheduler-red,sampler-pure,gpu,gpu-release,d2d-ui,workspace,capture-final,capture-clippy}.log`。依赖快照继续隔离并行虚拟列表改造；默认 `cargo fmt --all` 在其缺失的 showcase `virtual_list/tests.rs` 处失败，不能称默认工作树全量格式检查通过。
 
 测试使用离屏纹理，不截图、不写系统剪贴板、不切换 HDR 设置。实际 HDR 屏幕、放大镜各 DPI 下的文字可读性和真实复制操作仍需产品验收；§11 的倒计时＋取色组合项保持未勾选，直到 composition 倒计时也有对应证据。
+
+## 15. HDR composition 倒计时（P3-H，2026-11-03）
+
+### 15.1 输入宿主和颜色表面
+
+P3-G 已提交推送为 `de39fa9`。本批保留倒计时既有的独立 layered 输入窗口、鼠标穿透、无激活、topmost、工具窗口、截图排除及圆角洞口，在其全透明 DIB **上方**挂载独立 DirectComposition 树。树持有与冻结来源一致的 FP16 scRGB swap chain；模糊和遮罩复用原 D2D 资源／输出白，不读回 HDR 像素、不经过八位内容、不重新解释来源峰值。
+
+这一点纠正了旧文档中过宽的“DirectComposition 不能 layered”：微软 [Basic concepts](https://learn.microsoft.com/en-us/windows/win32/directcomp/basic-concepts) 的 Window composition 描述了 layered bitmap 和独立 composition tree 并存；[IDCompositionDevice::CreateTargetForHwnd](https://learn.microsoft.com/en-us/windows/win32/api/dcomp/nf-dcomp-idcompositiondevice-createtargetforhwnd) 也明确允许顶层或 layered window。视觉树不负责输入命中，本项目的输入合同仍由 layered HWND 样式与窗口区域实现。未改主浮层的既有输入机制。
+
+SDR 倒计时保留原 BGRA8 内容路径，与 HDR 共用一次模糊＋遮罩绘制函数。HDR composition 创建／尺寸检查失败时，明确记录错误并使用既有的纯 UI 色遮罩；**不**把 HDR 冻帧偷偷转成 PNG8／DIB。圆角洞口移动只更新 window region，不重新上传颜色表面；隐藏时先隐藏窗口，再清除 composition 和 swap-chain 引用。再次显示为 SDR 时不会叠上旧 HDR 图层。监视器尺寸变化会重建 DIB；释放前先销毁选择了 DIB 的 DC，避免对仍被选中的 bitmap 调用无效删除。
+
+这里仍保留输入宿主的透明 DIB（4 bytes/pixel），HDR flip swap chain 另有两块 FP16 缓冲；没有宣称零额外内存。VRAM／RSS 的实际峰值和重复替换后回收，继续属于 §11 的性能验收项。
+
+### 15.2 修改前后证据
+
+新增测试还查到原有 `ensure_blurred_frame` 在首次生成模糊帧后未恢复原 D2D target。先记录真实失败（`hdr-p3h-target-restore-before.log`），再在结束绘制后立即恢复旧 target，包括 EndDraw 失败分支；倒计时绘制也恢复入口 target。没有改为弱化地址断言或删除旧行为测试。
+
+| 验证 | 实际结果 |
+| --- | --- |
+| 新离屏 HDR 倒计时 | Debug／Release 各 **1** 通过；FP16 格式／尺寸、负通道和 >1 高亮、线性遮罩数值、来源逐字节不变、主 target 恢复、SDR 目标拒绝 |
+| D2D HDR 全模块 | **4** 项实际执行通过，包括上一批的原色中心格、UI 输出白、alpha 和标注导出 |
+| 短暂原生窗口合同 probe | **1** 通过；实际 layered／transparent／noactivate／topmost／toolwindow、`WindowFromPoint` 目标不变、前台 HWND 不变、截图排除标志、圆角区域、隐藏清除引用、创建失败后纯色回退、不同尺寸重建 |
+| 原有 SDR 倒计时模糊 GPU 测试 | **1** 通过；模糊局部对比度与压暗阈值保留 |
+| 普通 workspace lib、串行、隔离依赖 | **1224** 通过；Capture 568 通过／88 ignored，测试总数未减少；子进程重复项不另计 |
+| 格式／差异 | `cargo fmt -p snapclip-capture -- --check`、`git diff --check` 通过 |
+| strict Clippy | 仍未通过（lib 42、lib test 74 项）；按“诊断＋文件”对照 P3-G，新增与消失的诊断均为 0，没有扩大 allow 或删除测试 |
+
+日志为 `target/hdr-p3h-{countdown-before,target-restore-before,d2d-gpu,countdown-release,window-contract,sdr-blur,workspace,capture-clippy}.log`。仍使用前述隔离依赖，不把并行虚拟列表工作树当作已经通过。窗口 probe 只创建短暂、无激活的测试内容，没有截取桌面、注入输入、写剪贴板或改变 HDR 设置。
+
+这些证据证明内部颜色链路和原生输入宿主合同；未宣称已经验证 DWM 在真实 HDR 屏上的最终亮度、圆角外观、跨屏／各 DPI、完整倒计时触发截图或资源峰值。因此 §11 的产品级项暂不勾选；剩余 F6 宿主替换、历史母版引用与回放、AVIF 生产门禁、性能与实机矩阵继续执行，普通捕获入口的 preserving 门禁保持关闭。

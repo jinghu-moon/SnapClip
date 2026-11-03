@@ -222,9 +222,13 @@ pub fn region_from_pieces(
 /// | --- | --- |
 /// | none (overlay in the way) | the overlay |
 /// | `WS_EX_TRANSPARENT` | the overlay — **does not work** |
-/// | `WS_EX_LAYERED \| WS_EX_TRANSPARENT` | the page (but a DirectComposition window cannot be layered) |
+/// | `WS_EX_LAYERED \| WS_EX_TRANSPARENT` | the page (used by the countdown's separate input host) |
 /// | `HTTRANSPARENT` from `WM_NCHITTEST` | **the page — the lever we use** |
 /// | a hole in the window region | the overlay — does not work |
+///
+/// DirectComposition itself supports layered HWNDs: the countdown attaches its
+/// own FP16 tree above a transparent layered bitmap (docs/53 section 15). The
+/// main overlay retains its existing no-redirection input contract.
 ///
 /// So the overlay's own window procedure decides, and this flag is the only thing that crosses
 /// threads: a plain atomic the procedure reads. The guard is scoped to the single accessibility call

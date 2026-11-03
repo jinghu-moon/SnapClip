@@ -177,6 +177,36 @@ impl OverlayController {
             return;
         };
         let selection = self.session.selection();
+        let hdr = self.frozen.as_ref().is_some_and(|frozen| {
+            frozen.frame.source.descriptor().encoding()
+                == snapclip_model::pixels::PixelEncoding::ScRgb
+        });
+        if hdr {
+            let started = Instant::now();
+            let radius = self.corner_radius_px as i32;
+            let renderer = self.renderer.as_mut().expect("renderer checked above");
+            let shown = self
+                .dim_layer
+                .show_composition(monitor, selection, radius, |hwnd| {
+                    renderer.countdown_composition(::windows::Win32::Foundation::HWND(hwnd))
+                });
+            if let Err(error) = shown {
+                // A failed HDR surface never falls through to an eight-bit image
+                // conversion. Only the existing flat UI tint is an explicit fallback.
+                eprintln!(
+                    "[snapclip][capture] HDR countdown composition failed; using flat UI tint: {error}"
+                );
+                if let Err(error) = self.dim_layer.show(monitor, selection, radius, None) {
+                    eprintln!("[snapclip][capture] countdown flat fallback failed: {error}");
+                }
+            }
+            eprintln!(
+                "[snapclip][capture] countdown HDR dim: total_ms={} {}",
+                started.elapsed().as_millis(),
+                self.dim_layer.diagnose()
+            );
+            return;
+        }
         // 内容优先用「冻帧 + 模糊 + 压暗」那一帧：只给纯色会比正常截图态少一层模糊
         // （docs/23 §14.55.9.11）。渲染与读回都在帧之外做，按 1/DIM_DIVISOR 分辨率降级；
         // 拿不到就退回纯色 —— 少一层模糊也比阻断倒计时强。

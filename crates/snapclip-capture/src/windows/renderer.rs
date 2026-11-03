@@ -293,6 +293,24 @@ impl Win32Renderer {
         self.d2d.countdown_dim_source(divisor)
     }
 
+    /// Draw the countdown on the GPU and bind it above a transparent input host.
+    /// A layered HWND can own a DirectComposition tree independently of its DIB.
+    pub(crate) fn countdown_composition(
+        &mut self,
+        window: ::windows::Win32::Foundation::HWND,
+    ) -> Result<
+        (
+            CompositionTarget,
+            ::windows::Win32::Graphics::Dxgi::IDXGISwapChain1,
+        ),
+        String,
+    > {
+        let chain = self.d2d.countdown_swap_chain()?;
+        let composition = self.d2d.composition_target(window)?;
+        composition.attach(&chain)?;
+        Ok((composition, chain))
+    }
+
     pub fn render(
         &mut self,
         state: &OverlayFrameState,
