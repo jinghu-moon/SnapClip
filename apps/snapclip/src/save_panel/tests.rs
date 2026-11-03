@@ -40,6 +40,63 @@ fn hdr_picture_default_preserves_source_and_explicit_sdr_is_a_derivative() {
 }
 
 #[::core::prelude::v1::test]
+fn hdr_formats_are_gated_by_the_production_encoder_not_transitive_codec_dependencies() {
+    use snapclip_model::pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding};
+    let descriptor = PixelDescriptor::new(
+        snapclip_model::PixelFormat::Rgba16Float,
+        PixelEncoding::ScRgb,
+        AlphaMode::Straight,
+    )
+    .unwrap();
+    let bytes = [12.5_f32, 2.5375, 0.25, 0.5]
+        .into_iter()
+        .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+        .collect::<Vec<_>>();
+    let picture = Arc::new(Picture::from_pixels(
+        PixelBuffer::from_tight(1, 1, descriptor, bytes.clone()).unwrap(),
+    ));
+    let mut export = Export {
+        color_export: ColorExport::PreserveHdr,
+        picture: picture.clone(),
+        output: Size::new(1, 1),
+        directory: std::env::temp_dir().to_string_lossy().into_owned(),
+        name: "hdr-gate-test".into(),
+        format: SaveFormat::Png,
+        tier: 1,
+        fill: [255; 3],
+        date: "2026-11-04".into(),
+        time: "1200".into(),
+        sequence: 1,
+        conflict: ConflictPolicy::Overwrite,
+        limit: None,
+    };
+    let encoded = export.encoded_bytes().unwrap();
+    let decoded = snapclip_pin::decode_image(&encoded).unwrap();
+    assert!(decoded.is_hdr());
+    assert_eq!(decoded.pixels().size(), [1, 1]);
+    let pixel = snapclip_model::pixel_color::linear_rgba(decoded.pixels())
+        .next()
+        .unwrap();
+    assert!(pixel[0] > 1.0);
+    assert!((pixel[3] - 0.5).abs() < 0.001);
+    for format in [SaveFormat::Jpeg, SaveFormat::Webp, SaveFormat::Bmp] {
+        export.format = format;
+        assert!(
+            export
+                .encoded_bytes()
+                .unwrap_err()
+                .message()
+                .contains("保留 HDR 仅支持 PNG16")
+        );
+    }
+    assert!(
+        serde_json::from_str::<SaveFormat>("\"avif\"").is_err(),
+        "AVIF must stay unavailable until a production HDR encoder/decoder is verified"
+    );
+    assert_eq!(picture.original_pixels().as_bytes(), bytes);
+}
+
+#[::core::prelude::v1::test]
 fn preview_decodes_the_exact_bytes_written_by_each_encoder() {
     let directory = std::env::temp_dir().join(format!(
         "snapclip-yue-preview-roundtrip-{}",

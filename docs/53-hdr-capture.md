@@ -1,6 +1,6 @@
 # 53 · HDR 捕获、母版、保存面板与贴图接入方案
 
-初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制及历史保真源已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§17。AVIF 生产证据、资源性能与真实 HDR/双屏/DPI/设备恢复仍未验收，App/Capture 全仓 strict Clippy 尚未通过；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
+初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源与有界导出已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§21。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；AVIF 门禁关闭，真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收，App/Capture 全仓 strict Clippy 尚未通过；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
 
 通用像素、色彩、GPUI／Windows输出、依赖选择及官方资料统一见相邻Yue仓库的 [27 · Windows HDR图片与显示管线](../../GPUI-Yue-Component/docs/27-hdr-pipeline.md)。本文只定义SnapClip的业务和迁移，不复制第二套HDR框架。
 
@@ -590,3 +590,76 @@ cargo test -p snapclip-app --test regression_baseline --test ui --features test-
 ```
 
 本机隔离配置仅用于剥离 Yue 并行虚拟列表改动，仍非产品默认构建配置。上述修复不代替剩余 HDR 实机和资源性能验收。
+
+## 19. 历史原图的有界导出（2026-11-04）
+
+历史工具栏新增“导出 HDR PNG…”／“导出 SDR PNG…”，使用系统保存对话框，取消后恢复可操作。导出直接从持久源读行带，不调用受 256 MiB 交互预算限制的整图回放，也不把缩略图当作原图。256 MiB 的打开／复制上限保持不变，导出和交互是不同的资源合同。
+
+- `capture/pixel_export.rs::write_capture_source_png` 对 SCPX 核对完整 encoded hash、元数据及每块原始像素 hash，再有界读行；scRGB 生成 Rec.2020/PQ PNG16+cICP，SDR/relative 来源执行明确 SDR 策略。原生 SDR PNG 以 64 KiB scratch 流式复制并校验长度／fingerprint，保留原始编码字节。
+- `history/capture.rs::export_source` 先用保存服务解析实际目标，防止去除文件名尾部点／空格后绕过同源保护。禁止覆盖历史保真源；工作线程承担验证和编码，UI 不同步读大文件。
+- `save/service.rs::commit_stream` 共用现有名称校验、取消点、flush 与原子 rename。源损坏或编码失败丢弃本次 partial、保留旧目标；创建 partial 失败时不得清理其他写入者的文件。
+
+最后一点修复了真实旧缺陷：旧实现把 `create_new` 放在带无条件错误清理的闭包内，遇到已存在的 partial 会误删它。将该片段恢复为旧实现后，新测试真实失败（`target/hdr-save-partial-red.log`）；恢复修复后保存服务 **15 passed**。历史消费测试 **8 passed**，覆盖 SDR 原编码相等、HDR 位深／PQ／Alpha／尺寸、损坏 SDR/HDR 不替代旧目标、规范化目标同源保护，以及 360 DIP 真实按钮→取消→再次导出→原图查看的组件交互。日志 `target/hdr-history-export-final.log`。
+
+## 20. AVIF 生产证据门禁（2026-11-04）
+
+本次检查的是当前实际构建的 GPUI 应用，并非旧文档或工具中 codec 名称的存在：
+
+| 核查层 | 当前事实 | 产品决定 |
+| --- | --- | --- |
+| `snapclip-capture::save_format::SaveFormat` | 仅 PNG/JPEG/WebP/BMP；反序列化 `avif` 被拒绝 | 不提供虚假 AVIF 格式选项 |
+| `save_panel::Export::encoded_bytes` | 保留 HDR 只有 PNG16；JPEG/WebP/BMP 必须选择 SDR | HDR 不被悄悄量化为八位 |
+| App／Pin Cargo manifest | 没有 `zenavif`／`zenravif`／`rav1d-safe` 的生产依赖 | 旧 §49 研究结果不能直接复用为生产通过证据 |
+| 当前 Windows App 依赖树 | `cargo tree -p snapclip-app -e features -i ravif` 输出 nothing to print；根 lock 有该包不代表 App 使用 | 不依赖 lock 中未启用包推导能力 |
+| HDR AVIF 像素与标签 | 尚无生产 encoder→container→生产 decoder 的高位深、ICC/nclx、Alpha 回读证据 | 门禁关闭；不宣称 HDR AVIF 可用 |
+| 许可与性能 | 尚无当前生产候选 feature 图、实际许可证及 4K/45MP 占用证据 | 不给 Yue 默认引入新 codec／许可义务 |
+
+新增生产合同测试 `save_panel::tests::hdr_formats_are_gated_by_the_production_encoder_not_transitive_codec_dependencies`：真实调用当前 Export，PNG16 经当前 Pin 解码仍保留 >1 高光与透明度，所有非 PNG 格式明确拒绝保留 HDR，AVIF 配置明确拒绝，原始像素不改变。此项验证的是门禁，不是 AVIF 功能完成。
+
+后续放行须同时具备：当前生产编码与解码的确定版本和 feature、可分发许可、自行生成的已知亮度／Alpha／元数据冲突小 fixture、真实数值回读、取消／损坏处理和 Release 峰值／耗时。未核实的本地 12 位 AVIF 不当作金标准；不为凑齐格式数量引入未经验证的依赖。
+
+## 21. Release 有界处理、原生生命周期与回归（2026-11-04）
+
+### 21.1 4K 与 45MP 的实际资源测量
+
+`apps/snapclip/tests/hdr_resources.rs` 在独立 Release 进程中调用生产 `HistoryArtifactWriter.with_history` → SCPX/SDR thumbnail/数据库 → `write_capture_source_png` → `commit_stream`。输入由逐行合成器生成，测量前后都不分配完整整图；包含负 scRGB（位于 Rec.2020 色域内）、>1 高光和彩色透明像素。用全局 allocator 记录所有 Rust 堆分配，另每 5ms 采样进程 working set，查询失败直接失败。
+
+| 尺寸／阶段 | 耗时 | Rust 堆增量峰值 | 最大单次分配 | 采样 working set 峰值 | 完整 FP16 整图分配 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 3840×2160 归档＋缩略图＋DB | 413.843ms | 6,996,428 B | 4,177,920 B | 21,278,720 B | 0 |
+| 3840×2160 母版验证＋PQ PNG16＋原子提交 | 2440.041ms | 14,117,959 B | 4,177,920 B | 25,243,648 B | 0 |
+| 8256×5504 归档＋缩略图＋DB | 2184.606ms | 7,046,092 B | 4,161,024 B | 21,295,104 B | 0 |
+| 8256×5504 母版验证＋PQ PNG16＋原子提交 | 11220.333ms | 14,151,353 B | 4,161,024 B | 27,803,648 B | 0 |
+
+4K 原始 FP16 为 66,355,200 B，母版 17,209,055 B、PNG16 5,194,342 B。45MP 原始为 363,528,192 B，母版 91,643,392 B、PNG16 17,209,068 B。测试同时断言原始末行 bits/generation 保留、完整尺寸、16 位深和 cICP `[9,16,0,1]`，删除历史后释放源。两种尺寸的两阶段均受同一 32 MiB Rust 堆增量／16 MiB 单次分配硬断言约束，均通过。
+
+这是单次合成梯度、实际 Release 编码路径的结果，未经冷热缓存和系统负载控制，不表示真实照片吞吐、SDR/HDR 性能对比或完整应用总内存；5ms working set 采样也不等于系统记录的绝对峰值。SQLite/C/驱动占用不属于 Rust allocator 计数，working set 不包含专用 VRAM。
+
+首次色带含不可用 Rec.2020/PQ 表达的负色，导出真实拒绝，失败日志保留于 `hdr-resources-unrepresentable.log`。没有通过裁剪源或放宽颜色校验让测试变绿；另补 `unrepresentable_hdr_export_fails_without_clipping_or_replacing_the_original`，断言保真母版仍能读回原 bits、旧目标不被替换、partial 清理。性能 fixture 改为可表达的负 scRGB 后完成整条导出。
+
+```powershell
+cargo test -p snapclip-app --test hdr_resources --release --locked --offline --config target/hdr-isolated.toml hdr_4k_archive_and_export_are_bounded -- --ignored --exact --nocapture --test-threads=1
+cargo test -p snapclip-app --test hdr_resources --release --locked --offline --config target/hdr-isolated.toml hdr_45mp_archive_and_export_are_bounded -- --ignored --exact --nocapture --test-threads=1
+```
+
+日志：`target/hdr-resources-{4k,45mp}.log`。
+
+### 21.2 20 次真实窗口循环与空闲状态
+
+`screenshot::native_tests::native_twenty_hdr_windows_release_sources_and_do_not_render_while_idle` 实际创建生产 F6 窗口、等待首次 paint 回执、关闭，20 轮均确认 `RenderImage` 与视图释放；undo 期间原始源按设计保留，销毁 manager 后原始 `Arc` 的 Weak 不再能 upgrade。先等待初始化稳定，再记录生产视图的实际 render 调用，空闲 500ms 为 **0**。
+
+64×32 合成图、20 轮首次 paint 回执 P50 **31.124ms**、P95 **33.933ms**，含 10ms 等待采样精度，不是交互帧时间或 4K 首帧承诺。输出快照为 `LinearSdr`／`display_kind=Sdr`、`hdr_supported=Some(true)`、SDR white=80nit、显示峰值报告=400nit、scale=1.5；这只是当时驱动查询值，不代表测光。测试未切换 HDR、未读桌面、未写剪贴板或发送系统鼠标输入。它验证当前 SDR 输出上 HDR 源的窗口生命周期，不能替代 HDR 开启、跨屏或全部 DPI 档位。
+
+```powershell
+cargo test -p snapclip-pin --lib --features headless-tests --release --locked --offline --config target/hdr-isolated.toml screenshot::native_tests::native_twenty_hdr_windows_release_sources_and_do_not_render_while_idle -- --ignored --exact --nocapture --test-threads=1
+```
+
+日志 `target/hdr-f6-native-lifecycle.log`，**1 passed**；同一 native Application 每个测试独立进程。
+
+### 21.3 扩大回归
+
+- workspace ordinary lib 共 **1225 passed**（App 287、Capture 568、Clipboard 13、History 46、Model 31、Pin 59、UI 221），不重复计算子进程用例；App／Pin headless **310／71 passed**。
+- App `ui` **10 passed**、`regression_baseline` **2 passed**；History `capture_history` **6 passed**、`pixel_master` **5 passed**；workspace all-targets check 通过。
+- AVIF 生产门禁测试真实调用 Export 的结果与本节统计一起通过，不以文档代替执行；严格 Clippy 初次扩大检查仍暴露 UI 存量诊断，保留 `hdr-final-strict.log`，后续清理另记结果。
+
+证据 `target/hdr-final-{ordinary,headless,ui,history,check,strict}.log`。未测的真实 HDR 开关／双屏／100/125/200% DPI／读屏／设备恢复、剪贴板真实接收方、VRAM、完整捕获到可见以及交互帧时间，继续保持未验收。

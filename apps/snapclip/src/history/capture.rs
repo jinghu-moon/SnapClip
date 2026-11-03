@@ -128,6 +128,44 @@ pub(crate) fn read_source(source: &CaptureSource) -> Result<PinImage, String> {
         .ok_or("invalid history source encoding".into())
 }
 
+/// Export from the durable source in bounded bands. Resolve the actual save
+/// target before checking identity: save validation may trim the chosen stem.
+pub(crate) fn export_source(
+    source: &CaptureSource,
+    path: &std::path::Path,
+) -> Result<crate::save::service::SaveOutcome, String> {
+    use crate::save::service::{ConflictPolicy, NoCancel, SaveRequest, commit_stream, target_of};
+    if !path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+    {
+        return Err("请选择 .png 文件名".into());
+    }
+    let request = SaveRequest {
+        directory: path.parent().ok_or("保存路径无父目录")?.to_path_buf(),
+        stem: path
+            .file_stem()
+            .ok_or("保存路径无文件名")?
+            .to_string_lossy()
+            .into_owned(),
+        format: snapclip_capture::save_format::SaveFormat::Png,
+        conflict: ConflictPolicy::Overwrite,
+    };
+    let target = target_of(&request).map_err(|e| e.message())?;
+    if let (Ok(target), Ok(original)) = (
+        target.canonicalize(),
+        source.artifact.absolute_path.canonicalize(),
+    ) && target == original
+    {
+        return Err("不能覆盖历史保真源，请选择其他路径".into());
+    }
+    commit_stream(&request, &mut NoCancel, |file| {
+        crate::capture::pixel_export::write_capture_source_png(source, file)
+            .map_err(std::io::Error::other)
+    })
+    .map_err(|e| e.message())
+}
+
 #[cfg(test)]
 #[path = "capture_tests.rs"]
 mod tests;

@@ -16,6 +16,94 @@ use std::{
 use windows_sys::Win32::{Foundation::RECT, UI::WindowsAndMessaging::*};
 
 #[test]
+#[ignore = "Release own-window 20-cycle lifecycle and idle-render probe; no system input"]
+fn native_twenty_hdr_windows_release_sources_and_do_not_render_while_idle() {
+    assert!(
+        !cfg!(debug_assertions),
+        "run this measurement with --release"
+    );
+    let failures = Rc::new(RefCell::new(Vec::<String>::new()));
+    let observed = failures.clone();
+    gpui_kit::application().run(move |cx| {
+        cx.set_quit_mode(gpui_kit::QuitMode::Explicit);
+        gpui_kit::init(cx);
+        yue_component::init(cx, yue_component::YueTheme::new(
+            yue_component::ThemeMode::Light, yue_component::Accent::Azure,
+        )).unwrap();
+        crate::init(cx);
+        cx.spawn(async move |cx| {
+            let mut latencies = Vec::new();
+            for cycle in 0..20 {
+                let begin = std::time::Instant::now();
+                let (owner, window, view, ready, original) = cx.update(|cx| {
+                    let descriptor = PixelDescriptor::new(PixelFormat::Rgba16Float, PixelEncoding::ScRgb, AlphaMode::Straight).unwrap();
+                    let bytes = [-0.25_f32, 12.5, cycle as f32 / 20., 0.5]
+                        .into_iter().flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+                        .collect::<Vec<_>>().repeat(64 * 32);
+                    let pixels = Arc::new(PixelBuffer::from_tight(64, 32, descriptor, bytes).unwrap());
+                    let original = Arc::downgrade(&pixels);
+                    let image = PinImage::from_pixels(PixelSource::new(descriptor, cycle), pixels).unwrap();
+                    let owner = cx.new(|_| PinManager::new().unwrap().0);
+                    let ready = Rc::new(Cell::new(false));
+                    let notify = ready.clone();
+                    let id = PinManager::open_selection(PinSelection::new(Rect::new(16, 16, 80, 48), image),
+                        &owner, cx, move || notify.set(true)).unwrap().id();
+                    let (window, view, _) = owner.read(cx).screenshot_for_test(id);
+                    (owner, window, view, ready, original)
+                });
+                for _ in 0..300 {
+                    if ready.get() { break; }
+                    cx.background_executor().timer(Duration::from_millis(10)).await;
+                }
+                if !ready.get() {
+                    observed.borrow_mut().push(format!("cycle {cycle}: first frame timed out"));
+                }
+                latencies.push(begin.elapsed().as_secs_f64() * 1000.);
+                let resource = window.update(cx, |_, window, cx| {
+                    if cycle == 0 { eprintln!("native output snapshot: {:?}; scale={}", window.color_output(), window.scale_factor()); }
+                    view.upgrade().and_then(|v|
+                        v.read(cx).image.as_ref().map(|image| Arc::downgrade(image.image())))
+                }).unwrap();
+                if cycle == 19 {
+                    // Let creation/receipt/bounds settle, then count the real view's
+                    // render calls during an otherwise idle half-second interval.
+                    cx.background_executor().timer(Duration::from_millis(200)).await;
+                    let before = cx.update(|cx| view.upgrade().unwrap().read(cx).renders);
+                    cx.background_executor().timer(Duration::from_millis(500)).await;
+                    let after = cx.update(|cx| view.upgrade().unwrap().read(cx).renders);
+                    eprintln!("idle screenshot view renders over 500ms: {}", after - before);
+                    if before != after { observed.borrow_mut().push("idle screenshot kept rendering".into()); }
+                }
+                cx.update(|cx| owner.update(cx, |m, cx| m.close_all(cx)));
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                if resource.is_none_or(|weak| weak.upgrade().is_some()) {
+                    observed.borrow_mut().push(format!("cycle {cycle}: display resource missing or retained after close"));
+                }
+                // Undo intentionally retains the original until its manager dies.
+                // A retained undo image is not a GPU-resource leak.
+                if original.upgrade().is_none() {
+                    observed.borrow_mut().push(format!("cycle {cycle}: undo lost its original source"));
+                }
+                cx.update(|cx| {
+                    for window in cx.windows() { _ = window.update(cx, |_, w, _| w.remove_window()); }
+                });
+                drop(owner);
+                cx.background_executor().timer(Duration::from_millis(80)).await;
+                cx.update(|_| ());
+                if original.upgrade().is_some() || view.upgrade().is_some() {
+                    observed.borrow_mut().push(format!("cycle {cycle}: dropped owner retained source/view"));
+                }
+            }
+            latencies.sort_by(f64::total_cmp);
+            eprintln!("64x32 synthetic HDR first-paint acknowledgement, 20 cycles: p50_ms={:.3} p95_ms={:.3}; not a 4K display benchmark", latencies[9], latencies[18]);
+            eprintln!("lifecycle failures: {:?}", observed.borrow());
+            cx.update(|cx| cx.quit());
+        }).detach();
+    });
+    assert!(failures.borrow().is_empty(), "{:?}", failures.borrow());
+}
+
+#[test]
 #[ignore = "creates small nonactivating F6 windows; exercises own HWNDs and own GPU targets only"]
 fn native_hdr_surface_keeps_placement_alpha_focus_and_releases_its_render_image() {
     let failures = Rc::new(RefCell::new(Vec::<String>::new()));

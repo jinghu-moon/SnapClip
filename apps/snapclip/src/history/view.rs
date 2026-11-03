@@ -182,6 +182,42 @@ impl HistoryView {
         self.pins = Some(pins);
     }
 
+    fn export_capture(&mut self, cx: &mut Context<Self>) {
+        if self.capture_busy {
+            return;
+        }
+        let Some(source) = self.state.selected_capture().cloned() else {
+            return;
+        };
+        let selection = cx.prompt_for_new_path(
+            std::path::Path::new(&crate::save::dirs::desktop()),
+            Some("SnapClip-original.png"),
+        );
+        self.capture_busy = true;
+        self.capture_operation = Some(cx.spawn(async move |this, cx| {
+            let result = match selection.await {
+                Ok(Ok(Some(path))) => {
+                    cx.background_spawn(async move {
+                        super::capture::export_source(&source, &path).map(Some)
+                    })
+                    .await
+                }
+                Ok(Ok(None)) => Ok(None),
+                error => Err(format!("无法选择保存路径：{error:?}")),
+            };
+            _ = this.update(cx, |view, cx| {
+                view.capture_busy = false;
+                view.status = match result {
+                    Ok(Some(saved)) => Some(format!("已导出 {}", saved.path.display())),
+                    Ok(None) => None,
+                    Err(error) => Some(format!("原图导出失败：{error}")),
+                };
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn capture_action(&mut self, action: CaptureAction, cx: &mut Context<Self>) {
         if self.capture_busy {
             return;
@@ -838,6 +874,15 @@ impl Render for HistoryView {
                                         .variant(yue_component::ButtonVariant::Ghost)
                                         .disabled(disabled)
                                 };
+                                let export_label =
+                                    if self.state.selected_capture().is_some_and(|s| {
+                                        s.metadata.source.descriptor().encoding()
+                                            == snapclip_model::pixels::PixelEncoding::ScRgb
+                                    }) {
+                                        "导出 HDR PNG…"
+                                    } else {
+                                        "导出 SDR PNG…"
+                                    };
                                 bar.child(
                                     button("history-open-original", "查看原图…")
                                         .disabled(disabled || self.pins.is_none())
@@ -845,6 +890,9 @@ impl Render for HistoryView {
                                             this.capture_action(CaptureAction::Open, cx)
                                         })),
                                 )
+                                .child(button("history-export-original", export_label).on_click(
+                                    cx.listener(|this, _, _, cx| this.export_capture(cx)),
+                                ))
                                 .child(button("history-copy-sdr", "复制 SDR").on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.capture_action(CaptureAction::CopySdr, cx)

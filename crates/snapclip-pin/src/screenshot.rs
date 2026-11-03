@@ -19,6 +19,8 @@ pub(crate) struct ScreenshotView {
     scale: f32,
     visible: bool,
     receipt_sent: Rc<Cell<bool>>,
+    #[cfg(all(test, feature = "headless-tests"))]
+    renders: u64,
     _prepare: Task<()>,
     _bounds: Subscription,
 }
@@ -90,6 +92,8 @@ impl ScreenshotView {
             scale: window.scale_factor(),
             visible: true,
             receipt_sent: Rc::new(Cell::new(false)),
+            #[cfg(all(test, feature = "headless-tests"))]
+            renders: 0,
             _prepare: prepare,
             _bounds: bounds,
         };
@@ -219,6 +223,10 @@ impl ScreenshotView {
 
 impl Render for ScreenshotView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(all(test, feature = "headless-tests"))]
+        {
+            self.renders += 1;
+        }
         let (width, height) = self.dimensions();
         let scale = window.scale_factor();
         let border = self.border();

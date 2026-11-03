@@ -116,6 +116,130 @@ fn sdr_replay_reopens_the_original_size_and_alpha_instead_of_the_row_thumbnail()
     assert_eq!((replay.width(), replay.height()), (256, 2));
     assert_eq!(replay.pixels().as_bytes(), pixels.as_bytes());
     assert_eq!(replay.pixel_source().generation(), 91);
+    let mut encoded = Vec::new();
+    crate::capture::pixel_export::write_capture_source_png(source, &mut encoded).unwrap();
+    assert_eq!(
+        encoded,
+        std::fs::read(&source.artifact.absolute_path).unwrap(),
+        "streamed SDR export preserves original encoded bytes"
+    );
+}
+
+#[test]
+fn streaming_hdr_history_export_uses_the_master_and_keeps_pq_depth_and_alpha() {
+    let (_root, store, archive, pixels) = fixture(true);
+    archive.persist(&pixels).unwrap();
+    let source = store.history_page(None, None).unwrap().items[0]
+        .capture_source
+        .clone()
+        .unwrap();
+    let before = std::fs::read(&source.artifact.absolute_path).unwrap();
+    let mut output = Vec::new();
+    crate::capture::pixel_export::write_capture_source_png(&source, &mut output).unwrap();
+    let header = png::Decoder::new(std::io::Cursor::new(&output))
+        .read_info()
+        .unwrap();
+    assert_eq!((header.info().width, header.info().height), (256, 2));
+    assert_eq!(header.info().bit_depth, png::BitDepth::Sixteen);
+    assert_eq!(
+        header
+            .info()
+            .coding_independent_code_points
+            .unwrap()
+            .transfer_function,
+        16
+    );
+    let decoded = snapclip_pin::decode_image(&output).unwrap();
+    assert!(decoded.is_hdr());
+    // These negative scRGB source values remain within the wider Rec.2020
+    // gamut. Compare with the same explicit quantized derivative; FP16 bits
+    // remain exclusively in the unchanged master.
+    let expected = crate::capture::pixel_export::encode_pixels(
+        &pixels,
+        crate::capture::pixel_export::ColorExport::PreserveHdr,
+    )
+    .unwrap();
+    assert_eq!(output, expected);
+    assert_eq!(
+        std::fs::read(&source.artifact.absolute_path).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn history_export_checks_the_resolved_target_and_never_overwrites_its_source() {
+    let (_root, store, archive, pixels) = fixture(false);
+    archive.persist(&pixels).unwrap();
+    let source = store.history_page(None, None).unwrap().items[0]
+        .capture_source
+        .clone()
+        .unwrap();
+    let original = &source.artifact.absolute_path;
+    let before = std::fs::read(original).unwrap();
+    assert!(
+        export_source(&source, original)
+            .unwrap_err()
+            .contains("不能覆盖")
+    );
+    let normalized_alias = original.with_file_name(format!(
+        "{}. .png",
+        original.file_stem().unwrap().to_string_lossy()
+    ));
+    assert!(
+        export_source(&source, &normalized_alias)
+            .unwrap_err()
+            .contains("不能覆盖")
+    );
+    assert_eq!(std::fs::read(original).unwrap(), before);
+    assert!(!normalized_alias.exists());
+}
+
+#[test]
+fn corrupt_sdr_and_hdr_exports_preserve_the_target_and_clean_their_own_partial() {
+    for hdr in [false, true] {
+        let (root, store, archive, pixels) = fixture(hdr);
+        archive.persist(&pixels).unwrap();
+        let source = store.history_page(None, None).unwrap().items[0]
+            .capture_source
+            .clone()
+            .unwrap();
+        // Keep the encoded length so the PNG path fails after it wrote partial
+        // output, at the fingerprint check rather than a cheap size check.
+        let mut bytes = std::fs::read(&source.artifact.absolute_path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&source.artifact.absolute_path, bytes).unwrap();
+        let target = root.0.join("keep.png");
+        std::fs::write(&target, b"old-target").unwrap();
+        assert!(export_source(&source, &target).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old-target");
+        assert!(!root.0.join("keep.png.partial").exists());
+    }
+}
+
+#[test]
+fn unrepresentable_hdr_export_fails_without_clipping_or_replacing_the_original() {
+    let (root, store, archive, pixels) = fixture(true);
+    let bytes = [-1.0_f32, 0., 0., 1.]
+        .into_iter()
+        .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+        .collect::<Vec<_>>()
+        .repeat(512);
+    let pixels = PixelBuffer::from_tight(256, 2, pixels.descriptor(), bytes.clone()).unwrap();
+    archive.persist(&pixels).unwrap();
+    let source = store.history_page(None, None).unwrap().items[0]
+        .capture_source
+        .clone()
+        .unwrap();
+    let target = root.0.join("keep.png");
+    std::fs::write(&target, b"old-target").unwrap();
+    assert!(
+        export_source(&source, &target)
+            .unwrap_err()
+            .contains("outside HDR PNG")
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"old-target");
+    assert!(!root.0.join("keep.png.partial").exists());
+    assert_eq!(read_source(&source).unwrap().pixels().as_bytes(), bytes);
 }
 
 #[test]
@@ -193,6 +317,7 @@ fn history_original_button_opens_the_real_pin_view_with_original_pixels(
             "history-open-original",
             "history-copy-sdr",
             "history-copy-hdr",
+            "history-export-original",
         ] {
             let bounds = window.find(id).bounds();
             assert!(
@@ -200,7 +325,24 @@ fn history_original_button_opens_the_real_pin_view_with_original_pixels(
                 "{id} must fit the narrow history toolbar: {bounds:?}"
             );
         }
-        window.click("history-open-original", cx);
+        window.click("history-export-original", cx);
+    })
+    .unwrap();
+    assert!(cx.did_prompt_for_new_path());
+    cx.simulate_new_path_selection(|_| None);
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("history-export-original", cx)
+    })
+    .unwrap();
+    let exported = root.0.join("historical-original.png");
+    cx.simulate_new_path_selection(|_| Some(exported.clone()));
+    cx.run_until_parked();
+    let exported = snapclip_pin::decode_image(&std::fs::read(exported).unwrap()).unwrap();
+    assert_eq!((exported.width(), exported.height()), (256, 2));
+    assert!(exported.is_hdr());
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click("history-open-original", cx)
     })
     .unwrap();
     cx.run_until_parked();
