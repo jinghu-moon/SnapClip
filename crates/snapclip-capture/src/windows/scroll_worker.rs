@@ -148,8 +148,10 @@ pub(crate) struct Report {
 }
 
 /// Everything the thread needs, decided by the overlay before it starts.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Spec {
+    pub source: snapclip_model::pixels::PixelSource,
+    pub color_snapshot: super::color_output::ColorSnapshot,
     /// The `HMONITOR` the selection is on.
     pub monitor: isize,
     /// The selection in monitor-local physical pixels (the WGC monitor frame's space).
@@ -188,6 +190,7 @@ pub(crate) struct ScrollWorker {
 
 impl ScrollWorker {
     pub(crate) fn start(spec: Spec) -> Self {
+        let aim = spec.aim;
         let shared = Arc::new(Shared::default());
         let thread = {
             let shared = shared.clone();
@@ -202,7 +205,7 @@ impl ScrollWorker {
         Self {
             shared,
             thread,
-            aim: spec.aim,
+            aim,
         }
     }
 
@@ -331,13 +334,14 @@ fn run(spec: Spec, shared: &Shared) -> Option<Tracker> {
 }
 
 fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Result<(), String> {
+    let snapshot = super::color_output::ColorSnapshot::query(spec.monitor)
+        .unwrap_or_else(|_| super::color_output::ColorSnapshot::unknown(spec.monitor));
+    if snapshot != spec.color_snapshot {
+        return Err("display color changed before scroll acquisition; restart capture".into());
+    }
     let device = GraphicsDevice::create()?;
-    let mut session = WgcSession::open_monitor(
-        &device,
-        spec.monitor,
-        snapclip_model::pixels::PixelDescriptor::bgra8(),
-    )
-    .map_err(|e| e.to_string())?;
+    let mut session = WgcSession::open_monitor(&device, spec.monitor, spec.source.descriptor())
+        .map_err(|e| e.to_string())?;
     let (width, view) = (spec.region.width() as u32, spec.region.height() as u32);
     eprintln!(
         "[snapclip][scroll] started monitor_frame={:?} region={:?} aim=({},{}) options={:?} {}",
@@ -427,18 +431,30 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
         let started = Instant::now();
         let pixels = read_region(&device, &frame, spec.region)?;
         drop(frame);
+        let snapshot = super::color_output::ColorSnapshot::query(spec.monitor)
+            .unwrap_or_else(|_| super::color_output::ColorSnapshot::unknown(spec.monitor));
+        if snapshot != spec.color_snapshot {
+            return Err(
+                "display color or white changed during scrolling; source frames were not mixed"
+                    .into(),
+            );
+        }
         let read_us = started.elapsed().as_micros();
         frames += 1;
         let tracker = match tracker {
             Some(tracker) => tracker,
             None => {
                 eprintln!("[snapclip][scroll] first frame {width}x{view}");
-                tracker.insert(Tracker::new(&pixels, width, view, spec.thumb_width))
+                tracker.insert(Tracker::from_pixels(
+                    spec.source,
+                    &pixels,
+                    spec.thumb_width,
+                )?)
             }
         };
         if frames > 1 {
             let pushed = Instant::now();
-            let step = tracker.push(&pixels);
+            let step = tracker.push_pixels(spec.source, &pixels)?;
             let push_us = pushed.elapsed().as_micros();
             #[cfg(any(test, feature = "test-support"))]
             placement_stats.record(&step.estimate, step.placement.as_ref());
@@ -465,7 +481,7 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
                     "[snapclip][scroll] frame={frames} read_us={read_us} push_us={push_us} \
                      thumb_us={} total_us={us} bytes={}",
                     tracker.last_thumb_us(),
-                    pixels.len()
+                    pixels.as_bytes().len()
                 );
             }
             // This frame is the evidence the notch in flight is judged by. A Shift is the page
@@ -628,12 +644,11 @@ fn wake(spec: &Spec, shared: &Shared) {
 }
 
 /// The selection's pixels out of one monitor frame: one GPU→CPU copy of the selection only.
-fn read_region(device: &GraphicsDevice, frame: &WgcFrame, region: Rect) -> Result<Vec<u8>, String> {
-    if frame.descriptor() != snapclip_model::pixels::PixelDescriptor::bgra8() {
-        return Err(
-            "scroll stitching requires its SDR frame contract; HDR scroll is not enabled".into(),
-        );
-    }
+fn read_region(
+    device: &GraphicsDevice,
+    frame: &WgcFrame,
+    region: Rect,
+) -> Result<snapclip_model::pixels::PixelBuffer, String> {
     let (frame_w, frame_h) = frame.size();
     if region.left < 0 || region.top < 0 || region.right > frame_w || region.bottom > frame_h {
         return Err(format!(
@@ -641,19 +656,11 @@ fn read_region(device: &GraphicsDevice, frame: &WgcFrame, region: Rect) -> Resul
         ));
     }
     let (width, height) = (region.width() as u32, region.height() as u32);
-    let pixels = device.read_back_region_bgra(
+    let pixels = device.read_back_pixels(
         frame.texture(),
-        region.left as u32,
-        region.top as u32,
-        width,
-        height,
+        [region.left as u32, region.top as u32, width, height],
+        frame.descriptor(),
     )?;
-    if pixels.len() != width as usize * height as usize * 4 {
-        return Err(format!(
-            "the region readback returned {} bytes for {width}x{height}",
-            pixels.len()
-        ));
-    }
     Ok(pixels)
 }
 

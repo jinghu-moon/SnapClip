@@ -235,7 +235,8 @@ pub fn whole_from_bands(
             spec.source.descriptor(),
             bytes,
         )
-        .map_err(|message| crate::CaptureError::EncodeFailed(message.into()))?,
+        .map_err(|message| crate::CaptureError::EncodeFailed(message.into()))?
+        .into(),
         origin: spec.origin,
         corner_radius: spec.corner_radius,
     };

@@ -6710,6 +6710,7 @@ dependencies = [
  "blake3",
  "enough",
  "gpui-kit",
+ "half",
  "image",
  "png 0.18.1",
  "serde",
@@ -6750,6 +6751,7 @@ dependencies = [
  "arboard",
  "blake3",
  "encoding_rs",
+ "half",
  "html5ever",
  "image",
  "markup5ever_rcdom",
@@ -6780,8 +6782,10 @@ dependencies = [
 name = "snapclip-model"
 version = "0.1.0"
 dependencies = [
+ "half",
  "serde",
  "serde_json",
+ "yue-color",
 ]
 
 [[package]]
@@ -6791,6 +6795,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "gpui-kit",
+ "half",
  "image",
  "parking_lot",
  "png 0.18.1",
@@ -9228,6 +9233,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "yue-color"
+version = "0.1.0"
+
+[[package]]
 name = "yue-component"
 version = "0.1.0"
 dependencies = [
@@ -9237,6 +9246,7 @@ dependencies = [
  "lyon",
  "moxcms",
  "png 0.18.1",
+ "yue-color",
  "yue-component-icons",
 ]
 

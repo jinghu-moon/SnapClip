@@ -761,15 +761,18 @@ fn pin_home_selection(state: &mut HostState, id: u64, selection: PinSelection) -
             region.bottom
         );
     }
-    let expected = width as usize * height as usize * 4;
-    if selection.bytes().len() != expected {
-        bail!(
-            "选区像素 {} 字节，与 {width}x{height} 不符",
-            selection.bytes().len()
-        );
+    if selection.image().pixels().size() != [width, height] {
+        bail!("选区像素与 {width}x{height} 不符");
+    }
+    if selection.image().is_hdr() {
+        bail!("原位截图贴图尚不支持 HDR");
     }
     let started = now_us();
-    let image = ImageSource::from_bgra_bytes(selection.bytes(), width, height)?;
+    let image = ImageSource::from_rgba(
+        &selection.image().sdr_rgba().map_err(anyhow::Error::msg)?,
+        width,
+        height,
+    )?;
     let convert_us = now_us().saturating_sub(started);
     let started = now_us();
     create_pin_window(
@@ -3249,7 +3252,10 @@ mod tests {
             pin_home_selection(
                 &mut state,
                 1,
-                PinSelection::new(Rect::new(10, 10, 10, 50), Arc::new(Vec::new()))
+                PinSelection::new(
+                    Rect::new(10, 10, 10, 50),
+                    crate::PinImage::new(1, 1, vec![0; 4]).unwrap()
+                )
             )
             .is_err()
         );
@@ -3294,7 +3300,10 @@ mod tests {
             pin_home_selection(
                 &mut state,
                 2,
-                PinSelection::new(Rect::new(-10, -20, -8, -18), Arc::new(vec![0; 3]))
+                PinSelection::new(
+                    Rect::new(-10, -20, -8, -18),
+                    crate::PinImage::new(1, 1, vec![0; 4]).unwrap()
+                )
             )
             .is_err()
         );
@@ -3345,11 +3354,14 @@ mod tests {
     #[test]
     fn requests_and_selections_keep_negative_screen_origins_and_clamp_radius() {
         use snapclip_model::geometry::Rect;
-        let selection =
-            PinSelection::new(Rect::new(-10, -20, -9, -19), Arc::new(vec![0; 4])).radius(-2);
+        let selection = PinSelection::new(
+            Rect::new(-10, -20, -9, -19),
+            crate::PinImage::new(1, 1, vec![0; 4]).unwrap(),
+        )
+        .radius(-2);
         assert_eq!(selection.region(), Rect::new(-10, -20, -9, -19));
         assert_eq!(selection.corner_radius(), 0);
-        assert_eq!(selection.bytes(), &[0; 4]);
+        assert_eq!(selection.image().pixels().as_bytes(), &[0; 4]);
         assert_eq!(selection.radius(8).corner_radius(), 8);
         let request =
             PinRequest::new(ImageSource::from_bgra(vec![0], 1, 1).unwrap(), (-10, -20)).radius(-1);

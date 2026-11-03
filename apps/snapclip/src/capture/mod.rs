@@ -17,6 +17,7 @@ pub mod pin_source;
 
 pub use pin_source::{PinSource, TakeSelection};
 
+pub mod pixel_export;
 /// The scroll export port's encoder (`docs/31` P4.02, `docs/30` §17.7).
 ///
 /// It lives in the shell and not in `snapclip-capture` because which encoder to use is a decision
@@ -282,7 +283,8 @@ mod tests {
                 snapclip_model::pixels::PixelDescriptor::bgra8(),
                 vec![0; 16],
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         })
     }

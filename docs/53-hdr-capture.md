@@ -336,3 +336,77 @@ cargo clippy -p snapclip-capture --all-targets --no-deps --locked --offline -- -
 **仍未完成**：真实源能力／输出白快照及变化策略、实际 WGC HDR 帧验收、生产滚动的原始行带与固定分析派生图、HDR 倒计时 composition 宿主、明确映射的 HEX sampler、HDR PNG、保存面板／F3／F6／剪贴板／历史 DB 消费。旧 `UpdateLayeredWindow` 倒计时遇到 HDR 明确报错，生产滚动读回也只接受 SDR，均不静默截断。
 
 下一步先接源能力与输出白快照，并让生产滚动保持同一来源 generation；再推进编码和消费。真实 HDR／跨屏／DPI、45MP、RSS／VRAM、20 次替换资源残留与端到端性能门禁仍保留。本批没有得出性能提升或低占用的结论，也没有开启用户 HDR 捕获入口；P3-B／P3-C 改动尚未提交。
+
+
+## 11. 后续完整执行清单（2026-11-03）
+
+已按用户要求提交并推送上一检查点：SnapClip `a2932db`，Yue `7e9b74d`。以下是接续实施清单，勾选必须有对应验收证据；不得把底座完成等同于产品完成。
+
+- [ ] 源能力和输出白快照、状态变化与明确 fallback；保留生产入口门禁至所有消费者就绪。
+- [ ] 生产滚动：固定 SDR 分析、FP16 原始行带、来源变化检测、反向增长及有界落盘。
+- [ ] HDR composition 倒计时、明确为 SDR 派生的 HEX 取色。
+- [ ] HDR PNG16/Rec.2020/PQ+cICP、明确 SDR 导出、真实编码回读及有界处理。
+- [ ] 保存面板 HDR 策略和格式能力、原图/结果/对比同一相机和 revision。
+- [ ] F3/F6 共用 GPUI/Yue 图片窗口、保留原位/无激活/DPI/缩放合同并删除被替代的 native F6 实现。
+- [ ] SDR/HDR 剪贴板独立策略、载荷一致性和 PNG 优先保精度读取。
+- [ ] 历史保真源引用、SDR 缩略图与共享资源生命周期。
+- [ ] HDR AVIF 按真实生产编解码/许可/色彩证据门禁。
+- [ ] Release 资源性能、旧功能回归、严格 Clippy 与真实窗口/HDR/DPI 验收。
+
+### 11.1 纯数学共享边界
+
+Yue 的 `yue-color` 仅承载已有的传递函数、基色矩阵及 BT.2390 数学，无 GPUI、图像、编解码器、资源或平台依赖。目的是让原生捕获和 GPUI 显示引用同一个实现，而非复制数值算法或让 Capture 反向依赖 GPUI。ICC 管理仍留在 Yue 图片资源层，采集/文件/生命周期仍在各自既有模块；没有新增媒体引擎。
+
+Model 新增 `half` 表达 FP16、`yue-color` 承载纯数学。依赖门禁只额外允许这两个包和 `half` 的 `cfg-if`／`zerocopy`／`zerocopy-derive`，没有放开任意传递依赖；UI、Windows、图片编解码器和能力 crate 仍被禁止。原 §23 模块拆分记录中的“仅标准库 + serde”是当时基线，本节取代其当前依赖约束。
+
+## 12. 第四批实施记录（P3-D，2026-11-03）
+
+### 12.1 捕获、滚动与导出
+
+- `windows/color_output.rs` 从 Windows 读取真实输出能力、SDR-white 及拓扑快照，区分 SDR、HDR、advanced color 与未知状态。`capture_preserving_color()` 使用有门禁的 FP16 路径；只有确认 SDR 才可使用明确的 SDR fallback。普通 `capture()` 仍维持 SDR，未在消费者尚未齐备时开启生产 HDR。
+- 滚动匹配保持固定 SDR 分析图，输出行带保留 FP16 原始像素与来源 generation；来源定义／输出状态改变时拒绝混拼。内存及磁盘后备沿用已有滚动存储，不复制成第二个媒体引擎。
+- `pixel_export.rs` 显式区分 `PreserveHdr` 与 SDR 派生。HDR PNG 为 16-bit Rec.2020/PQ，附 cICP `[9,16,0,1]`；按行处理。不可表示的负／超域 RGB 或超过 10,000 nit 的源明确拒绝，不能用静默裁剪把有损导出称为无损母版。SCPX 原始像素母版仍保留完整 FP16。
+- 保存面板持有共享原像素，原图／结果交给 Yue；缩放在线性光、关联 Alpha 下计算，HDR／SDR 和格式能力由显式导出策略控制。
+
+### 12.2 贴图与剪贴板
+
+- `PinImage` 改为持有 `PixelSource` 与 `Arc<PixelBuffer>`；截图到贴图共享同一分配，保留编码、Alpha 与 generation。屏幕位置独立存于 `PinSelection`，不再用 RGBA8 数组同时承担位置和色彩合同。
+- F3 注入 Yue 的颜色管理解码器，PNG 优先于 DIB；PQ PNG／高精度 SDR 继续保留 FP16。PNG 解码失败、改用 DIB 时显示明确的 SDR 副本提示。framework-free 默认解码器拒绝自身不能正确管理的高精度／颜色元数据，而非静默降为八位。
+- Yue `ImagePreviewPixels::into_bytes` 将拥有的解码缓冲搬移到 Model，不复制整图；借入资源仍会建立独立所有权。传递函数、矩阵和 BT.2390 共用已提交的零依赖 `yue-color`。
+- 普通复制显式派生 SDR，从同一 RGBA 生成 sRGB PNG 和 DIB；HDR 图片菜单另设“复制 HDR 图片（PNG）”，只发布高精度 PNG。获取系统剪贴板锁之前校验完整编码流、尺寸预算、位深和 cICP。F3 窗口使用 `AutomaticHdr` 输出策略。
+- **F6 仍使用旧 native GDI 宿主，明确拒绝 HDR**。尚未完成原位、无激活、物理像素缩放、跨屏 DPI、圆角和生命周期的 GPUI 迁移；当前不能称 F3／F6 已统一。失败时捕获槽位的保留语义也必须在后续迁移中修复。
+
+### 12.3 关键行为与验证
+
+| 行为 | 修改前 | 本批实现与证据 |
+| --- | --- | --- |
+| 捕获到贴图 | 转成 RGBA8 并复制 | 共享原 PixelBuffer；测试 `Arc::ptr_eq`、负坐标、generation 91 与 Alpha |
+| PQ PNG 贴图 | 八位解码丢失高亮 | 同一 Yue 解码器保留 1,000 nit、FP16 负值／超白和 16-bit SDR |
+| 普通图片复制 | PNG／DIB 生成路径可能分离 | 同一 SDR RGBA 生成两种载荷；纯测试比较真实 DIB serializer 输出 |
+| HDR 复制 | 无独立策略 | 高精度 PNG 单格式命令；测试完整流、截断、SDR 拒绝和与普通命令分离 |
+| 保存面板重试 | 注入失败未通知父 view，测试无法看到按钮 | 先复现失败，再通知并测试重试恢复 Ready；不依赖已移除按钮仍存在 |
+| Model 依赖门禁 | 只允许 serde，拒绝新数值依赖 | 精确增加纯数学 allowlist；正常图通过，`-Package snapclip-app` 负对照仍拒绝 UI／能力依赖 |
+
+本批 Yue 检查点已推送为 `2ccc07d`。验证期间 Yue 工作树有独立、未提交且持续变化的虚拟列表重构；为避免混入该任务，SnapClip HDR 回归使用 `target/hdr-vendor-baseline` 中的 Yue `7e9b74d` 快照，叠加 `2ccc07d` 的 `into_bytes`，并使用已提交的 `yue-color`。Core／Base／Windows 后端均固定到此快照。`target/hdr-isolated.toml` 及快照仅为本机验证设施，不提交，也不是产品默认依赖配置。**下表不能解释为当前另一个任务的工作树已通过完整构建。**
+
+| 验证 | 最终结果 |
+| --- | --- |
+| 普通 workspace lib，串行、隔离依赖 | App 273、Capture 561、Clipboard 13、History 43、Model 31、Pin 73、UI 221，共 **1,215** 项通过；另 5／85／2／0／0／4／0 ignored，不计入通过数 |
+| App／Pin headless lib、隔离依赖 | **293／75** 项通过，另 5／4 ignored |
+| 图片资源纯 lib | Yue image_preview **48** 项通过，包含 owned 缓冲搬移／borrowed 所有权 |
+| Model／Clipboard lib 与 integration | **75** 项通过，另 2 ignored；分类 integration 25 项 |
+| Model／Clipboard／Pin all-targets strict Clippy | 带 Pin headless feature、`--no-deps -D warnings` 通过；不等于全仓 lint 通过 |
+| workspace all-targets check、fmt check | 隔离依赖构建通过；UI gallery 既有 9 项 must-use warning 保留；fmt 通过 |
+
+主要日志为 `target/hdr-p3d-{workspace-final,app-pin-isolated-final,model-clipboard-pin-clippy,check-final,fmt-final,contracts-final,dependency-before,dependency-after,dependency-negative}.log`。重试先失败／后通过见 `hdr-p3d-retry-{before,after}.log`；原 Pin 调用方缺失 typed API 的失败证据见 `hdr-p3d-pin-isolated-before.log`。子进程额外输出的测试结果不重复计数。
+
+核心复现命令（隔离配置仅在有上述本机快照时可用）：
+
+```powershell
+cargo test --workspace --lib --locked --offline --config target/hdr-isolated.toml -- --test-threads=1
+cargo test -p snapclip-app -p snapclip-pin --features snapclip-app/test-support,snapclip-pin/headless-tests --lib --locked --offline --config target/hdr-isolated.toml -- --test-threads=1
+cargo test -p snapclip-model --test pixel_contract -p snapclip-capture --test source_contract -p snapclip-history --test pixel_master -p snapclip-clipboard --test classification --locked --offline --config target/hdr-isolated.toml -- --test-threads=1
+cargo clippy -p snapclip-model -p snapclip-clipboard -p snapclip-pin --all-targets --features snapclip-pin/headless-tests --no-deps --locked --offline --config target/hdr-isolated.toml -- -D warnings
+```
+
+本批没有改系统 HDR 设置、实际截屏或写系统剪贴板；headless 证明实体／命令／资源生命周期，不能证明 DWM 最终显示、无激活窗口或实际剪贴板格式优先级。尚需 F6 宿主迁移、倒计时 composition、SDR HEX、历史 DB 保真引用／回放、AVIF 生产证据、Release 资源性能，以及真实 HDR／双屏／DPI 验收。§11 清单保持未勾选表示这些是产品级验收项；本节只记录已完成的代码及测试层次。

@@ -25,6 +25,33 @@ pub struct ClipboardImage<'a> {
 pub struct SystemClipboard;
 
 impl SystemClipboard {
+    /// Default compatibility copy: both PNG and DIB are made from these same
+    /// explicitly mapped SDR pixels. The immutable high-precision source survives.
+    pub fn copy_pin_image(&self, image: &snapclip_model::pin::PinImage) -> Result<(), String> {
+        let (rgba, png) = prepare_sdr_image(image)?;
+        self.copy_image(&ClipboardImage {
+            width: image.width(),
+            height: image.height(),
+            pixels: &rgba,
+            channels: Channels::Rgba,
+            png: Some(&png),
+        })
+    }
+
+    /// Explicit HDR transfer offers only Rec.2020/PQ PNG16. Supplying an SDR DIB
+    /// alongside it would let receivers silently choose the lower precision.
+    pub fn copy_hdr_png(&self, bytes: &[u8]) -> Result<(), String> {
+        validate_hdr_png(bytes)?;
+        #[cfg(windows)]
+        {
+            win::write_png(bytes)
+        }
+        #[cfg(not(windows))]
+        {
+            Err("HDR image copy is only implemented on Windows".into())
+        }
+    }
+
     /// Copy plain text.
     pub fn copy_text(&self, text: &str) -> Result<(), String> {
         #[cfg(windows)]
@@ -75,13 +102,7 @@ impl SystemClipboard {
     pub fn copy_pin(&self, pin: &snapclip_model::pin::PinSnapshot) -> Result<(), String> {
         use snapclip_model::pin::PinContent;
         match pin.content() {
-            PinContent::Image(image) => self.copy_image(&ClipboardImage {
-                width: image.width(),
-                height: image.height(),
-                pixels: image.rgba(),
-                channels: Channels::Rgba,
-                png: None,
-            }),
+            PinContent::Image(image) => self.copy_pin_image(image),
             PinContent::Files(files) => self.copy_files(
                 &files
                     .iter()
@@ -99,6 +120,127 @@ impl SystemClipboard {
                 }
             }
         }
+    }
+}
+
+fn prepare_sdr_image(image: &snapclip_model::pin::PinImage) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let rgba = image.sdr_rgba().map_err(str::to_owned)?;
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, image.width(), image.height());
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        writer.write_image_data(&rgba).map_err(|e| e.to_string())?;
+    }
+    Ok((rgba, png))
+}
+
+fn validate_hdr_png(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > crate::MAX_BYTES {
+        return Err("HDR PNG 超过剪贴板字节预算".into());
+    }
+    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .map_err(|e| e.to_string())?;
+    let info = reader.info();
+    let cicp = info
+        .coding_independent_code_points
+        .ok_or("HDR PNG 缺少 cICP 色彩定义")?;
+    if info.bit_depth != png::BitDepth::Sixteen
+        || !matches!(info.color_type, png::ColorType::Rgb | png::ColorType::Rgba)
+        || info.animation_control.is_some()
+        || u64::from(info.width) * u64::from(info.height) > crate::MAX_PIXELS
+        || (
+            cicp.color_primaries,
+            cicp.transfer_function,
+            cicp.matrix_coefficients,
+            cicp.is_video_full_range_image,
+        ) != (9, 16, 0, true)
+    {
+        return Err("HDR 剪贴板要求有界的静态 PNG16 / Rec.2020 / PQ / full range".into());
+    }
+    // Validate all compressed rows before taking the system clipboard lock.
+    while reader.next_row().map_err(|e| e.to_string())?.is_some() {}
+    reader.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_png_and_dib_pixels_are_the_same_explicit_sdr_image() {
+        use snapclip_model::pixels::{
+            AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource,
+        };
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let original: Vec<u8> = [2.5_f32, 2.5, 2.5, 0.5]
+            .into_iter()
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let image = snapclip_model::pin::PinImage::from_pixels(
+            PixelSource::new(descriptor, 3),
+            std::sync::Arc::new(
+                PixelBuffer::from_tight(1, 1, descriptor, original.clone()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let (rgba, bytes) = prepare_sdr_image(&image).unwrap();
+        let decoded = image::load_from_memory(&bytes)
+            .unwrap()
+            .into_rgba8()
+            .into_raw();
+        assert_eq!(decoded, rgba);
+        assert_eq!(rgba, image.sdr_rgba().unwrap());
+        assert_eq!(rgba[3], 128);
+        #[cfg(windows)]
+        {
+            let payload = ClipboardImage {
+                width: 1,
+                height: 1,
+                pixels: &rgba,
+                channels: Channels::Rgba,
+                png: Some(&bytes),
+            };
+            let mut dib = vec![0; win::dibv5_len(&payload).unwrap()];
+            win::fill_dibv5(&mut dib, &payload);
+            let offset = std::mem::size_of::<windows_sys::Win32::Graphics::Gdi::BITMAPV5HEADER>();
+            assert_eq!(&dib[offset..], [rgba[2], rgba[1], rgba[0], rgba[3]]);
+        }
+        assert_eq!(image.pixels().as_bytes(), original);
+        assert!(validate_hdr_png(&bytes).is_err());
+    }
+
+    #[test]
+    fn hdr_png_validation_checks_color_definition_and_complete_pixel_stream() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Sixteen);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_chunk(png::chunk::cICP, &[9, 16, 0, 1])
+                .unwrap();
+            writer
+                .write_image_data(&[192, 119, 192, 119, 192, 119, 128, 0])
+                .unwrap();
+        }
+        validate_hdr_png(&bytes).unwrap();
+        assert!(validate_hdr_png(&bytes[..bytes.len() / 2]).is_err());
+        assert!(matches!(
+            crate::image::decode_encoded(&bytes),
+            Err(crate::ReadError::Unsupported)
+        ));
+        assert!(validate_hdr_png(b"invalid").is_err());
     }
 }
 
@@ -248,6 +390,20 @@ mod win {
             set(format, png.len(), |memory| memory.copy_from_slice(png))?;
         }
         Ok(())
+    }
+
+    pub(super) fn write_png(bytes: &[u8]) -> Result<(), String> {
+        let name: Vec<u16> = "PNG\0".encode_utf16().collect();
+        let format = unsafe { RegisterClipboardFormatW(name.as_ptr()) };
+        if format == 0 {
+            return Err(last_error("RegisterClipboardFormatW(PNG)"));
+        }
+        let _open = Open::new()?;
+        if unsafe { EmptyClipboard() } == 0 {
+            return Err(last_error("EmptyClipboard"));
+        }
+        mark_open()?;
+        set(format, bytes.len(), |out| out.copy_from_slice(bytes))
     }
 
     /// The `CF_DIBV5` block's size: the header, then the pixels.

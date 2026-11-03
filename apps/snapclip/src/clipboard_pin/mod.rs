@@ -94,7 +94,9 @@ impl ClipboardPins {
                         ReadPurpose::ExplicitPin,
                         Some(request.sequence),
                     )
-                    .and_then(snapclip_clipboard::prepare);
+                    .and_then(|snapshot| {
+                        snapclip_clipboard::prepare_with_image_decoder(snapshot, decode_pin_image)
+                    });
                     if done.send_blocking(Completion { request, result }).is_err() {
                         break;
                     }
@@ -218,14 +220,13 @@ pub fn drain_copies(
                         CopyTarget::Text(text) => SystemClipboard.copy_text(&text),
                         CopyTarget::Files(paths) => SystemClipboard.copy_files(&paths),
                         CopyTarget::Content(snapshot) => SystemClipboard.copy_pin(&snapshot),
-                        CopyTarget::Pixels(image) => {
-                            SystemClipboard.copy_image(&snapclip_clipboard::ClipboardImage {
-                                width: image.width(),
-                                height: image.height(),
-                                pixels: image.rgba(),
-                                channels: snapclip_clipboard::Channels::Rgba,
-                                png: None,
-                            })
+                        CopyTarget::Pixels(image) => SystemClipboard.copy_pin_image(&image),
+                        CopyTarget::HdrPixels(image) => {
+                            let bytes = crate::capture::pixel_export::encode_pixels(
+                                image.pixels(),
+                                crate::capture::pixel_export::ColorExport::PreserveHdr,
+                            )?;
+                            SystemClipboard.copy_hdr_png(&bytes)
                         }
                     }
                 })
@@ -241,9 +242,60 @@ pub fn drain_copies(
     .detach();
 }
 
+fn decode_pin_image(
+    bytes: &[u8],
+    encoding: snapclip_clipboard::ImageEncoding,
+) -> Result<snapclip_pin::PinImage, ReadError> {
+    if bytes.len() > snapclip_clipboard::MAX_BYTES {
+        return Err(ReadError::TooLarge);
+    }
+    let bmp;
+    let encoded = if encoding == snapclip_clipboard::ImageEncoding::Dib {
+        bmp = snapclip_clipboard::image::dib_to_bmp(bytes).map_err(|_| ReadError::InvalidImage)?;
+        bmp.as_slice()
+    } else {
+        bytes
+    };
+    snapclip_pin::decode_image(encoded).map_err(ReadError::Platform)
+}
+
 #[cfg(test)]
 mod tests {
     use super::Requests;
+    #[test]
+    fn f3_png_uses_the_color_managed_hdr_decoder() {
+        use snapclip_model::pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding};
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let bytes = [12.5_f32, 12.5, 12.5, 0.5]
+            .into_iter()
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let pixels = PixelBuffer::from_tight(1, 1, descriptor, bytes).unwrap();
+        let png = crate::capture::pixel_export::encode_pixels(
+            &pixels,
+            crate::capture::pixel_export::ColorExport::PreserveHdr,
+        )
+        .unwrap();
+        let prepared = snapclip_clipboard::prepare_with_image_decoder(
+            snapclip_clipboard::Snapshot::new(7)
+                .with_image(snapclip_clipboard::ImageEncoding::Png, png),
+            super::decode_pin_image,
+        )
+        .unwrap();
+        let snapclip_pin::PinContent::Image(image) = prepared.content() else {
+            panic!("expected image");
+        };
+        assert!(image.is_hdr());
+        let r =
+            half::f16::from_le_bytes(image.pixels().as_bytes()[..2].try_into().unwrap()).to_f32();
+        assert!((r - 12.5).abs() < 0.02);
+        assert!(prepared.into_pin().notice().is_none());
+    }
     #[test]
     fn repeated_same_pending_snapshot_is_coalesced() {
         let mut r = Requests::default();

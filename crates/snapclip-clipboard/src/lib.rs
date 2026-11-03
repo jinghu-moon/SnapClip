@@ -7,7 +7,7 @@ pub mod rtf;
 pub mod windows;
 mod writer;
 
-pub use classify::{prepare, prepare_files};
+pub use classify::{prepare, prepare_files, prepare_with_image_decoder};
 use snapclip_model::pin::{PinContent, PinImage, PinSnapshot};
 use std::sync::Arc;
 pub use writer::{Channels, ClipboardImage, SystemClipboard};
@@ -134,6 +134,7 @@ pub struct PreparedSnapshot {
     content: PinContent,
     image: Option<PinImage>,
     fingerprint: [u8; 32],
+    notice: Option<String>,
 }
 impl PreparedSnapshot {
     pub fn snapshot(&self) -> &Snapshot {
@@ -150,6 +151,9 @@ impl PreparedSnapshot {
     }
     pub fn into_pin(self) -> PinSnapshot {
         let mut pin = PinSnapshot::new(self.content);
+        if let Some(notice) = self.notice {
+            pin = pin.with_notice(notice);
+        }
         if let Some(text) = &self.snapshot.text {
             pin = pin.with_text(text.clone());
         }

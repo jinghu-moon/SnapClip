@@ -37,6 +37,7 @@ windows = { version = "0.61", features = [
   "Graphics_Imaging",
   "Storage",
   "Storage_Streams",
+  "Win32_Devices_Display",
   "Win32_Graphics_Direct2D",
   "Win32_Graphics_Direct2D_Common",
   "Win32_Graphics_Direct3D",

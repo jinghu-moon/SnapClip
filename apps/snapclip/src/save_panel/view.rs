@@ -240,6 +240,44 @@ impl SavePanel {
                         column()
                             .key_context("YueSaveField")
                             .child(label("文件名"))
+                            .when(self.picture.is_hdr(), |this| {
+                                this.child(
+                                    column()
+                                        .child(label("色彩"))
+                                        .child(
+                                            YueSegmented::new(
+                                                "save-color-policy",
+                                                theme,
+                                                if self.preserve_hdr { "hdr" } else { "sdr" },
+                                            )
+                                            .size(SegmentedSize::Small)
+                                            .distribution(SegmentedDistribution::Equal)
+                                            .width(relative(1.))
+                                            .disabled(self.busy)
+                                            .accessibility_label("导出色彩策略")
+                                            .options([
+                                                YueSegmentedOption::new("hdr", "保留 HDR"),
+                                                YueSegmentedOption::new("sdr", "转换为 SDR"),
+                                            ])
+                                            .on_change(cx.listener(
+                                                |this, value: &SharedString, window, cx| {
+                                                    this.set_preserve_hdr(
+                                                        value == "hdr",
+                                                        window,
+                                                        cx,
+                                                    )
+                                                },
+                                            )),
+                                        )
+                                        .child(div().text_xs().text_color(muted).child(
+                                            if self.preserve_hdr {
+                                                "PNG16 · Rec.2020/PQ；原始 FP16 母版保留"
+                                            } else {
+                                                "映射至 100 nit SDR；原始 HDR 保留"
+                                            },
+                                        )),
+                                )
+                            })
                             .child(
                                 row()
                                     .child(
@@ -730,9 +768,7 @@ impl SavePanel {
         self.operation = Some(cx.spawn_in(window, async move |this, cx| {
             let fitted = cx
                 .background_executor()
-                .spawn(async move {
-                    source::shrink_to_fit(&export.picture, &export.values(), export.output, limit)
-                })
+                .spawn(async move { export.fit_under(limit) })
                 .await;
             _ = this.update_in(cx, |panel, window, cx| {
                 panel.set_busy(false, window, cx);

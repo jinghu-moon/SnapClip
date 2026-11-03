@@ -9,28 +9,28 @@ mod source;
 mod table;
 mod view;
 pub use host::{PinEvent, PinHandle, PinReport, PinRequest};
+pub use image_preview::decode_image;
 pub use manager::{CopyTarget, PinCommand, PinManager, PinPlacement};
 use snapclip_model::geometry::Rect;
 pub use snapclip_model::pin::*;
 pub use source::ImageSource;
-use std::sync::Arc;
 /// The most recently confirmed screenshot, in virtual-desktop physical pixels.
 ///
-/// The application supplies top-down BGRA bytes and the corner radius captured with the image.
-/// The host validates dimensions and byte length before creating a window.
+/// The image shares validated original pixels with the capture result. Placement
+/// is separate from pixel encoding; moving between owners never quantizes it.
 #[derive(Debug, Clone)]
 pub struct PinSelection {
     region: Rect,
-    pixels: Arc<Vec<u8>>,
+    image: PinImage,
     radius: i32,
 }
 
 impl PinSelection {
     /// Create a selection with square corners. Validation happens when it is consumed.
-    pub fn new(region: Rect, pixels: Arc<Vec<u8>>) -> Self {
+    pub fn new(region: Rect, image: PinImage) -> Self {
         Self {
             region,
-            pixels,
+            image,
             radius: 0,
         }
     }
@@ -46,9 +46,9 @@ impl PinSelection {
         self.region
     }
 
-    /// Top-down BGRA bytes. The host forces screenshot alpha to opaque.
-    pub fn bytes(&self) -> &[u8] {
-        &self.pixels
+    /// Immutable pixels and their acquisition definition, shared without copying.
+    pub fn image(&self) -> &PinImage {
+        &self.image
     }
 
     /// Captured corner radius in source-image physical pixels.

@@ -1,15 +1,55 @@
 //! Bounded, local image-file preparation. Called only from background tasks.
 use crate::PinImage;
+use snapclip_model::pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource};
 use std::io::Read as _;
+use std::{borrow::Cow, sync::Arc};
 use yue_component::{
     ImagePreviewColorSpace, ImagePreviewImage, ImagePreviewLimits, ImagePreviewPixels,
 };
 
-/// GPUI consumes BGRA; keep the immutable RGBA source for clipboard copying.
-/// This runs on the worker, without a PNG encode/decode round trip.
+/// Prepare a display derivative on the worker. The shared immutable source
+/// retains its precision, absolute luminance, alpha and acquisition generation.
 pub(crate) fn render(image: &PinImage) -> Result<ImagePreviewImage, String> {
-    ImagePreviewImage::from_rgba8(image.width(), image.height(), image.rgba(), "贴图图片")
-        .map_err(|error| error.to_string())
+    let source = image.pixels();
+    let descriptor = source.descriptor();
+    let prepared = if descriptor.format() == snapclip_model::PixelFormat::Bgra8Unorm {
+        let bytes = if descriptor.alpha() == AlphaMode::Premultiplied {
+            Cow::Owned(
+                snapclip_model::pixel_color::to_sdr_bgra8(source, 100.0)
+                    .map_err(str::to_owned)?
+                    .into_bytes(),
+            )
+        } else {
+            Cow::Borrowed(source.as_bytes())
+        };
+        ImagePreviewPixels::from_bgra8(image.width(), image.height(), bytes)
+    } else {
+        let bytes = if descriptor.alpha() == AlphaMode::Premultiplied {
+            Cow::Owned(
+                snapclip_model::pixel_color::linear_rgba(source)
+                    .flatten()
+                    .flat_map(|v| half::f16::from_f64(v).to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            )
+        } else {
+            Cow::Borrowed(source.as_bytes())
+        };
+        let encoding = if image.is_hdr() {
+            ImagePreviewColorSpace::ScRgb
+        } else {
+            ImagePreviewColorSpace::LinearSrgb
+        };
+        ImagePreviewPixels::from_rgba16f(
+            image.width(),
+            image.height(),
+            source.row_stride(),
+            bytes,
+            encoding,
+        )
+    };
+    prepared
+        .and_then(|pixels| pixels.into_preview(&ImagePreviewLimits::default(), "贴图图片"))
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn load(path: &str) -> Result<PinImage, String> {
@@ -25,25 +65,46 @@ pub(crate) fn load(path: &str) -> Result<PinImage, String> {
     if bytes.len() > 64 * 1024 * 1024 {
         return Err("图片文件超过 64 MiB".into());
     }
-    decode(&bytes)
+    decode_image(&bytes)
 }
-fn decode(bytes: &[u8]) -> Result<PinImage, String> {
+pub fn decode_image(bytes: &[u8]) -> Result<PinImage, String> {
     let limits = ImagePreviewLimits::default()
         .max_pixels(24_000_000)
         .max_decode_bytes(24_000_000 * 8);
     let decoded = ImagePreviewPixels::decode(bytes, &limits).map_err(|e| e.to_string())?;
     let [w, h] = decoded.pixel_size();
-    if decoded.color_space() == ImagePreviewColorSpace::ScRgb {
-        return Err("当前贴图像素模型仅支持 SDR；HDR 原图未被转换或截断".into());
+    let descriptor = match decoded.color_space() {
+        ImagePreviewColorSpace::Srgb => PixelDescriptor::bgra8(),
+        encoding => PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            if encoding == ImagePreviewColorSpace::ScRgb {
+                PixelEncoding::ScRgb
+            } else {
+                PixelEncoding::LinearSrgb
+            },
+            AlphaMode::Straight,
+        )
+        .map_err(str::to_owned)?,
+    };
+    let swap = descriptor == PixelDescriptor::bgra8() && !decoded.is_bgra8();
+    let mut bytes = decoded.into_bytes();
+    if swap {
+        for pixel in bytes.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
     }
-    // The current pin model is an SDR copy source. Converting high-precision
-    // SDR is explicit; the file identity still references the original file.
-    PinImage::new(w, h, decoded.into_sdr_rgba8()).ok_or_else(|| "图片为空".into())
+    let pixels = PixelBuffer::from_tight(w, h, descriptor, bytes).map_err(str::to_owned)?;
+    PinImage::from_pixels(PixelSource::new(descriptor, 0), Arc::new(pixels))
+        .ok_or_else(|| "图片为空".into())
 }
 
 pub(crate) fn encode(image: &PinImage, thumbnail: bool) -> Result<Vec<u8>, String> {
-    let rgba = image::RgbaImage::from_raw(image.width(), image.height(), image.rgba().to_vec())
-        .ok_or("图片尺寸错误")?;
+    let rgba = image::RgbaImage::from_raw(
+        image.width(),
+        image.height(),
+        image.sdr_rgba().map_err(str::to_owned)?,
+    )
+    .ok_or("图片尺寸错误")?;
     let image = image::DynamicImage::ImageRgba8(rgba);
     let image = if thumbnail {
         image.thumbnail(768, 384)
@@ -59,6 +120,7 @@ pub(crate) fn encode(image: &PinImage, thumbnail: bool) -> Result<Vec<u8>, Strin
 
 #[cfg(test)]
 mod tests {
+    use super::decode_image as decode;
     use super::*;
     #[test]
     fn sixteen_bit_sdr_has_an_explicit_eight_bit_copy_derivative() {
@@ -69,7 +131,84 @@ mod tests {
             .write_to(&mut encoded, image::ImageFormat::Png)
             .unwrap();
         let image = decode(encoded.get_ref()).unwrap();
-        assert_eq!(image.rgba(), [64, 128, 191, 255]);
+        assert_eq!(
+            image.pixels().descriptor().encoding(),
+            PixelEncoding::LinearSrgb
+        );
+        assert_eq!(image.pixels().as_bytes().len(), 8);
+        assert_eq!(
+            render(&image).unwrap().color_space(),
+            ImagePreviewColorSpace::LinearSrgb
+        );
+        assert_eq!(image.sdr_rgba().unwrap(), [64, 128, 191, 255]);
+    }
+    #[test]
+    fn pq_file_decodes_and_renders_hdr_without_an_sdr_intermediate() {
+        let mut bytes = Vec::new();
+        let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Sixteen);
+        {
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_chunk(png::chunk::cICP, &[9, 16, 0, 1])
+                .unwrap();
+            let codes: Vec<u8> = [49271_u16, 49271, 49271, 32768]
+                .into_iter()
+                .flat_map(u16::to_be_bytes)
+                .collect();
+            writer.write_image_data(&codes).unwrap();
+        }
+        let source = decode(&bytes).unwrap();
+        assert!(source.is_hdr());
+        let original = source.pixels().as_bytes().to_vec();
+        let preview = render(&source).unwrap();
+        assert_eq!(preview.color_space(), ImagePreviewColorSpace::ScRgb);
+        assert_eq!(preview.image().as_bytes(0).unwrap(), original);
+        let r = half::f16::from_le_bytes(original[..2].try_into().unwrap()).to_f32();
+        assert!((r - 12.5).abs() < 0.02);
+        let sdr = decode(&encode(&source, false).unwrap()).unwrap();
+        assert!(!sdr.is_hdr());
+        assert_eq!(sdr.sdr_rgba().unwrap()[3], 128);
+        assert_eq!(source.pixels().as_bytes(), original);
+    }
+    #[test]
+    fn render_preserves_extended_rgb_and_normalizes_associated_alpha_once() {
+        for alpha in [AlphaMode::Straight, AlphaMode::Premultiplied] {
+            let descriptor = PixelDescriptor::new(
+                snapclip_model::PixelFormat::Rgba16Float,
+                PixelEncoding::ScRgb,
+                alpha,
+            )
+            .unwrap();
+            let values = if alpha == AlphaMode::Straight {
+                [-0.25_f32, 2.5, 0.5, 0.5]
+            } else {
+                [-0.125, 1.25, 0.25, 0.5]
+            };
+            let bytes: Vec<u8> = values
+                .into_iter()
+                .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+                .collect();
+            let source =
+                Arc::new(PixelBuffer::from_tight(1, 1, descriptor, bytes.clone()).unwrap());
+            let image =
+                PinImage::from_pixels(PixelSource::new(descriptor, 7), source.clone()).unwrap();
+            let preview = render(&image).unwrap();
+            let rendered: Vec<f32> = preview
+                .image()
+                .as_bytes(0)
+                .unwrap()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_le_bytes(*b).to_f32())
+                .collect();
+            assert_eq!(rendered, [-0.25, 2.5, 0.5, 0.5]);
+            assert_eq!(source.as_bytes(), bytes);
+            assert!(Arc::ptr_eq(image.pixels(), &source));
+            assert_eq!(image.pixel_source().generation(), 7);
+        }
     }
     #[test]
     fn render_converts_channels_once_without_changing_source_or_alpha() {
@@ -81,20 +220,20 @@ mod tests {
             rendered.image().as_bytes(0).unwrap(),
             [17, 70, 180, 0, 93, 21, 45, 127]
         );
-        assert_eq!(source.rgba(), &rgba);
+        assert_eq!(source.sdr_rgba().unwrap(), rgba);
     }
     #[test]
     fn local_file_preview_keeps_original_pixels_and_alpha() {
         let original = PinImage::new(2, 1, vec![255, 0, 0, 0, 0, 255, 0, 127]).unwrap();
         let encoded = encode(&original, false).unwrap();
         let decoded = decode(&encoded).unwrap();
-        assert_eq!(decoded.rgba(), original.rgba());
+        assert_eq!(decoded.sdr_rgba().unwrap(), original.sdr_rgba().unwrap());
         let file =
             std::env::temp_dir().join(format!("snapclip-pin-preview-{}.png", std::process::id()));
         std::fs::write(&file, &encoded).unwrap();
         let loaded = load(file.to_str().unwrap()).unwrap();
         std::fs::remove_file(file).unwrap();
-        assert_eq!(loaded.rgba(), original.rgba());
+        assert_eq!(loaded.sdr_rgba().unwrap(), original.sdr_rgba().unwrap());
         assert_eq!((loaded.width(), loaded.height()), (2, 1));
         assert!(decode(b"not an image").is_err());
         assert!(
@@ -131,6 +270,6 @@ mod tests {
         assert_eq!(preview.pixel_size(), [10000, 1]);
         assert_eq!(preview.texture_size(), [8192, 1]);
         assert!(preview.is_proxy());
-        assert_eq!(image.rgba(), pixels);
+        assert_eq!(image.sdr_rgba().unwrap(), pixels);
     }
 }

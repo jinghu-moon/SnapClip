@@ -24,7 +24,29 @@ pub fn decode_encoded(bytes: &[u8]) -> Result<PinImage, ReadError> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| ReadError::InvalidImage)?;
+    // The framework-free fallback only claims ordinary unprofiled eight-bit
+    // sRGB. A production host injects its shared color-managed decoder; never
+    // quantize PNG16/PQ or discard an embedded profile in this fallback.
+    if reader.format() == Some(image::ImageFormat::Png) {
+        let png = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .map_err(|_| ReadError::InvalidImage)?;
+        let info = png.info();
+        if info.bit_depth == png::BitDepth::Sixteen
+            || info.icc_profile.is_some()
+            || info.coding_independent_code_points.is_some()
+        {
+            return Err(ReadError::Unsupported);
+        }
+    }
     let mut decoder = reader.into_decoder().map_err(|_| ReadError::InvalidImage)?;
+    if decoder
+        .icc_profile()
+        .map_err(|_| ReadError::InvalidImage)?
+        .is_some()
+    {
+        return Err(ReadError::Unsupported);
+    }
     let (width, height) = decoder.dimensions();
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return Err(ReadError::TooLarge);

@@ -13,6 +13,7 @@ use crate::{CaptureError, CaptureResult};
 use snapclip_model::pixels::{PixelBuffer, PixelDescriptor, PixelSource};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::color_output::ColorSnapshot;
 use super::monitor::CapturedMonitor;
 use super::win::bitblt;
 use super::win::d3d11::{GpuFrame, GraphicsDevice};
@@ -56,9 +57,13 @@ pub struct FrozenFrame {
     device: Option<Arc<GraphicsDevice>>,
     /// Filled on first use. `OnceLock` because the readback must happen at most once.
     pixels: OnceLock<PixelBuffer>,
+    color_snapshot: ColorSnapshot,
 }
 
 impl FrozenFrame {
+    pub fn color_snapshot(&self) -> &ColorSnapshot {
+        &self.color_snapshot
+    }
     /// The GPU texture of the frozen frame, if the provider produced one.
     #[allow(dead_code)]
     pub fn texture(&self) -> Option<&GpuFrame> {
@@ -304,8 +309,37 @@ impl CaptureProviders {
     /// Tries the preferred provider first and falls back to BitBlt when WGC is
     /// unavailable, so a machine without WGC still gets a working screenshot.
     pub fn capture(&mut self, monitor: &CapturedMonitor) -> CaptureResult<FrozenFrame> {
+        // Existing UI explicitly requests compatibility SDR until every consumer
+        // has a high-precision path. This is not an HDR fallback.
+        self.capture_impl(monitor, false)
+    }
+
+    /// Acquire without discarding Advanced Color. The UI must not call this
+    /// until its export, scroll and display consumers accept the typed source.
+    pub fn capture_preserving_color(
+        &mut self,
+        monitor: &CapturedMonitor,
+    ) -> CaptureResult<FrozenFrame> {
+        self.capture_impl(monitor, true)
+    }
+
+    fn capture_impl(
+        &mut self,
+        monitor: &CapturedMonitor,
+        preserve_color: bool,
+    ) -> CaptureResult<FrozenFrame> {
         let started_at = Instant::now();
-        let attempts = attempt_order(self.preferred);
+        let snapshot = ColorSnapshot::query(monitor.handle).unwrap_or_else(|error| {
+            self.diagnostics
+                .push(format!("display color unavailable: {error}"));
+            ColorSnapshot::unknown(monitor.handle)
+        });
+        let descriptor = if preserve_color {
+            snapshot.capture_descriptor()
+        } else {
+            PixelDescriptor::bgra8()
+        };
+        let attempts = attempt_order(self.preferred, descriptor);
 
         let mut last_error: Option<CaptureError> = None;
         for provider in attempts {
@@ -315,8 +349,15 @@ impl CaptureProviders {
                 monitor.width(),
                 monitor.height()
             );
-            match self.capture_with(provider, monitor) {
+            match self.capture_with(provider, monitor, descriptor, &snapshot) {
                 Ok(frame) => {
+                    let after = ColorSnapshot::query(monitor.handle)
+                        .unwrap_or_else(|_| ColorSnapshot::unknown(monitor.handle));
+                    if snapshot != after {
+                        return Err(CaptureError::CaptureFailed(
+                            "display color changed during acquisition; retry the capture".into(),
+                        ));
+                    }
                     eprintln!(
                         "[snapclip][capture] provider success={} elapsed_ms={}",
                         provider.name(),
@@ -333,7 +374,9 @@ impl CaptureProviders {
                     );
                     self.diagnostics
                         .push(format!("{} provider failed: {error}", provider.name()));
-                    self.preferred = Some(ProviderKind::BitBlt);
+                    if descriptor == PixelDescriptor::bgra8() {
+                        self.preferred = Some(ProviderKind::BitBlt);
+                    }
                     last_error = Some(error);
                 }
             }
@@ -347,10 +390,11 @@ impl CaptureProviders {
         &self,
         provider: ProviderKind,
         monitor: &CapturedMonitor,
+        descriptor: PixelDescriptor,
+        color_snapshot: &ColorSnapshot,
     ) -> CaptureResult<FrozenFrame> {
         match provider {
             ProviderKind::Wgc => {
-                let descriptor = PixelDescriptor::bgra8();
                 // No readback here: L0 renders from this texture and the CPU copy is
                 // produced lazily only if an artifact is actually exported.
                 let gpu =
@@ -364,6 +408,7 @@ impl CaptureProviders {
                     self.device.clone(),
                     None,
                     descriptor,
+                    color_snapshot.clone(),
                 )
             }
             ProviderKind::BitBlt => {
@@ -385,6 +430,7 @@ impl CaptureProviders {
                     self.device.clone(),
                     Some(cpu_pixels),
                     PixelDescriptor::bgra8(),
+                    color_snapshot.clone(),
                 )
             }
         }
@@ -398,6 +444,7 @@ fn frozen_frame(
     device: Arc<GraphicsDevice>,
     pre_materialized_pixels: Option<Vec<u8>>,
     descriptor: PixelDescriptor,
+    color_snapshot: ColorSnapshot,
 ) -> CaptureResult<FrozenFrame> {
     let pixels = OnceLock::new();
     if let Some(buf) = pre_materialized_pixels {
@@ -423,6 +470,7 @@ fn frozen_frame(
         texture,
         device: Some(device),
         pixels,
+        color_snapshot,
     })
 }
 
@@ -482,6 +530,7 @@ pub(crate) fn test_frozen_frame(width: u32, height: u32) -> FrozenFrame {
         pixels: OnceLock::from(
             PixelBuffer::from_tight(width, height, PixelDescriptor::bgra8(), pixels).unwrap(),
         ),
+        color_snapshot: ColorSnapshot::unknown(0),
     }
 }
 
@@ -492,12 +541,17 @@ pub(crate) fn test_frozen_frame(width: u32, height: u32) -> FrozenFrame {
 /// out — still falls back to a frame instead of failing the session outright
 /// (docs/11 §3.2). Keeping this decision pure makes the fallback contract unit
 /// testable without a GPU.
-fn attempt_order(preferred: Option<ProviderKind>) -> Vec<ProviderKind> {
+fn attempt_order(
+    preferred: Option<ProviderKind>,
+    descriptor: PixelDescriptor,
+) -> Vec<ProviderKind> {
     let mut attempts = Vec::new();
     if preferred == Some(ProviderKind::Wgc) {
         attempts.push(ProviderKind::Wgc);
     }
-    attempts.push(ProviderKind::BitBlt);
+    if descriptor == PixelDescriptor::bgra8() {
+        attempts.push(ProviderKind::BitBlt);
+    }
     attempts
 }
 
@@ -664,7 +718,7 @@ mod tests {
         // A WGC-preferred session must attempt BitBlt as well, so a first-frame
         // timeout cannot fail the session outright (docs/11 §3.2).
         assert_eq!(
-            attempt_order(Some(ProviderKind::Wgc)),
+            attempt_order(Some(ProviderKind::Wgc), PixelDescriptor::bgra8()),
             vec![ProviderKind::Wgc, ProviderKind::BitBlt]
         );
     }
@@ -675,10 +729,30 @@ mod tests {
         // next session must not re-attempt the broken WGC path, and a machine
         // that never had WGC goes straight to BitBlt.
         assert_eq!(
-            attempt_order(Some(ProviderKind::BitBlt)),
+            attempt_order(Some(ProviderKind::BitBlt), PixelDescriptor::bgra8()),
             vec![ProviderKind::BitBlt]
         );
-        assert_eq!(attempt_order(None), vec![ProviderKind::BitBlt]);
+        assert_eq!(
+            attempt_order(None, PixelDescriptor::bgra8()),
+            vec![ProviderKind::BitBlt]
+        );
+    }
+
+    #[test]
+    fn high_precision_never_falls_back_to_bitblt() {
+        use snapclip_model::pixels::{AlphaMode, PixelEncoding};
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        assert_eq!(
+            attempt_order(Some(ProviderKind::Wgc), descriptor),
+            vec![ProviderKind::Wgc]
+        );
+        assert!(attempt_order(Some(ProviderKind::BitBlt), descriptor).is_empty());
+        assert!(attempt_order(None, descriptor).is_empty());
     }
 
     #[test]

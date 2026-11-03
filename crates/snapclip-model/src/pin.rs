@@ -43,32 +43,59 @@ impl TextSpan {
 
 #[derive(Debug, Clone)]
 pub struct PinImage {
-    width: u32,
-    height: u32,
-    rgba: Arc<Vec<u8>>,
+    source: crate::pixels::PixelSource,
+    pixels: Arc<crate::pixels::PixelBuffer>,
 }
 impl PinImage {
-    pub fn new(width: u32, height: u32, rgba: Vec<u8>) -> Option<Self> {
-        (width > 0
-            && height > 0
-            && u64::from(width)
-                .checked_mul(u64::from(height))
-                .and_then(|n| n.checked_mul(4))
-                == Some(rgba.len() as u64))
-        .then(|| Self {
-            width,
-            height,
-            rgba: Arc::new(rgba),
-        })
+    pub fn new(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Self> {
+        let descriptor = crate::pixels::PixelDescriptor::bgra8();
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        let pixels =
+            crate::pixels::PixelBuffer::from_tight(width, height, descriptor, rgba).ok()?;
+        Self::from_pixels(
+            crate::pixels::PixelSource::new(descriptor, 0),
+            Arc::new(pixels),
+        )
+    }
+    pub fn from_pixels(
+        source: crate::pixels::PixelSource,
+        pixels: Arc<crate::pixels::PixelBuffer>,
+    ) -> Option<Self> {
+        (source.descriptor() == pixels.descriptor()).then_some(Self { source, pixels })
+    }
+    pub fn pixel_source(&self) -> crate::pixels::PixelSource {
+        self.source
+    }
+    pub fn pixels(&self) -> &Arc<crate::pixels::PixelBuffer> {
+        &self.pixels
+    }
+    pub fn is_hdr(&self) -> bool {
+        self.source.descriptor().encoding() == crate::pixels::PixelEncoding::ScRgb
+    }
+    /// Compatibility copying is always an explicit SDR derivative. Display and
+    /// re-export read `pixels()`, never this buffer.
+    pub fn sdr_rgba(&self) -> Result<Vec<u8>, &'static str> {
+        let peak = if self.is_hdr() {
+            crate::pixel_color::linear_rgba(&self.pixels)
+                .filter(|p| p[3] > 0.0)
+                .map(|p| p[0].max(p[1]).max(p[2]) * 80.0)
+                .fold(100.0_f64, f64::max)
+        } else {
+            100.0
+        };
+        let mut bytes = crate::pixel_color::to_sdr_bgra8(&self.pixels, peak)?.into_bytes();
+        for pixel in bytes.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        Ok(bytes)
     }
     pub fn width(&self) -> u32 {
-        self.width
+        self.pixels.size()[0]
     }
     pub fn height(&self) -> u32 {
-        self.height
-    }
-    pub fn rgba(&self) -> &[u8] {
-        &self.rgba
+        self.pixels.size()[1]
     }
 }
 
@@ -219,6 +246,7 @@ pub struct PinSnapshot {
     text: Option<Arc<str>>,
     sources: Vec<(String, Arc<[u8]>)>,
     image: Option<PinImage>,
+    notice: Option<Arc<str>>,
 }
 impl PinSnapshot {
     pub fn new(content: PinContent) -> Self {
@@ -227,6 +255,7 @@ impl PinSnapshot {
             text: None,
             sources: vec![],
             image: None,
+            notice: None,
         }
     }
     pub fn with_text(mut self, text: impl Into<Arc<str>>) -> Self {
@@ -244,6 +273,13 @@ impl PinSnapshot {
     pub fn content(&self) -> &PinContent {
         &self.content
     }
+    pub fn with_notice(mut self, notice: impl Into<Arc<str>>) -> Self {
+        self.notice = Some(notice.into());
+        self
+    }
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
     pub fn text(&self) -> Option<&str> {
         self.text.as_deref()
     }
@@ -254,13 +290,14 @@ impl PinSnapshot {
         self.image.as_ref()
     }
     pub fn retained_bytes(&self) -> usize {
-        let image = |i: &PinImage| i.rgba().len();
+        let image = |i: &PinImage| i.pixels.as_bytes().len();
         let primary = match &self.content {
             PinContent::Image(i) => image(i) * 2,
             PinContent::Document(d) => d.text.len() + d.html.as_ref().map_or(0, |h| h.len()),
             PinContent::Files(f) => f.iter().map(|f| f.path.len() + f.name.len()).sum(),
         };
         primary
+            + self.notice.as_ref().map_or(0, |s| s.len())
             + self.text.as_ref().map_or(0, |t| t.len())
             + self.sources.iter().map(|(_, s)| s.len()).sum::<usize>()
             + self.image.as_ref().map_or(0, image)
@@ -271,12 +308,46 @@ impl PinSnapshot {
 mod tests {
     use super::*;
     #[test]
+    fn hdr_pin_keeps_typed_source_and_uses_an_explicit_sdr_copy() {
+        use crate::pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource};
+        let descriptor = PixelDescriptor::new(
+            crate::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let bytes: Vec<u8> = [2.5_f32, 2.5, 2.5, 0.5]
+            .into_iter()
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let source = PixelSource::new(descriptor, 19);
+        let image = PinImage::from_pixels(
+            source,
+            Arc::new(PixelBuffer::from_tight(1, 1, descriptor, bytes.clone()).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(image.pixel_source(), source);
+        assert_eq!(image.pixels().as_bytes(), bytes);
+        assert_eq!(image.sdr_rgba().unwrap()[3], 128);
+        assert_eq!(image.pixels().as_bytes(), bytes);
+        assert!(
+            PinImage::from_pixels(
+                PixelSource::new(PixelDescriptor::bgra8(), 19),
+                image.pixels().clone()
+            )
+            .is_none()
+        );
+    }
+    #[test]
     fn images_require_exact_nonempty_pixels() {
         assert!(PinImage::new(0, 1, vec![]).is_none());
         assert!(PinImage::new(u32::MAX, u32::MAX, vec![]).is_none());
         assert!(PinImage::new(2, 2, vec![0; 15]).is_none());
         assert_eq!(
-            PinImage::new(1, 1, vec![1, 2, 3, 4]).unwrap().rgba(),
+            PinImage::new(1, 1, vec![1, 2, 3, 4])
+                .unwrap()
+                .sdr_rgba()
+                .unwrap(),
             &[1, 2, 3, 4]
         );
     }

@@ -183,7 +183,8 @@ impl ExportSource {
                     spec.source.descriptor(),
                     bgra,
                 )
-                .map_err(|message| CaptureError::EncodeFailed(message.into()))?,
+                .map_err(|message| CaptureError::EncodeFailed(message.into()))?
+                .into(),
                 origin: spec.origin,
                 corner_radius: spec.corner_radius,
             });
@@ -544,7 +545,8 @@ mod tests {
                 snapclip_model::pixels::PixelDescriptor::bgra8(),
                 vec![0; 64],
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             origin: Some(crate::geometry::Point::new(0, 0)),
         }
     }

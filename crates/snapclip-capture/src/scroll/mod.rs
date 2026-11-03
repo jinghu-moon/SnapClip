@@ -23,8 +23,30 @@ pub(crate) mod thumb;
 
 use backed::BackedCanvas;
 use estimate::{Estimate, FrameSig, estimate};
+use snapclip_model::pixels::{PixelBuffer, PixelDescriptor, PixelSource};
 use stitch::{CanvasStore, Placement, Stitcher};
 use thumb::Thumb;
+
+/// A fixed analysis transform for the entire session. Adapting to each frame's
+/// peak would change unchanged page colors and destabilize content matching.
+fn analysis_bytes(
+    source: PixelSource,
+    width: u32,
+    rows: u32,
+    bytes: &[u8],
+) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    if source.descriptor() == PixelDescriptor::bgra8() {
+        if bytes.len() != width as usize * rows as usize * 4 {
+            return Err("invalid SDR analysis frame length".into());
+        }
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    let pixels = PixelBuffer::from_tight(width, rows, source.descriptor(), bytes.to_vec())
+        .map_err(str::to_owned)?;
+    let mapped =
+        snapclip_model::pixel_color::to_sdr_bgra8(&pixels, 10000.0).map_err(str::to_owned)?;
+    Ok(std::borrow::Cow::Owned(mapped.into_bytes()))
+}
 
 /// The long image is capped at this many selection heights (the reference implementation's cap).
 /// How many viewport heights an automatic scroll may reach.
@@ -166,6 +188,7 @@ pub(crate) fn scroll_format(
 
 #[derive(Debug)]
 pub(crate) struct Tracker {
+    source: PixelSource,
     width: u32,
     view: u32,
     reference: FrameSig,
@@ -182,6 +205,7 @@ pub(crate) struct Tracker {
 impl Tracker {
     /// `first` is the selection's first frame, `width × view` BGRA; `thumb_width` the widest
     /// thumbnail the panel shows.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new(first: &[u8], width: u32, view: u32, thumb_width: u32) -> Self {
         Self::with_rows(
             first,
@@ -194,35 +218,63 @@ impl Tracker {
 
     /// The same tracker with an explicit canvas row cap, so a test can drive the byte budget
     /// without allocating half a gigabyte.
+    #[cfg(any(test, feature = "test-support"))]
     fn with_rows(first: &[u8], width: u32, view: u32, thumb_width: u32, max_rows: u32) -> Self {
+        Self::with_source_rows(
+            first,
+            width,
+            view,
+            thumb_width,
+            max_rows,
+            PixelSource::new(PixelDescriptor::bgra8(), 0),
+        )
+        .expect("the SDR tracker fixture must be valid")
+    }
+
+    pub(crate) fn from_pixels(
+        source: PixelSource,
+        first: &PixelBuffer,
+        thumb_width: u32,
+    ) -> Result<Self, String> {
+        if first.descriptor() != source.descriptor() {
+            return Err("scroll pixels differ from their source".into());
+        }
+        let [width, view] = first.size();
+        let row_bytes = first.row_stride();
+        let rows = (MAX_BYTES / row_bytes)
+            .min(MAX_SCREENS as usize * view as usize)
+            .max(view as usize)
+            .min(u32::MAX as usize) as u32;
+        Self::with_source_rows(first.as_bytes(), width, view, thumb_width, rows, source)
+    }
+
+    fn with_source_rows(
+        first: &[u8],
+        width: u32,
+        view: u32,
+        thumb_width: u32,
+        max_rows: u32,
+        source: PixelSource,
+    ) -> Result<Self, String> {
+        let analysis = analysis_bytes(source, width, view, first)?;
         let stitcher = Stitcher::with_store(
-            BackedCanvas::new(
-                first,
-                width,
-                view,
-                max_rows,
-                snapclip_model::PixelFormat::Bgra8Unorm,
-            ),
+            BackedCanvas::new(first, width, view, max_rows, source.descriptor().format()),
             width,
             view,
         );
         let mut thumb = Thumb::new(width, thumb_width);
-        let mut first_frame = vec![0u8; (width * view * 4) as usize];
-        stitcher
-            .store()
-            .read_rows(0, view, &mut first_frame)
-            .expect("the first frame was just written to the store");
-        thumb.refresh(&first_frame, 0, view, 0, 0, view);
-        Self {
+        thumb.refresh(&analysis, 0, view, 0, 0, view);
+        Ok(Self {
+            source,
             width,
             view,
-            reference: FrameSig::of(first, width, view),
+            reference: FrameSig::of(&analysis, width, view),
             stitcher,
             thumb,
             status: Status::Tracking,
             last_thumb_us: 0,
             band: Vec::new(),
-        }
+        })
     }
 
     pub(crate) fn status(&self) -> Status {
@@ -246,8 +298,31 @@ impl Tracker {
     }
 
     /// Measure `frame` against the reference and place it.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn push(&mut self, frame: &[u8]) -> Step {
-        let current = FrameSig::of(frame, self.width, self.view);
+        assert_eq!(self.source.descriptor(), PixelDescriptor::bgra8());
+        self.push_analyzed(frame, frame)
+    }
+
+    pub(crate) fn push_pixels(
+        &mut self,
+        source: PixelSource,
+        frame: &PixelBuffer,
+    ) -> Result<Step, String> {
+        if source != self.source
+            || frame.descriptor() != source.descriptor()
+            || frame.size() != [self.width, self.view]
+        {
+            return Err(
+                "scroll source, dimensions or color generation changed; restart capture".into(),
+            );
+        }
+        let analysis = analysis_bytes(source, self.width, self.view, frame.as_bytes())?;
+        Ok(self.push_analyzed(frame.as_bytes(), &analysis))
+    }
+
+    fn push_analyzed(&mut self, frame: &[u8], analysis: &[u8]) -> Step {
+        let current = FrameSig::of(analysis, self.width, self.view);
         let estimate = estimate(&self.reference, &current);
         let placement = match estimate {
             Estimate::Shift { dy, .. } => {
@@ -307,7 +382,12 @@ impl Tracker {
         let k = self.thumb.factor();
         let first = from.saturating_sub(k);
         let last = (to + k).min(rows);
-        let bytes = ((last - first) as usize) * (self.width as usize * 4);
+        let bytes = ((last - first) as usize)
+            * self
+                .source
+                .descriptor()
+                .row_bytes(self.width)
+                .expect("validated row");
         self.band.clear();
         self.band.resize(bytes, 0);
         if let Err(error) = self
@@ -319,7 +399,14 @@ impl Tracker {
             eprintln!("[snapclip][scroll] the preview cannot be refreshed: {error}");
             return;
         }
-        self.thumb.refresh(&self.band, first, rows, top, from, to);
+        let analysis = match analysis_bytes(self.source, self.width, last - first, &self.band) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                eprintln!("[snapclip][scroll] thumbnail mapping failed: {error}");
+                return;
+            }
+        };
+        self.thumb.refresh(&analysis, first, rows, top, from, to);
         self.last_thumb_us = started.elapsed().as_micros() as u64;
     }
 
@@ -370,7 +457,7 @@ impl Tracker {
         mut f: impl FnMut(u32, &[u8]) -> bool,
     ) -> Result<(), crate::scroll::store::RowReadError> {
         let rows = self.stitcher.rows();
-        let row_bytes = self.width as usize * 4;
+        let row_bytes = self.stitcher.store().row_bytes();
         let band_rows = band_rows.max(1);
         let mut buffer = Vec::new();
         let mut first = 0;
@@ -400,9 +487,11 @@ impl Tracker {
         rows: u32,
         out: &mut [u8],
     ) -> Result<(), crate::scroll::store::RowReadError> {
-        let row_bytes = self.width as usize * 4;
+        let row_bytes = self.stitcher.store().row_bytes();
         if rows == 0
-            || first_row + rows > self.stitcher.rows()
+            || first_row
+                .checked_add(rows)
+                .is_none_or(|end| end > self.stitcher.rows())
             || out.len() != rows as usize * row_bytes
         {
             return Err(crate::scroll::store::RowReadError::OutOfRange);
@@ -507,6 +596,83 @@ mod tests {
     const H: u32 = 200;
     const HEADER: u32 = 30;
     const FOOTER: u32 = 20;
+
+    #[test]
+    fn fp16_scroll_uses_sdr_geometry_and_keeps_original_row_bits() {
+        use crate::ports::BandSource;
+        use snapclip_model::pixels::{
+            AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource,
+        };
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let source = PixelSource::new(descriptor, 53);
+        let hdr = |pixels: Vec<u8>| {
+            let bytes = pixels
+                .chunks_exact(4)
+                .flat_map(|p| {
+                    [
+                        f32::from(p[2]) / 100.0,
+                        f32::from(p[1]) / 100.0,
+                        f32::from(p[0]) / 100.0,
+                        1.0,
+                    ]
+                    .into_iter()
+                    .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+                })
+                .collect();
+            PixelBuffer::from_tight(W, H, descriptor, bytes).unwrap()
+        };
+        let page = page(W, 5000, 22);
+        let first = hdr(frame_at(&page, 0, 0));
+        let first_sdr = snapclip_model::pixel_color::to_sdr_bgra8(&first, 10000.0).unwrap();
+        let mut high = Tracker::from_pixels(source, &first, 40).unwrap();
+        let mut low = Tracker::new(first_sdr.as_bytes(), W, H, 40);
+        for (tick, top) in [64, 128, 192, 256, 320, 256, 192, 128, 64, 0]
+            .into_iter()
+            .enumerate()
+        {
+            let frame = hdr(frame_at(&page, top, tick as u32 + 1));
+            let analysis = snapclip_model::pixel_color::to_sdr_bgra8(&frame, 10000.0).unwrap();
+            let expected = low.push(analysis.as_bytes());
+            assert_eq!(high.push_pixels(source, &frame).unwrap(), expected);
+        }
+        assert!(high.rows() > H);
+        let before = high.rows();
+        assert!(
+            high.push_pixels(PixelSource::new(descriptor, 54), &first)
+                .is_err()
+        );
+        assert_eq!(
+            high.rows(),
+            before,
+            "a new source cannot mutate the old canvas"
+        );
+        let mut bands = ScrollBands::new(high);
+        assert_eq!(bands.source(), source);
+        let mut bytes = Vec::new();
+        assert!(bands.read_rows(0, bands.rows(), &mut bytes));
+        assert_eq!(bytes.len(), bands.rows() as usize * W as usize * 8);
+        // Mapping the stored FP16 canvas must reproduce the SDR oracle's geometry.
+        let (_, rows, expected) = low.into_image().unwrap();
+        assert_eq!(rows, bands.rows());
+        let restored = PixelBuffer::from_tight(W, rows, descriptor, bytes).unwrap();
+        assert_eq!(
+            snapclip_model::pixel_color::to_sdr_bgra8(&restored, 10000.0)
+                .unwrap()
+                .as_bytes(),
+            expected
+        );
+        assert!(
+            restored
+                .as_bytes()
+                .chunks_exact(8)
+                .any(|p| half::f16::from_le_bytes([p[0], p[1]]).to_f32() > 1.0)
+        );
+    }
 
     /// A small deterministic generator, so the scroll sequence is "random" but reproducible.
     struct Lcg(u64);
@@ -1123,17 +1289,14 @@ impl ScrollBands {
 
 impl crate::ports::BandSource for ScrollBands {
     fn source(&self) -> snapclip_model::pixels::PixelSource {
-        snapclip_model::pixels::PixelSource::new(
-            snapclip_model::pixels::PixelDescriptor::bgra8(),
-            0,
-        )
+        self.tracker.source
     }
     fn rows(&self) -> u32 {
         self.tracker.rows()
     }
 
     fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool {
-        let row_bytes = self.tracker.width() as usize * 4;
+        let row_bytes = self.tracker.stitcher.store().row_bytes();
         out.resize(rows as usize * row_bytes, 0);
         match self.tracker.read_rows(first_row, rows, out) {
             Ok(()) => true,

@@ -427,7 +427,8 @@ mod tests {
                 snapclip_model::pixels::PixelDescriptor::bgra8(),
                 bgra,
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         };
 
@@ -507,7 +508,8 @@ mod tests {
                 snapclip_model::pixels::PixelDescriptor::bgra8(),
                 vec![0; 64],
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             origin: Some(snapclip_model::geometry::Point::new(0, 0)),
         };
 
@@ -583,7 +585,8 @@ mod tests {
                 snapclip_model::pixels::PixelDescriptor::bgra8(),
                 bgra,
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             origin: None,
         };
 
@@ -636,7 +639,9 @@ mod tests {
         let selection = SelectionPixels {
             frame,
             region: Rect::new(0, 0, 4, 3),
-            pixels: PixelBuffer::from_tight(4, 3, descriptor, bytes.clone()).unwrap(),
+            pixels: PixelBuffer::from_tight(4, 3, descriptor, bytes.clone())
+                .unwrap()
+                .into(),
             origin: None,
             corner_radius: 0,
         };
@@ -731,7 +736,9 @@ mod tests {
             region: Rect::new(0, 0, 20, 20),
             origin: None,
             corner_radius: 6,
-            pixels: snapclip_capture::artifact::round_pixel_corners(pixels, 6).unwrap(),
+            pixels: snapclip_capture::artifact::round_pixel_corners(pixels, 6)
+                .unwrap()
+                .into(),
         };
         let result = HistoryArtifactWriter::new(&directory)
             .write("rounded-hdr-selection", &selection, 144, None)

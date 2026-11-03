@@ -13,6 +13,7 @@ yue-component = { path = "../../../GPUI-Yue-Component/crates/yue-component", def
 async-channel = "2.5"
 raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp"] }
+half = { version = "2.7", default-features = false, features = ["std"] }
 snapclip-model = { path = "../snapclip-model" }
 snapclip-ui = { path = "../snapclip-ui" }
 

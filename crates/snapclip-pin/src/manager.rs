@@ -22,6 +22,7 @@ pub enum CopyTarget {
     Text(String),
     Files(Vec<String>),
     Pixels(crate::PinImage),
+    HdrPixels(crate::PinImage),
 }
 #[derive(Debug, Clone)]
 pub enum PinCommand {
@@ -113,7 +114,16 @@ impl PinManager {
         if let (PinContent::Image(image), PinPlacement::Screenshot(position, radius)) =
             (snapshot.content(), placement)
         {
-            let image = ImageSource::from_rgba(image.rgba(), image.width(), image.height())?;
+            // The native F6 host is an explicitly SDR-only capability until its
+            // original-position/nonactivation contract moves to GPUI.
+            if image.is_hdr() {
+                anyhow::bail!("原位截图贴图的 HDR 窗口迁移尚未完成，原始像素未被量化");
+            }
+            let image = ImageSource::from_rgba(
+                &image.sdr_rgba().map_err(anyhow::Error::msg)?,
+                image.width(),
+                image.height(),
+            )?;
             let handle = owner.read(cx).native.create_pin(
                 PinRequest::new(image, position)
                     .radius(radius)
@@ -158,6 +168,7 @@ impl PinManager {
         let mut view = None;
         let window = cx.open_window(
             WindowOptions {
+                color_policy: WindowColorPolicy::AutomaticHdr,
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                     point(px(0.), px(0.)),
                     size(px(width), px(height)),
@@ -207,16 +218,10 @@ impl PinManager {
         let region = selection.region();
         let w = u32::try_from(region.width())?;
         let h = u32::try_from(region.height())?;
-        let expected = u64::from(w) * u64::from(h) * 4;
-        if expected != selection.bytes().len() as u64 {
+        if [w, h] != selection.image().pixels().size() {
             anyhow::bail!("截图像素与尺寸不符");
         }
-        let mut rgba = selection.bytes().to_vec();
-        for pixel in rgba.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-            pixel[3] = 255;
-        }
-        let image = crate::PinImage::new(w, h, rgba).ok_or_else(|| anyhow::anyhow!("截图为空"))?;
+        let image = selection.image().clone();
         Self::open(
             Arc::new(PinSnapshot::new(PinContent::Image(image))),
             PinPlacement::Screenshot((region.left, region.top), selection.corner_radius()),

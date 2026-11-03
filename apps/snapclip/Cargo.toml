@@ -17,6 +17,7 @@ gpui-kit = "0.8"
 yue-component = { path = "../../../GPUI-Yue-Component/crates/yue-component", default-features = false }
 # Decode the actual encoded preview; the version is already used by GPUI.
 image = { version = "0.25", default-features = false, features = ["webp", "png", "jpeg"] }
+half = { version = "2.7", default-features = false, features = ["std"] }
 
 # Capability crates, not UI: the shell composes them and owns no feature logic of its own.
 snapclip-model = { path = "../../crates/snapclip-model" }

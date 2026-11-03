@@ -451,7 +451,8 @@ mod save_open_tests {
                 snapclip_model::pixels::PixelDescriptor::bgra8(),
                 [0, 0, 255, 255].repeat(4),
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             origin: Some(snapclip_model::Point::new(0, 0)),
             corner_radius: 0,
         }

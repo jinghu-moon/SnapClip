@@ -233,10 +233,18 @@ impl Win32Renderer {
     /// When the provider produced a GPU texture the bitmap is created directly over it,
     /// so no pixels cross the PCIe bus; GPU-less frames fall back to a one-off upload.
     pub fn set_frame(&mut self, frozen: &FrozenFrame) -> Result<(), String> {
-        // The production provider is SDR. HDR must supply a verified per-output
-        // white snapshot before this entry can accept it; do not guess 80 nit.
-        self.d2d
-            .configure_source(frozen.frame.source.descriptor(), None)?;
+        // Source encoding stays frozen. UI white belongs to the output *now*,
+        // not the source snapshot taken before acquisition.
+        let output = super::color_output::ColorSnapshot::query(frozen.monitor.handle).ok();
+        self.d2d.configure_source(
+            frozen.frame.source.descriptor(),
+            output.as_ref().and_then(|v| v.sdr_white_nits()),
+        )?;
+        // A color-contract change recreates the swap chain. Bind the new target
+        // before presenting rather than leaving composition on the old SDR one.
+        if let Some(swap_chain) = self.d2d.swap_chain() {
+            self.composition.attach(swap_chain)?;
+        }
         if let Some(texture) = frozen.render_source() {
             return self.d2d.set_frame_texture(
                 frozen.frame.width,

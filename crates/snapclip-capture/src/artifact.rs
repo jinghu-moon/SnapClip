@@ -42,7 +42,7 @@ pub struct SelectionPixels {
     /// Clipped, non-empty region the pixels cover.
     pub region: Rect,
     /// `region` sized, top-down, tightly packed.
-    pub pixels: PixelBuffer,
+    pub pixels: std::sync::Arc<PixelBuffer>,
     /// Where `frame`'s own `(0, 0)` sits on the virtual desktop, in physical pixels.
     ///
     /// `region` is expressed in the frame's coordinates, and a frame is one monitor, so
@@ -158,7 +158,7 @@ impl CaptureService {
             corner_radius: 0,
             frame: frame.clone(),
             region: clipped,
-            pixels: buffer,
+            pixels: std::sync::Arc::new(buffer),
         };
         prepared.validate()?;
         Ok(prepared)

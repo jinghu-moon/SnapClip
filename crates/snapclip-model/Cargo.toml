@@ -8,8 +8,10 @@ publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+half = { version = "2.7", default-features = false, features = ["std"] }
+yue-color = { path = "../../../GPUI-Yue-Component/crates/yue-color" }
 
 [dev-dependencies]
 # Test-only: the wire-format test for `ImageDimensions` pins the JSON the front end
-# reads. The crate itself still depends on nothing but `serde`.
+# reads. Production dependencies remain serialization, FP16 value types and pure color math.
 serde_json = "1"

@@ -160,7 +160,8 @@ fn selection(width: u32, height: u32) -> SelectionPixels {
             snapclip_model::pixels::PixelDescriptor::bgra8(),
             bgra,
         )
-        .unwrap(),
+        .unwrap()
+        .into(),
         origin: Some(snapclip_model::geometry::Point::new(0, 0)),
     }
 }

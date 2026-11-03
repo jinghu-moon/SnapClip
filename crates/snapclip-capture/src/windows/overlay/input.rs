@@ -1549,7 +1549,8 @@ mod tests {
                     snapclip_model::pixels::PixelDescriptor::bgra8(),
                     bgra,
                 )
-                .unwrap(),
+                .unwrap()
+                .into(),
                 origin: Some(crate::geometry::Point::new(0, 0)),
                 corner_radius: 0,
             }));
@@ -1617,7 +1618,8 @@ mod tests {
                     snapclip_model::pixels::PixelDescriptor::bgra8(),
                     vec![0; 64],
                 )
-                .unwrap(),
+                .unwrap()
+                .into(),
                 origin: Some(crate::geometry::Point::new(0, 0)),
                 corner_radius: 0,
             }));

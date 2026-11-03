@@ -38,8 +38,11 @@ $FORBIDDEN = @{
     "snapclip-model" = $SHELL_ONLY + @("snapclip-pin", "snapclip-clipboard", "rusqlite", "arboard", "image", "windows", "windows-sys", "snapclip-capture", "snapclip-history", "snapclip-recognize")
 }
 
-# `snapclip-model` is the bottom of the graph: value types and `serde`, nothing else.
-$MODEL_ALLOWED = @("serde", "serde_core", "serde_derive", "serde_json", "serde_derive_internals", "proc-macro2", "quote", "syn", "unicode-ident", "memchr", "itoa", "ryu")
+# `snapclip-model` is the bottom of the graph: serializable value types and pure color
+# math (docs/53 section 11.1). `half` represents FP16 without an image codec; its
+# cfg-if/zerocopy dependencies are listed explicitly rather than allowing its entire
+# transitive graph. UI, platform, codec and capability dependencies remain forbidden.
+$MODEL_ALLOWED = @("serde", "serde_core", "serde_derive", "serde_json", "serde_derive_internals", "proc-macro2", "quote", "syn", "unicode-ident", "memchr", "itoa", "ryu", "half", "cfg-if", "zerocopy", "zerocopy-derive", "yue-color")
 
 function Get-TreeLines([string]$target) {
     $output = & cargo tree -p $target -e normal 2>&1
@@ -86,7 +89,7 @@ foreach ($target in $targets) {
             # The first line of `cargo tree` is the package itself, not a dependency.
             if ($name -eq $target) { continue }
             if ($MODEL_ALLOWED -notcontains $name) {
-                $failures.Add("snapclip-model depends on $name (only serde is allowed)")
+                $failures.Add("snapclip-model depends on $name (only value types, serialization and the explicit pure-math allowlist are allowed)")
             }
         }
     }

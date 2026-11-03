@@ -90,12 +90,11 @@ impl PinSource {
         if region.is_empty() {
             return None;
         }
-        // 这里是唯一一次拷贝：`PinSelection` 要的是自己那份 `Arc<Vec<u8>>`（贴图窗口要
-        // 独立的生命周期，不能用借来的切片，而 `SelectionPixels` 会随捕获侧的槽位一起走）。
-        Some(
-            PinSelection::new(region, Arc::new(selection.sdr_bgra().ok()?.to_vec()))
-                .radius(selection.corner_radius),
-        )
+        // Transfer shared ownership, including precision and acquisition generation.
+        // The pin outlives the capture slot without a second full-image allocation.
+        let image =
+            snapclip_pin::PinImage::from_pixels(selection.source(), selection.pixels.clone())?;
+        Some(PinSelection::new(region, image).radius(selection.corner_radius))
     }
 }
 
@@ -133,7 +132,8 @@ mod tests {
                 snapclip_model::pixels::PixelDescriptor::bgra8(),
                 vec![7; region.width() as usize * region.height() as usize * 4],
             )
-            .unwrap(),
+            .unwrap()
+            .into(),
             origin,
         }
     }
@@ -206,7 +206,7 @@ mod tests {
         let taken = source.take_selection().expect("显示器选区必须能贴");
         // 屏幕坐标 = 显示器原点 + 帧内选区，见 `SelectionPixels::screen_region`。
         assert_eq!(taken.region(), Rect::new(1010, 520, 1040, 550));
-        assert_eq!(taken.bytes().len(), 30 * 30 * 4);
+        assert_eq!(taken.image().pixels().as_bytes().len(), 30 * 30 * 4);
     }
 
     /// 回归：主显示器的原点是 `(0, 0)`，那是一个**真实**的位置。
@@ -224,6 +224,42 @@ mod tests {
             .take_selection()
             .expect("主显示器原点 (0, 0) 是真实位置，必须能贴");
         assert_eq!(taken.region(), Rect::new(10, 20, 40, 50));
+    }
+
+    #[test]
+    fn hdr_selection_transfers_shared_pixels_and_keeps_generation_and_alpha() {
+        use snapclip_model::pixels::{
+            AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource,
+        };
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        )
+        .unwrap();
+        let bytes = [-0.25_f32, 2.5, 0.5, 0.5]
+            .into_iter()
+            .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+            .collect();
+        let pixels = Arc::new(PixelBuffer::from_tight(1, 1, descriptor, bytes).unwrap());
+        let mut frame = frame(1, 1);
+        frame.source = PixelSource::new(descriptor, 91);
+        let home = Arc::new(FakeHome::default());
+        home.put(SelectionPixels {
+            frame,
+            region: Rect::new(0, 0, 1, 1),
+            pixels: pixels.clone(),
+            origin: Some(Point::new(-100, 0)),
+            corner_radius: 1,
+        });
+        let source = PinSource::new();
+        source.set_home(home);
+        let selection = source.take_selection().unwrap();
+        assert_eq!(selection.region(), Rect::new(-100, 0, -99, 1));
+        assert!(Arc::ptr_eq(selection.image().pixels(), &pixels));
+        assert_eq!(selection.image().pixel_source().generation(), 91);
+        assert!(selection.image().is_hdr());
+        assert!(source.take_selection().is_none());
     }
 
     fn frame(width: u32, height: u32) -> snapclip_capture::session::CapturedFrame {

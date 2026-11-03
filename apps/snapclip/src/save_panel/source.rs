@@ -5,7 +5,8 @@ use crate::save::estimate;
 use crate::save::scale::{Frame, Size};
 use crate::save::service::{ConflictPolicy, SaveError, SaveOutcome};
 use snapclip_capture::save_format::SaveFormat;
-use std::sync::{Mutex, OnceLock};
+use snapclip_model::pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The size of the synthetic picture. Small on purpose: its pixels are only ever written to a file
 /// in a test, and a smaller source keeps the real-encode tests quick.
@@ -21,23 +22,45 @@ const CHECKER: [[u8; 4]; 2] = [[0x3e, 0x36, 0x32, 0xff], [0x2a, 0x24, 0x21, 0xff
 /// size with a caption of another.
 #[derive(Clone)]
 pub struct Picture {
-    bgra: Vec<u8>,
-    source: Size,
+    original: Arc<PixelBuffer>,
+    sdr: Arc<OnceLock<PixelBuffer>>,
+    peak_nits: f64,
 }
 
 impl Picture {
     /// Standalone preview accepts a real image path; otherwise it uses a clearly synthetic fixture.
     pub fn preview_example() -> Self {
         if let Some(path) = std::env::var_os("SNAPCLIP_YUE_IMAGE") {
-            let image = image::open(path)
-                .expect("decode SNAPCLIP_YUE_IMAGE")
-                .into_rgba8();
-            let source = Size::new(image.width(), image.height());
-            let mut bgra = image.into_raw();
-            for pixel in bgra.as_chunks_mut::<4>().0 {
-                pixel.swap(0, 2);
+            let bytes = std::fs::read(path).expect("read SNAPCLIP_YUE_IMAGE");
+            let image = yue_component::ImagePreviewPixels::decode(
+                &bytes,
+                &yue_component::ImagePreviewLimits::default(),
+            )
+            .expect("decode color-managed SNAPCLIP_YUE_IMAGE");
+            let [width, height] = image.pixel_size();
+            let descriptor = match image.color_space() {
+                yue_component::ImagePreviewColorSpace::Srgb => PixelDescriptor::bgra8(),
+                encoding => PixelDescriptor::new(
+                    snapclip_model::PixelFormat::Rgba16Float,
+                    if encoding == yue_component::ImagePreviewColorSpace::ScRgb {
+                        PixelEncoding::ScRgb
+                    } else {
+                        PixelEncoding::LinearSrgb
+                    },
+                    AlphaMode::Straight,
+                )
+                .unwrap(),
+            };
+            let mut bytes = image.as_bytes().to_vec();
+            if descriptor == PixelDescriptor::bgra8() && !image.is_bgra8() {
+                for pixel in bytes.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
             }
-            return Self::from_selection(bgra, source);
+            return Self::from_pixels(
+                PixelBuffer::from_tight(width, height, descriptor, bytes)
+                    .expect("validated decoded fixture"),
+            );
         }
         let source = Size::new(1200, 750);
         let mut bgra = Vec::with_capacity(1200 * 750 * 4);
@@ -70,15 +93,13 @@ impl Picture {
                 bgra.extend_from_slice(&pixel);
             }
         }
-        Self { bgra, source }
+        Self::from_selection(bgra, source).expect("synthetic fixture dimensions")
     }
 
     /// The synthetic picture, `FIXTURE_SIZE` in size.
     pub fn synthetic() -> Self {
-        Self {
-            bgra: checker_bgra(FIXTURE_SIZE),
-            source: FIXTURE_SIZE,
-        }
+        Self::from_selection(checker_bgra(FIXTURE_SIZE), FIXTURE_SIZE)
+            .expect("synthetic fixture dimensions")
     }
 
     /// A picture whose middle is fully transparent, so a fill can be seen changing it.
@@ -94,35 +115,135 @@ impl Picture {
                 bgra[at..at + 4].copy_from_slice(&[0, 0, 0, 0]);
             }
         }
-        Self {
-            bgra,
-            source: FIXTURE_SIZE,
-        }
+        Self::from_selection(bgra, FIXTURE_SIZE).expect("synthetic fixture dimensions")
     }
 
     /// The picture a capture handed over: `bgra` is top-down and tightly packed, which is exactly
     /// what [`SelectionPixels::bgra`] promises, so no row walking happens here.
-    pub fn from_selection(bgra: Vec<u8>, source: Size) -> Self {
-        Self { bgra, source }
+    pub fn from_selection(bgra: Vec<u8>, source: Size) -> Result<Self, String> {
+        PixelBuffer::from_tight(source.width, source.height, PixelDescriptor::bgra8(), bgra)
+            .map(Self::from_pixels)
+            .map_err(str::to_owned)
+    }
+
+    pub fn from_pixels(original: PixelBuffer) -> Self {
+        Self::from_shared_pixels(Arc::new(original))
+    }
+
+    pub fn from_shared_pixels(original: Arc<PixelBuffer>) -> Self {
+        let peak_nits = if original.descriptor().encoding() == PixelEncoding::ScRgb {
+            snapclip_model::pixel_color::linear_rgba(&original)
+                .filter(|p| p[3] > 0.0)
+                .map(|p| p[0].max(p[1]).max(p[2]) * 80.0)
+                .fold(100.0_f64, f64::max)
+        } else {
+            100.0
+        };
+        Self {
+            original,
+            sdr: Arc::new(OnceLock::new()),
+            peak_nits,
+        }
+    }
+
+    pub fn is_hdr(&self) -> bool {
+        self.original.descriptor().encoding() == PixelEncoding::ScRgb
+    }
+
+    pub fn original_pixels(&self) -> &PixelBuffer {
+        &self.original
+    }
+
+    /// Explicit compatibility pixels, computed only for SDR output/clipboard.
+    pub fn sdr_pixels(&self) -> &PixelBuffer {
+        if self.original.descriptor() == PixelDescriptor::bgra8() {
+            return &self.original;
+        }
+        self.sdr.get_or_init(|| {
+            snapclip_model::pixel_color::to_sdr_bgra8(&self.original, self.peak_nits)
+                .expect("validated finite source and peak produce an SDR derivative")
+        })
+    }
+
+    pub fn peak_nits(&self) -> f64 {
+        self.peak_nits
+    }
+
+    /// High precision resizing is linear and premultiplied during filtering.
+    /// Original pixels are borrowed when no resize is requested.
+    pub fn resized_pixels(
+        &self,
+        output: Size,
+    ) -> Result<std::borrow::Cow<'_, PixelBuffer>, String> {
+        super::model::validate_preview_size(output).map_err(str::to_owned)?;
+        if output == self.size() {
+            return Ok(std::borrow::Cow::Borrowed(&self.original));
+        }
+        if self.original.descriptor().format() != snapclip_model::PixelFormat::Rgba16Float {
+            let bytes = crate::save::scale::scaled(&self.frame(output));
+            return PixelBuffer::from_tight(
+                output.width,
+                output.height,
+                PixelDescriptor::bgra8(),
+                bytes,
+            )
+            .map(std::borrow::Cow::Owned)
+            .map_err(str::to_owned);
+        }
+        let source = self.size();
+        let rgba: Vec<f32> = snapclip_model::pixel_color::linear_rgba(&self.original)
+            .flat_map(|[r, g, b, a]| [(r * a) as f32, (g * a) as f32, (b * a) as f32, a as f32])
+            .collect();
+        let image = image::Rgba32FImage::from_raw(source.width, source.height, rgba)
+            .ok_or("invalid resize source")?;
+        let resized = image::imageops::resize(
+            &image,
+            output.width,
+            output.height,
+            image::imageops::FilterType::Lanczos3,
+        );
+        let mut bytes = Vec::with_capacity(output.width as usize * output.height as usize * 8);
+        for pixel in resized.pixels() {
+            let a = pixel.0[3].clamp(0.0, 1.0);
+            for channel in &pixel.0[..3] {
+                let straight = if a > 1e-8 { *channel / pixel.0[3] } else { 0.0 };
+                let value = half::f16::from_f32(straight);
+                if !value.is_finite() {
+                    return Err("resized pixel exceeds FP16 range".into());
+                }
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.extend_from_slice(&half::f16::from_f32(a).to_le_bytes());
+        }
+        let descriptor = PixelDescriptor::new(
+            snapclip_model::PixelFormat::Rgba16Float,
+            self.original.descriptor().encoding(),
+            AlphaMode::Straight,
+        )
+        .map_err(str::to_owned)?;
+        PixelBuffer::from_tight(output.width, output.height, descriptor, bytes)
+            .map(std::borrow::Cow::Owned)
+            .map_err(str::to_owned)
     }
 
     /// The capture's own size, which the size cells start at.
     pub fn size(&self) -> Size {
-        self.source
+        let [width, height] = self.original.size();
+        Size::new(width, height)
     }
 
     /// The pixels as the save chain wants them.
     pub fn frame(&self, output: Size) -> Frame<'_> {
         Frame {
-            bgra: &self.bgra,
-            source: self.source,
+            bgra: self.sdr_pixels().as_bytes(),
+            source: self.size(),
             output,
         }
     }
 
     /// The same pixels for the clipboard, which takes straight rows of four bytes.
     pub fn pixels(&self) -> (&[u8], Size) {
-        (&self.bgra, self.source)
+        (self.sdr_pixels().as_bytes(), self.size())
     }
 }
 
@@ -610,10 +731,7 @@ mod tests {
             bgra.push(((seed >> 16) & 0xff) as u8);
             bgra.push(0xff);
         }
-        let picture = Picture {
-            bgra,
-            source: Size::new(128, 96),
-        };
+        let picture = Picture::from_selection(bgra, Size::new(128, 96)).unwrap();
         let mut sizes = Vec::new();
         for tier in 0..3 {
             let name = format!("tier-{tier}");

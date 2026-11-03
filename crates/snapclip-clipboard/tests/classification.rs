@@ -1,6 +1,37 @@
 use snapclip_clipboard::{ImageEncoding, MAX_TEXT_CHARS, ReadError, Snapshot, document, prepare};
 use snapclip_model::pin::{DocumentMode, PinContent};
 
+#[test]
+fn injected_decoder_prefers_png_and_reports_explicit_sdr_fallback() {
+    use snapclip_clipboard::prepare_with_image_decoder;
+    use snapclip_model::pin::PinImage;
+    let snapshot = Snapshot::new(1)
+        .with_image(ImageEncoding::Dib, vec![1])
+        .with_image(ImageEncoding::Png, vec![2]);
+    let mut calls = Vec::new();
+    let prepared = prepare_with_image_decoder(snapshot, |_, encoding| {
+        calls.push(encoding);
+        if encoding == ImageEncoding::Png {
+            return Err(ReadError::InvalidImage);
+        }
+        Ok(PinImage::new(1, 1, vec![20, 40, 60, 128]).unwrap())
+    })
+    .unwrap();
+    assert_eq!(calls, [ImageEncoding::Png, ImageEncoding::Dib]);
+    let pin = prepared.into_pin();
+    assert!(pin.notice().unwrap().contains("SDR"));
+    assert!(matches!(pin.content(), PinContent::Image(image) if !image.is_hdr()));
+
+    let prepared = prepare_with_image_decoder(
+        Snapshot::new(2)
+            .with_image(ImageEncoding::Png, vec![1])
+            .with_files(vec!["C:\\image.png".into()]),
+        |_, _| panic!("file references must not invoke the image decoder"),
+    )
+    .unwrap();
+    assert!(matches!(prepared.content(), PinContent::Files(_)));
+}
+
 fn mode(snapshot: Snapshot) -> DocumentMode {
     match prepare(snapshot).unwrap().content() {
         PinContent::Document(doc) => doc.mode(),
@@ -156,7 +187,7 @@ fn image_wrapper_and_alt_are_not_a_document() {
 fn original_image_resolution_and_transparency_survive() {
     let p = prepare(Snapshot::new(1).with_image(ImageEncoding::Png, png(2400, 2))).unwrap();
     assert!(
-        matches!(p.content(),PinContent::Image(i)if i.width()==2400&&i.height()==2&&i.rgba()[3]==128)
+        matches!(p.content(),PinContent::Image(i)if i.width()==2400&&i.height()==2&&i.sdr_rgba().unwrap()[3]==128)
     );
 }
 #[test]

@@ -153,7 +153,7 @@ impl ImageSource {
 mod tests {
     use super::*;
 
-    /// F6 那条路上两块最贵的搬运的净成本，和窗口、消息、GPU 都无关。
+    /// 旧 F6 GDI 像素转换的成本，和窗口、消息、GPU 都无关。
     ///
     /// 默认跳过（`#[ignore]`）：它是测量而不是断言，数字随机器变，进不了每次
     /// `cargo test`。要拿数字就这样跑：
@@ -162,11 +162,9 @@ mod tests {
     /// cargo test --release -p snapclip-pin --lib pin_bytes_to_u32_throughput -- --ignored --nocapture
     /// ```
     ///
-    /// 两块搬运分别是：
-    /// 1. `PinSource::take_selection` 把捕获侧的 `Vec<u8>` 复制一份交给贴图
-    ///    （`Arc<Vec<u8>>` 装不下借来的切片，这次复制躲不掉）；
-    /// 2. `ImageSource::from_bgra_bytes` 把它重解释成 `Vec<u32>`——**第二份
-    ///    完整副本**，这是当前设计里最该被质疑的一处开销。
+    /// 分别测量字节复制和 `ImageSource::from_bgra_bytes` 的 u32 转换。
+    /// 当前捕获到 PinImage 的交接已共享 `Arc<PixelBuffer>`，不再做第一项复制；
+    /// 本 probe 只保留转换成本的历史对照，不能作为当前端到端资源测量。
     #[test]
     #[ignore = "测量而不是断言；用 --ignored --nocapture 手动跑"]
     fn pin_bytes_to_u32_throughput() {

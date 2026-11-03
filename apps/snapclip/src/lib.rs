@@ -294,15 +294,8 @@ impl Shell {
             })
             .detach();
             events.set_save_opener(std::sync::Arc::new(move |pixels| {
-                let width = (pixels.region.right - pixels.region.left) as u32;
-                let height = (pixels.region.bottom - pixels.region.top) as u32;
-                let picture = crate::save_panel::Picture::from_selection(
-                    pixels
-                        .sdr_bgra()
-                        .map_err(|error| error.to_string())?
-                        .to_vec(),
-                    crate::save::scale::Size::new(width, height),
-                );
+                pixels.validate().map_err(|error| error.to_string())?;
+                let picture = crate::save_panel::Picture::from_shared_pixels(pixels.pixels.clone());
                 requests
                     .try_send(picture)
                     .map_err(|error| format!("{error}"))

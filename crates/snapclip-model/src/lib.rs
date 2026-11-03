@@ -20,6 +20,7 @@ pub mod history;
 pub mod ids;
 pub mod payload;
 pub mod pin;
+pub mod pixel_color;
 pub mod pixels;
 pub mod publication;
 pub mod recognition;

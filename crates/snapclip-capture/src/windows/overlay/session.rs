@@ -917,7 +917,7 @@ impl OverlayController {
                             .map(|layout| Point::new(layout.bounds.left, layout.bounds.top)),
                         frame: frozen.frame.clone(),
                         region: clipped,
-                        pixels,
+                        pixels: pixels.into(),
                     })
                 })
                 .map_err(CaptureError::RenderFailed)
@@ -941,16 +941,18 @@ impl OverlayController {
         // annotated export), and every consumer forks off the same `prepared` below — the pin
         // slot and the export worker alike. Rounding here therefore lands on both destinations
         // once, instead of once per path (docs/23 §14.55.17).
-        prepared.pixels =
-            match crate::artifact::round_pixel_corners(prepared.pixels, self.corner_radius_px) {
-                Ok(pixels) => pixels,
-                Err(error) => {
-                    self.sink.on_failed(Some(&session_id), &error, provider);
-                    self.session.fail();
-                    self.finish_session();
-                    return;
-                }
-            };
+        prepared.pixels = match crate::artifact::round_pixel_corners(
+            std::sync::Arc::unwrap_or_clone(prepared.pixels),
+            self.corner_radius_px,
+        ) {
+            Ok(pixels) => pixels.into(),
+            Err(error) => {
+                self.sink.on_failed(Some(&session_id), &error, provider);
+                self.session.fail();
+                self.finish_session();
+                return;
+            }
+        };
         let export_width = prepared.region.width();
         let export_height = prepared.region.height();
         // Hand the pixels to whoever pins "the thing I just captured" (`F6`). The gesture that

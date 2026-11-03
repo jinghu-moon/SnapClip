@@ -10,11 +10,16 @@ snapclip-model = { path = "../snapclip-model" }
 serde_json = "1"
 blake3 = "1.5"
 image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg", "webp"] }
+png = "0.18"
 html5ever = "0.27"
 markup5ever_rcdom = "0.3"
 url = "2"
 rclip-rtf = { version = "0.1", features = ["std", "codepage"] }
 encoding_rs = "0.8"
+
+[dev-dependencies]
+half = { version = "2.7", default-features = false, features = ["std"] }
+
 [target.'cfg(not(windows))'.dependencies]
 arboard = "3.6"
 
@@ -25,6 +30,3 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Ole", "Win32_System_Threading", "Win32_UI_Controls",
   "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging",
 ] }
-
-[dev-dependencies]
-png = "0.18"

@@ -52,6 +52,8 @@ pub(crate) struct Budgets {
 
 /// How a [`CanvasStore`] holds rows and what it costs to hold them.
 pub(crate) trait CanvasStore {
+    /// Byte width of one raw source row, independent of analysis pixels.
+    fn row_bytes(&self) -> usize;
     /// Rows known so far, i.e. the image height.
     fn rows(&self) -> u32;
 
@@ -193,6 +195,9 @@ impl MemoryCanvas {
 
 #[cfg(test)]
 impl CanvasStore for MemoryCanvas {
+    fn row_bytes(&self) -> usize {
+        self.row()
+    }
     fn rows(&self) -> u32 {
         self.rows
     }
@@ -271,6 +276,9 @@ impl CanvasStore for MemoryCanvas {
 /// A store behind a box is still a store, so a test can drive either implementation through the
 /// same code path (the oracle in `stitch`'s model tests does exactly that).
 impl CanvasStore for Box<dyn CanvasStore> {
+    fn row_bytes(&self) -> usize {
+        (**self).row_bytes()
+    }
     fn rows(&self) -> u32 {
         (**self).rows()
     }

@@ -1,6 +1,5 @@
 //! App-owned image preparation and export revisions; Yue owns the viewport.
 use super::{Export, Picture, SavePanel};
-use crate::save::assemble;
 use gpui_kit::*;
 
 use yue_component::{
@@ -32,23 +31,47 @@ pub(super) struct EncodedPreview {
 /// The capture is already decoded BGRA. Its first display must not depend on
 /// export compression, format support, debounce, or the current output draft.
 pub(super) fn original(picture: &Picture) -> Result<ImagePreviewImage, String> {
-    let (pixels, source) = picture.pixels();
-    let expected = (source.width as usize)
-        .checked_mul(source.height as usize)
-        .and_then(|n| n.checked_mul(4));
-    if source.width == 0 || source.height == 0 || expected != Some(pixels.len()) {
-        return Err("截图像素长度不正确".into());
+    let source = picture.original_pixels();
+    let [width, height] = source.size();
+    let descriptor = source.descriptor();
+    if descriptor.format() == snapclip_model::PixelFormat::Bgra8Unorm {
+        return ImagePreviewImage::from_bgra8(
+            width,
+            height,
+            picture.sdr_pixels().as_bytes(),
+            "原始截图",
+        )
+        .map_err(|e| e.to_string());
     }
-    // Borrow the capture. A proxy allocates only its bounded output buffer;
-    // native-size preparation copies once, without decode or channel conversion.
-    ImagePreviewImage::from_bgra8(source.width, source.height, pixels, "原始截图")
-        .map_err(|e| e.to_string())
+    let bytes = if descriptor.alpha() == snapclip_model::pixels::AlphaMode::Premultiplied {
+        std::borrow::Cow::Owned(
+            snapclip_model::pixel_color::linear_rgba(source)
+                .flatten()
+                .flat_map(|v| half::f16::from_f64(v).to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(source.as_bytes())
+    };
+    let encoding = if picture.is_hdr() {
+        yue_component::ImagePreviewColorSpace::ScRgb
+    } else {
+        yue_component::ImagePreviewColorSpace::LinearSrgb
+    };
+    yue_component::ImagePreviewPixels::from_rgba16f(
+        width,
+        height,
+        source.row_stride(),
+        bytes,
+        encoding,
+    )
+    .and_then(|pixels| pixels.into_preview(&ImagePreviewLimits::default(), "原始截图"))
+    .map_err(|e| e.to_string())
 }
 
 pub(super) fn encode(export: &Export) -> Result<EncodedPreview, String> {
     super::model::validate_preview_size(export.output).map_err(str::to_owned)?;
-    let encoded = assemble::encoded_bytes(&export.values(), &export.picture.frame(export.output))
-        .map_err(|e| e.message())?;
+    let encoded = export.encoded_bytes().map_err(|e| e.message())?;
     // Native detail within the same budget as the source; oversized output is
     // explicitly a proxy. Byte counts still measure the exact export file.
     let encoded_image =
@@ -85,7 +108,11 @@ impl SavePanel {
             .child(
                 YueImagePreview::new(&self.preview.state)
                     .theme(theme)
-                    .result_label("编码后"),
+                    .result_label(if self.picture.is_hdr() && !self.preserve_hdr {
+                        "SDR 结果"
+                    } else {
+                        "编码后"
+                    }),
             )
     }
 }

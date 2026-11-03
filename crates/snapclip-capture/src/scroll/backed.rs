@@ -675,6 +675,9 @@ impl BackedCanvas {
 }
 
 impl CanvasStore for BackedCanvas {
+    fn row_bytes(&self) -> usize {
+        self.row
+    }
     fn rows(&self) -> u32 {
         self.rows
     }

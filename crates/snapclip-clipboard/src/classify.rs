@@ -56,6 +56,19 @@ pub fn prepare_files(paths: &[String]) -> Result<Vec<PinFile>, ReadError> {
 }
 
 pub fn prepare(snapshot: Snapshot) -> Result<PreparedSnapshot, ReadError> {
+    prepare_with_image_decoder(snapshot, image::decode)
+}
+
+/// Prepare representations using the host's color-managed decoder. The clipboard
+/// crate owns bounded I/O, ordering and classification, without depending on a UI
+/// renderer. The decoder must preserve the source color definition and precision.
+pub fn prepare_with_image_decoder(
+    snapshot: Snapshot,
+    mut decode: impl FnMut(
+        &[u8],
+        crate::ImageEncoding,
+    ) -> Result<snapclip_model::pin::PinImage, ReadError>,
+) -> Result<PreparedSnapshot, ReadError> {
     if snapshot.byte_len() > MAX_BYTES {
         return Err(ReadError::TooLarge);
     }
@@ -64,16 +77,37 @@ pub fn prepare(snapshot: Snapshot) -> Result<PreparedSnapshot, ReadError> {
     }
     let mut image = None;
     let mut image_error = ReadError::InvalidImage;
+    let mut png_failed = false;
+    let mut notice = None;
     // File references remain files: their incidental bitmap representation is not a preview request.
     if snapshot.files.is_empty() {
-        for (format, bytes) in &snapshot.images {
-            match image::decode(bytes, *format) {
+        let candidates = snapshot
+            .images
+            .iter()
+            .filter(|(f, _)| *f == crate::ImageEncoding::Png)
+            .chain(
+                snapshot
+                    .images
+                    .iter()
+                    .filter(|(f, _)| *f != crate::ImageEncoding::Png),
+            );
+        for (format, bytes) in candidates {
+            match decode(bytes, *format) {
                 Ok(decoded) => {
+                    if png_failed && *format == crate::ImageEncoding::Dib && !decoded.is_hdr() {
+                        notice = Some("PNG 表示无法读取，当前显示 DIB 的 SDR 副本".into());
+                    }
                     image = Some(decoded);
                     break;
                 }
-                Err(ReadError::TooLarge) => image_error = ReadError::TooLarge,
-                Err(_) => {}
+                Err(error) => {
+                    if *format == crate::ImageEncoding::Png {
+                        png_failed = true;
+                    }
+                    if error == ReadError::TooLarge {
+                        image_error = ReadError::TooLarge;
+                    }
+                }
             }
         }
     }
@@ -216,5 +250,6 @@ pub fn prepare(snapshot: Snapshot) -> Result<PreparedSnapshot, ReadError> {
         content,
         image,
         fingerprint,
+        notice,
     })
 }

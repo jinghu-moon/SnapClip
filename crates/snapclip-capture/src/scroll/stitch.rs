@@ -38,7 +38,6 @@ pub(crate) enum Placement {
 /// Places frames into a [`CanvasStore`].
 #[derive(Debug)]
 pub(crate) struct Stitcher<C: CanvasStore> {
-    width: u32,
     view: u32,
     store: C,
     pos: u32,
@@ -64,8 +63,8 @@ impl<C: CanvasStore> Stitcher<C> {
     /// A stitcher over an existing store (docs/35 phase 2 hands in a different one).
     pub(crate) fn with_store(store: C, width: u32, view: u32) -> Self {
         debug_assert_eq!(store.rows(), view, "a store starts with exactly one frame");
+        debug_assert!(width > 0 && store.row_bytes().is_multiple_of(width as usize));
         Self {
-            width,
             view,
             store,
             pos: 0,
@@ -116,8 +115,8 @@ impl<C: CanvasStore> Stitcher<C> {
     /// Place `frame`, whose content moved by `dy` relative to the frame placed last
     /// (positive: the page scrolled down).
     pub(crate) fn place(&mut self, frame: &[u8], dy: i32) -> Placement {
-        debug_assert_eq!(frame.len(), (self.width * self.view * 4) as usize);
-        let row = (self.width * 4) as usize;
+        let row = self.store.row_bytes();
+        debug_assert_eq!(frame.len(), row * self.view as usize);
         let view = self.view as i64;
         let cand = i64::from(self.pos) + i64::from(dy);
         let known = i64::from(self.store.rows());

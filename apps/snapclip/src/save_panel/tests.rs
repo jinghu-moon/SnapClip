@@ -3,6 +3,43 @@ use super::*;
 use core::prelude::v1::test;
 
 #[::core::prelude::v1::test]
+fn hdr_picture_default_preserves_source_and_explicit_sdr_is_a_derivative() {
+    use snapclip_model::pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding};
+    let descriptor = PixelDescriptor::new(
+        snapclip_model::PixelFormat::Rgba16Float,
+        PixelEncoding::ScRgb,
+        AlphaMode::Straight,
+    )
+    .unwrap();
+    let bytes: Vec<u8> = [1.25_f32, 1.25, 1.25, 0.5, 12.5, 12.5, 12.5, 1.0]
+        .into_iter()
+        .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+    let picture =
+        Picture::from_pixels(PixelBuffer::from_tight(2, 1, descriptor, bytes.clone()).unwrap());
+    assert!(picture.is_hdr());
+    assert_eq!(picture.original_pixels().as_bytes(), bytes);
+    let original = preview::original(&picture).unwrap();
+    assert_eq!(
+        original.color_space(),
+        yue_component::ImagePreviewColorSpace::ScRgb
+    );
+    assert_eq!(original.image().as_bytes(0).unwrap(), bytes);
+    let sdr = picture.sdr_pixels();
+    assert_eq!(sdr.descriptor(), PixelDescriptor::bgra8());
+    assert_eq!(picture.original_pixels().as_bytes(), bytes);
+    let smaller = picture.resized_pixels(Size::new(1, 1)).unwrap();
+    assert_eq!(smaller.size(), [1, 1]);
+    assert_eq!(smaller.descriptor(), descriptor);
+    assert!(
+        snapclip_model::pixel_color::linear_rgba(&smaller)
+            .next()
+            .unwrap()[0]
+            > 1.0
+    );
+}
+
+#[::core::prelude::v1::test]
 fn preview_decodes_the_exact_bytes_written_by_each_encoder() {
     let directory = std::env::temp_dir().join(format!(
         "snapclip-yue-preview-roundtrip-{}",
@@ -12,6 +49,9 @@ fn preview_decodes_the_exact_bytes_written_by_each_encoder() {
     let picture = Arc::new(Picture::with_transparent_middle());
     for format in [SaveFormat::Png, SaveFormat::Jpeg, SaveFormat::Webp] {
         let export = Export {
+            color_export: ColorExport::Sdr {
+                source_peak_nits: 100.0,
+            },
             picture: picture.clone(),
             output: Size::new(96, 80),
             directory: directory.to_string_lossy().into(),
@@ -52,14 +92,15 @@ fn preview_decodes_the_exact_bytes_written_by_each_encoder() {
 #[::core::prelude::v1::test]
 fn raw_preview_preserves_bgra_alpha_and_bounds_its_texture() {
     let pixels = vec![17, 70, 180, 0, 93, 21, 45, 255];
-    let picture = Picture::from_selection(pixels.clone(), Size::new(2, 1));
+    let picture = Picture::from_selection(pixels.clone(), Size::new(2, 1)).unwrap();
     let original = preview::original(&picture).unwrap();
     assert_eq!(original.image().as_bytes(0).unwrap(), pixels);
     assert_eq!(original.pixel_size(), [2, 1]);
     assert_eq!(original.texture_size(), [2, 1]);
     assert!(!original.is_proxy());
 
-    let picture = Picture::from_selection([17, 70, 180, 128].repeat(8192 * 2), Size::new(8192, 2));
+    let picture =
+        Picture::from_selection([17, 70, 180, 128].repeat(8192 * 2), Size::new(8192, 2)).unwrap();
     let original = preview::original(&picture).unwrap();
     assert_eq!(original.pixel_size(), [8192, 2]);
     assert_eq!(original.texture_size(), [8192, 2]);
@@ -85,7 +126,7 @@ fn raw_preview_keeps_4k_pixels_without_cpu_resampling() {
     pixels[..4].copy_from_slice(&[1, 2, 3, 0]);
     let last = pixels.len() - 4;
     pixels[last..].copy_from_slice(&[4, 5, 6, 255]);
-    let picture = Picture::from_selection(pixels, Size::new(3840, 2160));
+    let picture = Picture::from_selection(pixels, Size::new(3840, 2160)).unwrap();
     let original = preview::original(&picture).unwrap();
     assert_eq!(original.texture_size(), [3840, 2160]);
     assert_eq!(original.image().as_bytes(0).unwrap(), picture.pixels().0);
@@ -94,7 +135,8 @@ fn raw_preview_keeps_4k_pixels_without_cpu_resampling() {
 #[::core::prelude::v1::test]
 fn long_preview_declares_proxy_without_relabelling_source_pixels() {
     let picture =
-        Picture::from_selection([17, 70, 180, 128].repeat(64 * 32768), Size::new(64, 32768));
+        Picture::from_selection([17, 70, 180, 128].repeat(64 * 32768), Size::new(64, 32768))
+            .unwrap();
     let preview = preview::original(&picture).unwrap();
     assert_eq!(preview.pixel_size(), [64, 32768]);
     assert_eq!(preview.texture_size(), [16, 8192]);
@@ -114,6 +156,9 @@ fn long_preview_declares_proxy_without_relabelling_source_pixels() {
 #[::core::prelude::v1::test]
 fn encoded_preview_keeps_native_detail_above_the_old_2048_cap() {
     let export = Export {
+        color_export: ColorExport::Sdr {
+            source_peak_nits: 100.0,
+        },
         picture: Arc::new(Picture::with_transparent_middle()),
         output: Size::new(3072, 2),
         directory: String::new(),
@@ -152,7 +197,7 @@ fn raw_preview_rejects_inconsistent_capture_buffers() {
         (Size::new(1, 1), vec![0; 3]),
         (Size::new(1, 1), vec![0; 8]),
     ] {
-        assert!(preview::original(&Picture::from_selection(pixels, source)).is_err());
+        assert!(Picture::from_selection(pixels, source).is_err());
     }
 }
 
@@ -174,7 +219,7 @@ mod ui {
             cx,
             width,
             height,
-            Picture::from_selection(vec![255; 800 * 600 * 4], Size::new(800, 600)),
+            Picture::from_selection(vec![255; 800 * 600 * 4], Size::new(800, 600)).unwrap(),
         )
     }
 
@@ -206,18 +251,21 @@ mod ui {
 
     #[gpui_kit::test]
     fn failed_capture_uses_the_component_error_and_real_retry_action(cx: &mut TestAppContext) {
-        let (handle, panel) = setup_picture(
-            cx,
-            1000.,
-            720.,
-            Picture::from_selection(vec![0; 3], Size::new(2, 1)),
-        );
+        let (handle, panel) = setup_picture(cx, 1000., 720., Picture::synthetic());
         cx.run_until_parked();
         // Drop the completed task so the assertion detects a missing host retry subscription.
-        panel.update(cx, |panel, _| panel._original_task = None);
+        cx.update_window(handle.into(), |_, window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel._original_task = None;
+                panel.preview.original = ImagePreviewLoad::Failed("图片资源读取失败".into());
+                panel.publish_preview(window, cx);
+                cx.notify();
+            });
+        })
+        .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert!(matches!(&panel.read(cx).preview.original, ImagePreviewLoad::Failed(message) if message.contains("像素")));
+            assert!(matches!(&panel.read(cx).preview.original, ImagePreviewLoad::Failed(message) if message.contains("图片资源")));
             let retry = (ElementId::from("save-image-preview"), "retry");
             assert!(window.find(retry.clone()).visible());
             window.click(retry, cx);
@@ -231,12 +279,12 @@ mod ui {
             );
             assert!(matches!(
                 panel.read(cx).preview.original,
-                ImagePreviewLoad::Failed(_)
+                ImagePreviewLoad::Ready(_)
             ));
             assert!(
-                window
-                    .find((ElementId::from("save-image-preview"), "retry"))
-                    .visible()
+                !window
+                    .try_find((ElementId::from("save-image-preview"), "retry"))
+                    .is_some_and(|node| node.visible())
             );
             window.remove_window();
         })

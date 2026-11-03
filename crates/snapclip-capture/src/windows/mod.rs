@@ -22,6 +22,7 @@
 //! store, OCR or a UI framework.
 
 pub mod capture_worker;
+pub mod color_output;
 pub mod detection_worker;
 pub mod export_worker;
 pub mod hotkey;

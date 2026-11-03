@@ -9,6 +9,104 @@ use std::sync::Arc;
 
 // Uses production views and the real command channel; never reads/writes the desktop clipboard.
 #[gpui_kit::test]
+fn hdr_view_retains_shared_source_and_sends_explicit_copy_intents(cx: &mut TestAppContext) {
+    use snapclip_model::pixels::{
+        AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource,
+    };
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        yue_component::init(
+            cx,
+            yue_component::YueTheme::new(
+                yue_component::ThemeMode::Light,
+                yue_component::Accent::Azure,
+            ),
+        )
+        .unwrap();
+        crate::init(cx);
+    });
+    let descriptor = PixelDescriptor::new(
+        snapclip_model::PixelFormat::Rgba16Float,
+        PixelEncoding::ScRgb,
+        AlphaMode::Straight,
+    )
+    .unwrap();
+    let bytes = [-0.25_f32, 2.5, 0.5, 0.5]
+        .into_iter()
+        .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+        .collect();
+    let pixels = Arc::new(PixelBuffer::from_tight(1, 1, descriptor, bytes).unwrap());
+    let image =
+        crate::PinImage::from_pixels(PixelSource::new(descriptor, 82), pixels.clone()).unwrap();
+    let (owner, commands) = cx.update(|cx| {
+        let (manager, commands) = PinManager::new().unwrap();
+        (cx.new(|_| manager), commands)
+    });
+    let id = cx.update(|cx| {
+        PinManager::open(
+            Arc::new(PinSnapshot::new(PinContent::Image(image))),
+            PinPlacement::Pointer((0, 0)),
+            &owner,
+            cx,
+        )
+        .unwrap()
+        .id()
+    });
+    let (window, view) = cx.update(|cx| owner.read(cx).view_for_test(id));
+    let view = view.upgrade().unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(Arc::ptr_eq(
+            view.read(cx).image_pixels.as_ref().unwrap().pixels(),
+            &pixels
+        ));
+        assert_eq!(
+            view.read(cx)
+                .image_preview
+                .read(cx)
+                .snapshot()
+                .reference_size(),
+            Some([1, 1])
+        );
+        assert!(
+            window
+                .find((gpui_kit::ElementId::from("pin-image-preview"), "hdr-info"))
+                .visible()
+        );
+        window.press("ctrl-c", cx);
+        window.click("pin-more-button", cx);
+    })
+    .unwrap();
+    assert!(
+        matches!(commands.try_recv().unwrap(), PinCommand::Copy { target: CopyTarget::Pixels(image), .. }
+        if image.is_hdr() && Arc::ptr_eq(image.pixels(), &pixels))
+    );
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let target = window
+            .find_by_label("复制 HDR 图片（PNG）")
+            .path()
+            .last()
+            .unwrap()
+            .clone();
+        window.click(target, cx);
+    })
+    .unwrap();
+    assert!(
+        matches!(commands.try_recv().unwrap(), PinCommand::Copy { target: CopyTarget::HdrPixels(image), .. }
+        if image.pixel_source().generation() == 82 && Arc::ptr_eq(image.pixels(), &pixels))
+    );
+    cx.update_window(window.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert!(!owner.read(cx).is_open(id)));
+}
+
+#[gpui_kit::test]
 fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -315,8 +413,13 @@ fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
                 .visible()
         );
         assert_eq!(
-            view.read(cx).image_pixels.as_ref().unwrap().rgba(),
-            pixels.rgba()
+            view.read(cx)
+                .image_pixels
+                .as_ref()
+                .unwrap()
+                .sdr_rgba()
+                .unwrap(),
+            pixels.sdr_rgba().unwrap()
         );
         window.click(
             (gpui_kit::ElementId::from("pin-image-preview"), "viewport"),
@@ -332,7 +435,7 @@ fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(
-        matches!(commands.try_recv().unwrap(),PinCommand::Copy{target:CopyTarget::Pixels(image),..} if image.rgba()==pixels.rgba())
+        matches!(commands.try_recv().unwrap(),PinCommand::Copy{target:CopyTarget::Pixels(image),..} if image.sdr_rgba().unwrap()==pixels.sdr_rgba().unwrap())
     );
     cx.executor()
         .advance_clock(std::time::Duration::from_millis(200));
@@ -372,8 +475,13 @@ fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
         window.click(item, cx);
         assert!((view.read(cx).image_preview.read(cx).snapshot().zoom() - 1.25).abs() < 0.001);
         assert_eq!(
-            view.read(cx).image_pixels.as_ref().unwrap().rgba(),
-            pixels.rgba()
+            view.read(cx)
+                .image_pixels
+                .as_ref()
+                .unwrap()
+                .sdr_rgba()
+                .unwrap(),
+            pixels.sdr_rgba().unwrap()
         );
     })
     .unwrap();
@@ -406,8 +514,13 @@ fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
                 .visible()
         );
         assert_eq!(
-            view.read(cx).image_pixels.as_ref().unwrap().rgba(),
-            pixels.rgba()
+            view.read(cx)
+                .image_pixels
+                .as_ref()
+                .unwrap()
+                .sdr_rgba()
+                .unwrap(),
+            pixels.sdr_rgba().unwrap()
         );
         window.press("ctrl-c", cx);
         window.click(("pin-representation", 0usize), cx);
@@ -418,7 +531,7 @@ fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(
-        matches!(commands.try_recv().unwrap(), PinCommand::Copy { target: CopyTarget::Pixels(image), .. } if image.rgba() == pixels.rgba())
+        matches!(commands.try_recv().unwrap(), PinCommand::Copy { target: CopyTarget::Pixels(image), .. } if image.sdr_rgba().unwrap() == pixels.sdr_rgba().unwrap())
     );
     assert!(
         matches!(commands.try_recv().unwrap(), PinCommand::Copy { target: CopyTarget::Text(text), .. } if text == "图片的文字备选")
@@ -456,8 +569,13 @@ fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
             Some([2, 1])
         );
         assert_eq!(
-            view.read(cx).image_pixels.as_ref().unwrap().rgba(),
-            pixels.rgba()
+            view.read(cx)
+                .image_pixels
+                .as_ref()
+                .unwrap()
+                .sdr_rgba()
+                .unwrap(),
+            pixels.sdr_rgba().unwrap()
         );
     })
     .unwrap();
@@ -535,7 +653,7 @@ fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(
-        matches!(commands.try_recv().unwrap(), PinCommand::Copy { target: CopyTarget::Pixels(image), .. } if image.rgba() == pixels.rgba())
+        matches!(commands.try_recv().unwrap(), PinCommand::Copy { target: CopyTarget::Pixels(image), .. } if image.sdr_rgba().unwrap() == pixels.sdr_rgba().unwrap())
     );
     assert!(
         matches!(commands.try_recv().unwrap(), PinCommand::Copy { target: CopyTarget::Text(text), .. } if text == "附带位图")
@@ -608,8 +726,13 @@ fn production_pin_selection_copy_files_and_close_flow(cx: &mut TestAppContext) {
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            view.read(cx).image_pixels.as_ref().unwrap().rgba(),
-            pixels.rgba()
+            view.read(cx)
+                .image_pixels
+                .as_ref()
+                .unwrap()
+                .sdr_rgba()
+                .unwrap(),
+            pixels.sdr_rgba().unwrap()
         );
         assert!(
             window

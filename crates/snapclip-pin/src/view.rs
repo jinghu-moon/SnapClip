@@ -207,14 +207,13 @@ impl PinView {
                             // Primary images already reserve a display buffer in retained_bytes().
                             0
                         } else {
-                            pixels
-                                .rgba()
-                                .len()
-                                .saturating_mul(if this.snapshot.image().is_some() {
+                            pixels.pixels().as_bytes().len().saturating_mul(
+                                if this.snapshot.image().is_some() {
                                     1
                                 } else {
                                     2
-                                })
+                                },
+                            )
                         };
                         if this
                             .owner
@@ -421,6 +420,7 @@ impl PinView {
             },
         );
         let starts_as_image = matches!(snapshot.content(), PinContent::Image(_));
+        let status = snapshot.notice().map(str::to_owned);
         let mut view = Self {
             id,
             snapshot,
@@ -436,7 +436,7 @@ impl PinView {
             collapsed: false,
             expanded_size: window.viewport_size(),
             copied: false,
-            status: None,
+            status,
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             thumbnail: None,
@@ -550,6 +550,25 @@ impl PinView {
     }
     fn menu(&self, cx: &Context<Self>) -> Vec<YueMenuItem> {
         let mut items = vec![];
+        let image = self
+            .image_pixels
+            .as_ref()
+            .or_else(|| match self.snapshot.content() {
+                PinContent::Image(image) => Some(image),
+                _ => self.snapshot.image(),
+            });
+        if let Some(image) = image.filter(|image| image.is_hdr()) {
+            let image = image.clone();
+            let owner = self.owner.clone();
+            let id = self.id;
+            items.push(
+                YueMenuItem::new("复制 HDR 图片（PNG）").on_click(move |_, _, cx| {
+                    _ = owner.update(cx, |manager, _| {
+                        manager.copy(id, CopyTarget::HdrPixels(image.clone()))
+                    });
+                }),
+            );
+        }
         let owner = cx.entity().downgrade();
         items.push(
             YueMenuItem::new("复制全部内容")

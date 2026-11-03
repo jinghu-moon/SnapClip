@@ -7,6 +7,7 @@ mod source;
 mod tests;
 mod view;
 
+use crate::capture::pixel_export::{self, ColorExport};
 use crate::save::{
     assemble,
     scale::{Size, SizeMode},
@@ -103,6 +104,7 @@ pub fn init(cx: &mut App, dark: bool) {
 /// One immutable export request, shared by background preview and save jobs.
 #[derive(Clone)]
 struct Export {
+    color_export: ColorExport,
     picture: Arc<Picture>,
     output: Size,
     directory: String,
@@ -118,6 +120,32 @@ struct Export {
 }
 
 impl Export {
+    fn fit_under(&self, limit: u64) -> Option<Size> {
+        crate::save::estimate::fit_under(self.output, limit, |size| {
+            let mut candidate = self.clone();
+            candidate.output = size;
+            candidate
+                .encoded_bytes()
+                .ok()
+                .map(|bytes| bytes.len() as u64)
+        })
+        .map(|(size, _)| size)
+    }
+    fn encoded_bytes(&self) -> Result<Vec<u8>, SaveError> {
+        if self.color_export == ColorExport::PreserveHdr {
+            if self.format != SaveFormat::Png {
+                return Err(SaveError::Io(
+                    "保留 HDR 仅支持 PNG16；其他格式请明确选择转换为 SDR".into(),
+                ));
+            }
+            let pixels = self
+                .picture
+                .resized_pixels(self.output)
+                .map_err(SaveError::Io)?;
+            return pixel_export::encode_pixels(&pixels, self.color_export).map_err(SaveError::Io);
+        }
+        assemble::encoded_bytes(&self.values(), &self.picture.frame(self.output))
+    }
     fn values(&self) -> assemble::PanelValues<'_> {
         source::values_with(
             &self.directory,
@@ -132,6 +160,20 @@ impl Export {
         )
     }
     fn save(&self) -> Result<SaveOutcome, SaveError> {
+        if self.color_export == ColorExport::PreserveHdr {
+            let bytes = self.encoded_bytes()?;
+            if self.limit.is_some_and(|limit| bytes.len() as u64 > limit) {
+                return Err(SaveError::Io(
+                    "HDR PNG 超出体积上限，请先自动缩小尺寸".into(),
+                ));
+            }
+            let request = assemble::request_for(
+                &self.values(),
+                u64::from(self.output.width),
+                u64::from(self.output.height),
+            )?;
+            return crate::save::service::commit_bytes(&request, &bytes);
+        }
         source::save_within(&self.picture, &self.values(), self.output, self.limit).unwrap_or_else(
             || {
                 Err(SaveError::Validation {
@@ -144,6 +186,7 @@ impl Export {
 }
 
 pub struct SavePanel {
+    preserve_hdr: bool,
     picture: Arc<Picture>,
     dimensions: Dimensions,
     directory: Entity<InputState>,
@@ -179,6 +222,49 @@ pub struct SavePanel {
 }
 
 impl SavePanel {
+    fn set_preserve_hdr(&mut self, preserve: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.picture.is_hdr() || self.preserve_hdr == preserve {
+            return;
+        }
+        self.preserve_hdr = preserve;
+        if preserve {
+            self.format = SaveFormat::Png;
+            self.format_select.update(cx, |state, cx| {
+                state
+                    .set_value(SelectValue::Single(Some("png".into())), window, cx)
+                    .expect("single PNG format");
+            });
+        }
+        self.sync_color_formats(cx);
+        self.schedule_preview(window, cx);
+    }
+
+    fn sync_color_formats(&mut self, cx: &mut Context<Self>) {
+        if !self.picture.is_hdr() {
+            return;
+        }
+        let preserve = self.preserve_hdr;
+        self.format_select.update(cx, |state, cx| {
+            state
+                .set_options(
+                    [
+                        SelectOption::new("png", ".PNG").with_description(if preserve {
+                            "HDR · 16 位 PQ"
+                        } else {
+                            "无损 · 支持透明"
+                        }),
+                        SelectOption::new("jpeg", ".JPG")
+                            .with_description("需转换为 SDR")
+                            .disabled(preserve),
+                        SelectOption::new("webp", ".WebP")
+                            .with_description("需转换为 SDR")
+                            .disabled(preserve),
+                    ],
+                    cx,
+                )
+                .expect("unique color-policy formats");
+        });
+    }
     pub fn new(picture: Picture, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let owner = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
@@ -287,6 +373,7 @@ impl SavePanel {
             },
         ));
         let mut panel = Self {
+            preserve_hdr: picture.is_hdr(),
             picture: Arc::new(picture),
             dimensions,
             directory,
@@ -321,6 +408,7 @@ impl SavePanel {
             _subscriptions: subscriptions,
         };
         panel.focus.focus(window, cx);
+        panel.sync_color_formats(cx);
         panel.load_original(window, cx);
         panel.schedule_preview(window, cx);
         panel
@@ -329,6 +417,13 @@ impl SavePanel {
     fn export(&self, cx: &App) -> Export {
         let (date, time) = source::now();
         Export {
+            color_export: if self.preserve_hdr && self.picture.is_hdr() {
+                ColorExport::PreserveHdr
+            } else {
+                ColorExport::Sdr {
+                    source_peak_nits: self.picture.peak_nits(),
+                }
+            },
             picture: self.picture.clone(),
             output: self.dimensions.output,
             directory: self.directory.read(cx).value().to_string(),

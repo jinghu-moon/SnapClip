@@ -305,6 +305,18 @@ impl OverlayController {
             }
         };
         let spec = Spec {
+            source: self
+                .frozen
+                .as_ref()
+                .expect("an armed scroll session owns its frozen source")
+                .frame
+                .source,
+            color_snapshot: self
+                .frozen
+                .as_ref()
+                .expect("an armed scroll session owns its frozen source")
+                .color_snapshot()
+                .clone(),
             monitor: monitor.handle,
             region: selection,
             aim,
@@ -700,7 +712,8 @@ mod tests {
                         snapclip_model::pixels::PixelDescriptor::bgra8(),
                         vec![0; width as usize * rows as usize * 4],
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .into(),
                     origin: None,
                 })),
                 dpi: 144,
