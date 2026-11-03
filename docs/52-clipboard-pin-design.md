@@ -489,6 +489,12 @@ Remove-Item Env:SNAPCLIP_PIN_DARK
 
 最新回归：app **285 passed / 5 ignored**、pin **71 passed / 4 ignored**；pin严格Clippy和两包all-targets check通过。日志统一为`target/image-preview-resources-*.log`，构建了最新应用及pin_preview示例，未启动；完整命令与边界见[保存面板§11.1](50-yue-save-panel.md#111-公共资源与采样升级2026-11-03)。
 
+### 11.8 测试门禁的归属迁移（2026-11-03）
+
+从提交 `ba52c97` 核对：History 的 Windows `formats` 2 项、`source_app` 3 项、`reader` 3 项共 8 项随剪贴板能力移出。前两组保留原断言；reader 的 UTF-16 终止、事件窗口快照和 DIB 尺寸断言分别位于 Clipboard 的 `utf16_ends_at_first_nul`、`snapshot_keeps_sequence_and_event_window_handles`、`top_down_dib_preserves_dimensions`。History 原图归一化测试仍在 History，不重复计数。
+
+`tools/check-test-baseline.ps1` 将旧 History 的 51 项下限按归属拆为 History 43 + Clipboard 8，要求两个测试二进制都存在，各自下限分别通过，不能用新 crate 的额外测试抵扣 History 缺失。实际本次普通 lib 为 History 43 通过、Clipboard 11 通过 / 2 ignored；没有删除测试以绕过门禁。`tools/tests/check-test-baseline.Tests.ps1` 验证迁移后可通过、Clipboard 少一项失败、History 少一项即使 Clipboard 多一项仍失败，以及 Clipboard 整包缺失失败。
+
 ## 12. 参考与依据
 
 本地依据见第 2 节，以及 [34 · 贴图窗口设计](34-pin-window-design.md)、[51 · 贴图能力独立](51-pin-crate.md)。GPUI Kit Coding Guides / Design Guides 用于状态所有权、组件复用、焦点、滚动与平台能力边界；本项目现有主题与行为约定优先。

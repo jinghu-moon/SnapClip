@@ -31,11 +31,15 @@ $root = Split-Path -Parent $PSScriptRoot
 # docs/31 section 0.3 plus docs/51 (2026-11-02): 55/3 pin tests moved from app.
 # App baseline 316/9 - 55/3 = 261/6. Pin starts at its pre-move 55/3 floor.
 # The combined pre-move app floor is preserved, not reset to a smaller suite.
+# docs/52 (2026-11-03): 8 Windows clipboard tests moved from history to clipboard
+# (formats 2, source_app 3, reader 3). Preserve that 51-test floor as 43 + 8;
+# require both binaries so removing the new crate cannot hide missing coverage.
 $Baseline = [ordered]@{
     'snapclip-app'     = @{ Passed = 261; Ignored = 6 }
     'snapclip-pin'     = @{ Passed = 55;  Ignored = 3 }
     'snapclip-capture' = @{ Passed = 347; Ignored = 7 }
-    'snapclip-history' = @{ Passed = 51;  Ignored = 0 }
+    'snapclip-history' = @{ Passed = 43;  Ignored = 0 }
+    'snapclip-clipboard' = @{ Passed = 8; Ignored = 0 }
     'snapclip-model'   = @{ Passed = 23;  Ignored = 0 }
 }
 
