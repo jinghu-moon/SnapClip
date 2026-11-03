@@ -20,12 +20,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The three formats the save path can produce.
+/// Save targets described without importing their optional encoders.
 ///
 /// `Png` is the master and the default; `Jpeg` is the lossy export; `Webp` is lossless only (see
 /// [`SaveFormat::label`]) and only within its side limit.
 ///
-/// Stored by name (`"png"` / `"jpeg"` / `"webp"`), so a settings file written by an older build
+/// Stored by name (`"png"` / `"jpeg"` / `"webp"` / `"bmp"` / `"avif"`), so a settings file written by an older build
 /// keeps loading: a missing field takes the default, which is `Png`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -36,6 +36,9 @@ pub enum SaveFormat {
     /// BMP (`docs/49`): save-time only, top-down 32bpp, no compression. Not a capture
     /// preference, so the scroll preflight has no arm for it.
     Bmp,
+    /// Save-time HDR PQ10 grid export. The consuming shell owns the optional
+    /// encoder and its geometry/resource budget; capture keeps its master.
+    Avif,
 }
 
 /// Why a format cannot hold an image. Structured rather than a message: the caller decides how to
@@ -130,6 +133,7 @@ impl SaveFormat {
             SaveFormat::Webp => 16_383,
             // `biHeight` is an `i32`, and the height is written negative for top-down rows.
             SaveFormat::Bmp => i32::MAX as u64,
+            SaveFormat::Avif => u64::from(u32::MAX),
         }
     }
 
@@ -159,6 +163,7 @@ impl SaveFormat {
             SaveFormat::Jpeg => "JPG",
             SaveFormat::Webp => "WebP（无损）",
             SaveFormat::Bmp => "BMP",
+            SaveFormat::Avif => "AVIF（HDR PQ10）",
         }
     }
 }

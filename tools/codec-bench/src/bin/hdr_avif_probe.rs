@@ -19,6 +19,8 @@ mod alloc_probe;
 mod avif_bands;
 #[path = "../avif_grid.rs"]
 mod avif_grid;
+#[path = "../avif_spool.rs"]
+mod avif_spool;
 #[global_allocator]
 static ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
 
@@ -153,6 +155,20 @@ fn main() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, width, height, path] = arguments.as_slice()
+        && flag == "--spool-resources"
+    {
+        return avif_spool::resources(
+            width.parse().map_err(|_| "invalid width")?,
+            height.parse().map_err(|_| "invalid height")?,
+            std::path::Path::new(path),
+        );
+    }
+    if let [flag, input, output] = arguments.as_slice()
+        && flag == "--product-decode"
+    {
+        return avif_spool::decode(std::path::Path::new(input), std::path::Path::new(output));
+    }
     if let [flag, directory] = arguments.as_slice()
         && flag == "--band-fixture-dir"
     {

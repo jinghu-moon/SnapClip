@@ -3,6 +3,15 @@
 use crate::PixelFormat;
 use serde::{Deserialize, Serialize};
 
+/// Immutable source rows requested by codecs, capture and durable storage.
+/// A source may read from pixels, a file, or bounded storage. Returned rows are
+/// top-down, tightly packed in `source()`'s format. Failure supplies no artifact.
+pub trait BandSource: Send {
+    fn source(&self) -> PixelSource;
+    fn rows(&self) -> u32;
+    fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PixelEncoding {

@@ -1,0 +1,122 @@
+[
+  {
+    "name": "zenpixels",
+    "version": "0.2.16",
+    "commit": "640dcedf1ee3f828c66dd19c0a08f08a68da9685",
+    "url": "https://raw.githubusercontent.com/imazen/zenpixels/640dcedf1ee3f828c66dd19c0a08f08a68da9685/LICENSE-MIT",
+    "file": "tools/codec-bench/license-texts/zenpixels-0.2.16/LICENSE-MIT",
+    "sha256": "0de4ab3c18082a8d99ab08a1b3340ccd48a254049371699142e009322621f315"
+  },
+  {
+    "name": "zenpixels",
+    "version": "0.2.16",
+    "commit": "640dcedf1ee3f828c66dd19c0a08f08a68da9685",
+    "url": "https://raw.githubusercontent.com/imazen/zenpixels/640dcedf1ee3f828c66dd19c0a08f08a68da9685/LICENSE-APACHE",
+    "file": "tools/codec-bench/license-texts/zenpixels-0.2.16/LICENSE-APACHE",
+    "sha256": "f83f4043677a20322cbb22a4896039c4fec5d7a5bb26a2a1cac83efce22b0a8e"
+  },
+  {
+    "name": "enough",
+    "version": "0.4.5",
+    "commit": "ca2a13c48e270aba990b11d96879b7774d799c92",
+    "url": "https://raw.githubusercontent.com/imazen/enough/ca2a13c48e270aba990b11d96879b7774d799c92/LICENSE-MIT",
+    "file": "tools/codec-bench/license-texts/enough-0.4.5/LICENSE-MIT",
+    "sha256": "ffa509f359743823fe3cdba2c4dc8feee00be8f07ab299fbbe2b5a50d6ed1ecf"
+  },
+  {
+    "name": "enough",
+    "version": "0.4.5",
+    "commit": "ca2a13c48e270aba990b11d96879b7774d799c92",
+    "url": "https://raw.githubusercontent.com/imazen/enough/ca2a13c48e270aba990b11d96879b7774d799c92/LICENSE-APACHE",
+    "file": "tools/codec-bench/license-texts/enough-0.4.5/LICENSE-APACHE",
+    "sha256": "870d879e82d57b10ed54a364c985f4a1483092ef44ab53a0a845e14b0dbae815"
+  },
+  {
+    "name": "almost-enough",
+    "version": "0.4.5",
+    "commit": "ca2a13c48e270aba990b11d96879b7774d799c92",
+    "url": "https://raw.githubusercontent.com/imazen/enough/ca2a13c48e270aba990b11d96879b7774d799c92/LICENSE-MIT",
+    "file": "tools/codec-bench/license-texts/almost-enough-0.4.5/LICENSE-MIT",
+    "sha256": "ffa509f359743823fe3cdba2c4dc8feee00be8f07ab299fbbe2b5a50d6ed1ecf"
+  },
+  {
+    "name": "almost-enough",
+    "version": "0.4.5",
+    "commit": "ca2a13c48e270aba990b11d96879b7774d799c92",
+    "url": "https://raw.githubusercontent.com/imazen/enough/ca2a13c48e270aba990b11d96879b7774d799c92/LICENSE-APACHE",
+    "file": "tools/codec-bench/license-texts/almost-enough-0.4.5/LICENSE-APACHE",
+    "sha256": "870d879e82d57b10ed54a364c985f4a1483092ef44ab53a0a845e14b0dbae815"
+  },
+  {
+    "name": "simd_helpers",
+    "version": "0.1.0",
+    "commit": "ca1a2f84aa386d758e98f8a609d990263932fb85",
+    "url": "https://github.com/lu-zero/simd_helpers/tree/ca1a2f84aa386d758e98f8a609d990263932fb85",
+    "missing_original_text": true,
+    "declared_license": "MIT"
+  },
+  {
+    "name": "profiling",
+    "version": "1.0.18",
+    "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+    "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+    "file": "tools/codec-bench/license-texts/profiling-1.0.18/LICENSE-MIT",
+    "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
+  },
+  {
+    "name": "profiling",
+    "version": "1.0.18",
+    "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+    "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE",
+    "file": "tools/codec-bench/license-texts/profiling-1.0.18/LICENSE-APACHE",
+    "sha256": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551"
+  },
+  {
+    "name": "profiling-procmacros",
+    "version": "1.0.18",
+    "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+    "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+    "file": "tools/codec-bench/license-texts/profiling-procmacros-1.0.18/LICENSE-MIT",
+    "sha256": "c8167fdeeed46d3f244d3f85c5bf998ce889343691c32be2c61a8bc4b5c08333"
+  },
+  {
+    "name": "profiling-procmacros",
+    "version": "1.0.18",
+    "commit": "8271551172eb6fa4cba47369aedd93790c623df9",
+    "url": "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE",
+    "file": "tools/codec-bench/license-texts/profiling-procmacros-1.0.18/LICENSE-APACHE",
+    "sha256": "10d30a673cd5e9349bdc02aeb48f14b3386d27d0da32df8f0a555d4aa16aa551"
+  },
+  {
+    "name": "zenpixels-convert",
+    "version": "0.2.16",
+    "commit": "640dcedf1ee3f828c66dd19c0a08f08a68da9685",
+    "url": "https://raw.githubusercontent.com/imazen/zenpixels/640dcedf1ee3f828c66dd19c0a08f08a68da9685/LICENSE-MIT",
+    "file": "tools/codec-bench/license-texts/zenpixels-convert-0.2.16/LICENSE-MIT",
+    "sha256": "0de4ab3c18082a8d99ab08a1b3340ccd48a254049371699142e009322621f315"
+  },
+  {
+    "name": "zenpixels-convert",
+    "version": "0.2.16",
+    "commit": "640dcedf1ee3f828c66dd19c0a08f08a68da9685",
+    "url": "https://raw.githubusercontent.com/imazen/zenpixels/640dcedf1ee3f828c66dd19c0a08f08a68da9685/LICENSE-APACHE",
+    "file": "tools/codec-bench/license-texts/zenpixels-convert-0.2.16/LICENSE-APACHE",
+    "sha256": "f83f4043677a20322cbb22a4896039c4fec5d7a5bb26a2a1cac83efce22b0a8e"
+  },
+  {
+    "name": "atomig-macro",
+    "version": "0.4.0",
+    "commit": "abd42e50a6a1b0615505189a780fcb5da19d7385",
+    "url": "https://raw.githubusercontent.com/LukasKalbertodt/atomig//abd42e50a6a1b0615505189a780fcb5da19d7385/LICENSE-MIT",
+    "file": "tools/codec-bench/license-texts/atomig-macro-0.4.0/LICENSE-MIT",
+    "sha256": "6f54826bbf67526f2d41937c1904ae2de63ef5707b80c68deadbf073b5669c40"
+  },
+  {
+    "name": "atomig-macro",
+    "version": "0.4.0",
+    "commit": "abd42e50a6a1b0615505189a780fcb5da19d7385",
+    "url": "https://raw.githubusercontent.com/LukasKalbertodt/atomig//abd42e50a6a1b0615505189a780fcb5da19d7385/LICENSE-APACHE",
+    "file": "tools/codec-bench/license-texts/atomig-macro-0.4.0/LICENSE-APACHE",
+    "sha256": "8173d5c29b4f956d532781d2b86e4e30f83e6b7878dce18c919451d6ba707c90"
+  }
+]

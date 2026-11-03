@@ -1,6 +1,6 @@
 # HDR AVIF 的固定源码补丁
 
-本目录仅为 `codec-bench/hdr-avif-probe` 的显式资格验证服务，App／Pin／MIT Yue 不新增这些默认 codec 依赖。没有修改全局 Cargo registry。上游原包版本、SHA-256、许可证声明，以及本地补丁 SHA-256／修改文件清单在 `tools/codec-bench/hdr-avif-sources.json`。
+本目录服务于共享 CPU crate `snapclip-avif` 与 `codec-bench/hdr-avif-probe`。App／Pin 仅在显式启用 `avif` feature 时消费，默认关闭；MIT Yue 不依赖这些 codec。没有修改全局 Cargo registry。上游原包版本、SHA-256、许可证声明，以及本地补丁 SHA-256／修改文件清单在 `tools/codec-bench/hdr-avif-sources.json`。
 
 ## zenavif 0.1.6
 
@@ -9,7 +9,7 @@
 - `src/decoder_managed.rs`：8/10/12 位 Identity 不走 BT.601；8 位 strip 入口同样转到正确路径。
 - 同文件新增 `decode_grid_tiles`：解码前校验块尺寸／位深，每次只交付一块，合并对应 Alpha，裁掉边缘 padding；整帧便利 API 复用此路径。grid 的 10 位／4:4:4 信息来自实际序列头，不回退成 8 位／4:2:0。
 - `new_with_stop` 将取消从构造入口传给 parser 和 grid 索引；单次压缩输入复制仍是同步操作，调用方必须限制输入大小。
-- `src/config.rs`：显式 `grid_tile_limit`，默认仍保留 parser 的 1000 块；开发探针为 128×128 的大图实验独立设置 4096 块。像素和内存门槛没有提高。
+- `src/config.rs`：显式 `grid_tile_limit`，默认仍保留 parser 的 1000 块；产品／开发探针对有界 grid 显式设置 4096 块。新增 `parser_memory_limit`，共享 codec 在构造 parser 前设置 16 MiB 预算。没有提高原 32 MiB 编码堆／16 MiB 单分配门槛。
 - `src/encoder.rs`：RGB16／RGBA16 写入正确的 G/B/R 平面，使用迭代器去掉全图中间副本。
 - `src/yuv_convert.rs`：将锁定依赖已弃用的 `splat/zero/from_array` 改为其对应 `_t` 名称，未更换 SIMD 算法或加 allow。
 
@@ -24,7 +24,7 @@
 - 原包 11 份文件和 BSD-3-Clause `LICENSE` 保留，仅省略独立 `Cargo.lock`。仅 `src/grid.rs` 修改。
 - grid 支持主图 ICC 和 nclx 同时关联；按同一来源／类型合并 dimg，保留行优先顺序。
 - 修复扫描整份文件寻找 `BAAD_F00D` 偏移占位符的实现，只更新已记录的 iloc 字段，避免破坏 ICC 或压缩数据；测试覆盖同字节序列出现在两种 payload 中。
-- 校验几何、Alpha 配置、item ID／32 位文件长度溢出，按准确总长度 reserve。此 serializer 仍返回完整压缩 Vec；探针有独立的 4 MiB 压缩数据／5 MiB 文件上限，不能称为任意大文件流式 muxer。
+- 校验几何、Alpha 配置、item ID／32 位文件长度溢出。`header` 仅按压缩块长度生成准确 header，产品将临时文件中的 payload 顺序写出，不要求目标可 seek；原 `serialize` 复用该 header 并追加 payload。旧开发探针保留 4 MiB／5 MiB 有界拒绝对照，共享产品编码改为累计 512 MiB 的磁盘后备，不能称为任意大小或任意布局的 muxer。
 
 ## 可复现验证
 
@@ -34,4 +34,4 @@
 
 第一方文件执行常规 fmt／`git diff --check`。原发布包 LICENSE／两个 examples 自带的行尾空白，以及 unified diff 必须带空格的空白 context 行，逐项确认后保留其原字节；没有为它们新增 whitespace allow 或全局降低门禁。第三方包使用原档案＋补丁逐字节检查，不对完整上游源进行格式清洗。
 
-本补丁限定 managed decoder 和静态高位深编码的已测路径；没有为 `unsafe-asm`、zencodec、动画、异构 Alpha grid 或任意敌意元数据提供额外合格声明。来源校验不等于发布时的许可交付已经完成。整帧资源仍失败；有界 grid 的成功与超限拒绝测量见 `docs/53-hdr-capture.md` §27，不能把资格探针通过解释为产品已支持 AVIF。
+本补丁限定 managed decoder 和静态高位深编码的已测路径；没有为 `unsafe-asm`、zencodec、动画、异构 Alpha grid 或任意敌意元数据提供额外合格声明。来源校验不等于发布时的许可交付已经完成；`simd_helpers 0.1.0` 的原始许可正文缺口仍阻止完整发行包放行。整帧资源仍失败；原 grid／行带证据见 `docs/53-hdr-capture.md` §27～§28，显式 feature 产品接线与磁盘后备见 §29，不能把 CPU 资格通过解释为 HDR 显示或生产捕获已经验收。

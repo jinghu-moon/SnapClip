@@ -142,17 +142,7 @@ pub trait ClipboardWriter: Send + Sync + 'static {
 /// over one buffer costs the whole image in memory. A writer that can stream asks for bands
 /// instead, and the source decides whether the rows come from a file, a ring buffer or a
 /// single contiguous image.
-pub trait BandSource: Send {
-    /// All bands belong to this immutable source definition and generation.
-    fn source(&self) -> snapclip_model::pixels::PixelSource;
-    /// How many rows the picture has.
-    fn rows(&self) -> u32;
-    /// Fill `out` with source-format rows, top-down and tightly packed.
-    ///
-    /// Returns false when the rows cannot be supplied; the writer then refuses the artifact
-    /// rather than writing a short one.
-    fn read_rows(&mut self, first_row: u32, rows: u32, out: &mut Vec<u8>) -> bool;
-}
+pub use snapclip_model::pixels::BandSource;
 
 /// Everything about a picture except its pixels, so a banded one can be named, stamped and
 /// placed exactly like a whole one.

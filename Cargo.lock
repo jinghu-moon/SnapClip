@@ -1039,6 +1039,7 @@ dependencies = [
  "mozjpeg-rs",
  "png 0.18.1",
  "rgb",
+ "snapclip-avif",
  "snapclip-capture",
  "snapclip-history",
  "snapclip-model",
@@ -6873,6 +6874,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "serde_json",
+ "snapclip-avif",
  "snapclip-capture",
  "snapclip-clipboard",
  "snapclip-history",
@@ -6884,6 +6886,24 @@ dependencies = [
  "yue-component",
  "zenjpeg",
  "zenwebp",
+]
+
+[[package]]
+name = "snapclip-avif"
+version = "0.1.0"
+dependencies = [
+ "almost-enough",
+ "enough",
+ "half",
+ "imgref",
+ "moxcms",
+ "rgb",
+ "snapclip-model",
+ "tempfile",
+ "yue-color",
+ "zenavif",
+ "zenavif-parse",
+ "zenavif-serialize",
 ]
 
 [[package]]
@@ -6958,6 +6978,7 @@ dependencies = [
  "image",
  "png 0.18.1",
  "raw-window-handle",
+ "snapclip-avif",
  "snapclip-model",
  "snapclip-ui",
  "windows-sys 0.59.0",

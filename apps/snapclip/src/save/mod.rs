@@ -8,6 +8,8 @@
 //! because a changed name must not force a re-encode (`docs/42` D9).
 
 pub mod assemble;
+#[cfg(feature = "avif")]
+pub(crate) mod avif;
 pub mod bands;
 pub mod caps;
 pub mod copy;

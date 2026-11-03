@@ -85,6 +85,12 @@ impl DecoderConfig {
         self
     }
 
+    /// Bound parser metadata allocations independently of decoded pixel limits.
+    pub fn parser_memory_limit(mut self, bytes: u64) -> Self {
+        self.parser_peak_memory_limit = Some(bytes);
+        self
+    }
+
     /// Set CPU feature flags mask.
     ///
     /// Controls which SIMD code paths are used by masking detected CPU features.

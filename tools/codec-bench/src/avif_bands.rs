@@ -1,7 +1,9 @@
-//! Qualification of the real row-source/color contract. This remains opt-in;
-//! neither the application nor Yue enables this codec candidate.
+//! Qualification of the real row-source/color contract. The explicit product
+//! AVIF feature uses the same shared codec; MIT Yue stays codec-free.
 use almost_enough::StopToken;
-use enough::{Stop, Unstoppable};
+#[cfg(test)]
+use enough::Stop;
+use enough::Unstoppable;
 use rgb::Rgba;
 use snapclip_capture::ports::BandSource;
 use snapclip_history::{artifact_store::CaptureArtifactStore, pixel_master::PixelMaster};
@@ -10,99 +12,19 @@ use snapclip_model::{
     pixels::{AlphaMode, PixelBuffer, PixelDescriptor, PixelEncoding, PixelSource},
 };
 
-use super::avif_grid::{MAX_PAYLOAD, TILE_SIDE};
+#[cfg(test)]
+use super::avif_grid::MAX_PAYLOAD;
 
 const READ_BYTES: usize = 1024 * 1024;
-const BAND_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn encode(
     bands: &mut dyn BandSource,
     width: u32,
     stop: StopToken,
 ) -> Result<Vec<u8>, String> {
-    stop.check().map_err(|e| e.to_string())?;
-    let source = bands.source();
-    let descriptor = source.descriptor();
-    let height = bands.rows();
-    if descriptor.encoding() != PixelEncoding::ScRgb {
-        return Err("HDR grid requires an absolute scRGB source".into());
-    }
-    let row = descriptor.row_bytes(width).ok_or("source row overflow")?;
-    let band_rows = (height as usize).min(TILE_SIDE);
-    let band_bytes = row.checked_mul(band_rows).ok_or("source band overflow")?;
-    if width == 0 || height == 0 || row > READ_BYTES || band_bytes >= BAND_BYTES {
-        return Err("source exceeds the bounded row-band budget".into());
-    }
-    let mut cached = Vec::new();
-    let mut cached_top = None;
-    let mut raw = Vec::new();
-    let stable = |bands: &dyn BandSource| bands.source() == source && bands.rows() == height;
-    let bytes = super::avif_grid::encode_tiles(
-        width as usize,
-        height as usize,
-        TILE_SIDE,
-        // These samples have been converted to Rec.2020/PQ. An unrelated source
-        // ICC must never be attached to the converted bytes.
-        None,
-        stop.clone(),
-        MAX_PAYLOAD,
-        |left, top, tile| {
-            if !stable(bands) {
-                return Err("pixel source changed during grid export".into());
-            }
-            let count = (height as usize - top).min(TILE_SIDE);
-            if cached_top != Some(top) {
-                cached.clear();
-                cached
-                    .try_reserve_exact(width as usize * count)
-                    .map_err(|e| e.to_string())?;
-                let end = top + count;
-                let mut first = top;
-                while first < end {
-                    stop.check().map_err(|e| e.to_string())?;
-                    let rows = (READ_BYTES / row).min(end - first);
-                    raw.clear();
-                    if !stable(bands)
-                        || !bands.read_rows(first as u32, rows as u32, &mut raw)
-                        || !stable(bands)
-                    {
-                        return Err("pixel source changed or refused a grid band".into());
-                    }
-                    stop.check().map_err(|e| e.to_string())?;
-                    let pixels = PixelBuffer::from_tight(
-                        width,
-                        rows as u32,
-                        descriptor,
-                        std::mem::take(&mut raw),
-                    )
-                    .map_err(str::to_owned)?;
-                    let converted = snapclip_model::pixel_color::rec2020_pq16_pixels(&pixels)
-                        .map_err(str::to_owned)?;
-                    for (ix, pixel) in converted.enumerate() {
-                        if ix % width as usize == 0 {
-                            stop.check().map_err(|e| e.to_string())?;
-                        }
-                        let [r, g, b, a] = pixel.map_err(str::to_owned)?;
-                        cached.push(Rgba::new(r, g, b, a));
-                    }
-                    raw = pixels.into_bytes();
-                    first += rows;
-                }
-                cached_top = Some(top);
-            }
-            for y in 0..TILE_SIDE {
-                let row = y.min(count - 1) * width as usize;
-                for x in 0..TILE_SIDE {
-                    tile.push(cached[row + (left + x).min(width as usize - 1)]);
-                }
-            }
-            Ok(())
-        },
-    )?;
-    if !stable(bands) {
-        return Err("pixel source changed before completing grid export".into());
-    }
-    stop.check().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    snapclip_avif::write_hdr(bands, width, &std::env::temp_dir(), &mut bytes, stop)
+        .map_err(|e| e.to_string())?;
     Ok(bytes)
 }
 

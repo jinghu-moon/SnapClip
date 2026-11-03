@@ -20,7 +20,9 @@
 param(
     # Check one package instead of the whole invariant set. Used as the negative control:
     # `-Package snapclip-app` must fail because the shell depends on GPUI and capabilities.
-    [string]$Package
+    [string]$Package,
+    [string]$CargoConfig = '',
+    [switch]$Avif
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +33,7 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $SHELL_ONLY = @("snapclip-app", "tauri", "wry", "gpui", "gpui-pre", "gpui-kit", "gpui-base", "gpui-component", "yue-component")
 $APP_ONLY = @("snapclip-app", "tauri", "wry")
 $FORBIDDEN = @{
+    "snapclip-avif" = $SHELL_ONLY + @("snapclip-capture", "snapclip-pin", "snapclip-history", "snapclip-clipboard", "snapclip-ui")
     "snapclip-pin" = $APP_ONLY + @("rusqlite", "arboard", "snapclip-clipboard", "snapclip-capture", "snapclip-history", "snapclip-recognize")
     "snapclip-clipboard" = $SHELL_ONLY + @("rusqlite", "snapclip-pin", "snapclip-capture", "snapclip-history", "snapclip-recognize", "snapclip-ui")
     "snapclip-capture" = $SHELL_ONLY + @("snapclip-pin", "snapclip-clipboard", "rusqlite", "arboard", "snapclip-history", "snapclip-recognize")
@@ -45,7 +48,11 @@ $FORBIDDEN = @{
 $MODEL_ALLOWED = @("serde", "serde_core", "serde_derive", "serde_json", "serde_derive_internals", "proc-macro2", "quote", "syn", "unicode-ident", "memchr", "itoa", "ryu", "half", "cfg-if", "zerocopy", "zerocopy-derive", "yue-color")
 
 function Get-TreeLines([string]$target) {
-    $output = & cargo tree -p $target -e normal 2>&1
+    $featureArgs = @()
+    if ($Avif -and $target -in @("snapclip-pin", "snapclip-app")) { $featureArgs = @('--features', 'avif') }
+    $configArgs = @()
+    if ($CargoConfig) { $configArgs = @('--config', $CargoConfig) }
+    $output = & cargo tree -p $target -e normal @featureArgs @configArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "cargo tree -p $target failed:`n$($output -join "`n")"
     }
@@ -65,7 +72,7 @@ function Get-PackageNames([string[]]$lines) {
 
 $failures = New-Object System.Collections.Generic.List[string]
 
-$targets = if ($Package) { @($Package) } else { @("snapclip-capture", "snapclip-history", "snapclip-model", "snapclip-pin", "snapclip-clipboard") }
+$targets = if ($Package) { @($Package) } else { @("snapclip-capture", "snapclip-history", "snapclip-model", "snapclip-pin", "snapclip-clipboard", "snapclip-avif") }
 
 foreach ($target in $targets) {
     $lines = Get-TreeLines $target

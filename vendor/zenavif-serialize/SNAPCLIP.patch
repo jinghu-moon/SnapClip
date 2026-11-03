@@ -32,8 +32,36 @@
      /// - `output_width`, `output_height`: final image dimensions
      /// - `tile_width`, `tile_height`: dimensions of each tile
      /// - `tile_data`: AV1-encoded data for each tile in row-major order (length must equal `rows * columns`)
-@@ -60,6 +64,19 @@
+@@ -58,8 +62,47 @@
+                      output_width: u32, output_height: u32,
+                      tile_width: u32, tile_height: u32,
                       tile_data: &[&[u8]], alpha_data: Option<&[&[u8]]>) -> io::Result<Vec<u8>> {
++        let lengths = |tiles: &[&[u8]]| tiles.iter().map(|tile| {
++            u32::try_from(tile.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
++        }).collect::<io::Result<Vec<_>>>();
++        let colors = lengths(tile_data)?;
++        let alphas = alpha_data.map(lengths).transpose()?;
++        let mut out = self.header(rows, columns, output_width, output_height,
++            tile_width, tile_height, &colors, alphas.as_deref())?;
++        let size = colors.iter().chain(alphas.iter().flatten())
++            .map(|&len| len as usize).sum();
++        out.try_reserve_exact(size).map_err(|_| io::ErrorKind::OutOfMemory)?;
++        for tile in tile_data.iter().copied().chain(alpha_data.into_iter().flatten().copied()) {
++            out.extend_from_slice(tile);
++        }
++        Ok(out)
++    }
++
++    /// Build only the container header and grid descriptors. Append each color
++    /// payload followed by each alpha payload, with precisely these lengths.
++    /// The returned mdat size and iloc offsets describe the complete file; no
++    /// payload allocation or seekable output is required. Errors must discard
++    /// the caller's partial output. This writer uses 32-bit file offsets.
++    #[allow(clippy::too_many_arguments)]
++    pub fn header(&self, rows: u8, columns: u8,
++                  output_width: u32, output_height: u32,
++                  tile_width: u32, tile_height: u32,
++                  tile_data: &[u32], alpha_data: Option<&[u32]>) -> io::Result<Vec<u8>> {
      let image = self;
      let tile_count = rows as usize * columns as usize;
 +    let has_alpha = alpha_data.is_some();
@@ -52,7 +80,7 @@
      if tile_data.len() != tile_count {
          return Err(io::Error::new(io::ErrorKind::InvalidInput,
              format!("tile_data.len() ({}) != rows*columns ({})", tile_data.len(), tile_count)));
-@@ -69,8 +86,6 @@
+@@ -69,8 +112,6 @@
              return Err(io::Error::new(io::ErrorKind::InvalidInput,
                  format!("alpha_data.len() ({}) != rows*columns ({})", alpha.len(), tile_count)));
          }
@@ -61,7 +89,7 @@
  
      // Item IDs:
      // 1 = color grid item
-@@ -132,6 +147,10 @@
+@@ -132,6 +173,10 @@
      } else {
          None
      };
@@ -72,7 +100,7 @@
  
      // Alpha AV1C + pixi + auxC (if applicable)
      let (av1c_alpha, pixi_alpha, auxc_alpha) = if has_alpha {
-@@ -166,6 +185,9 @@
+@@ -166,6 +211,9 @@
              if let Some(colr_p) = colr_prop {
                  v.push(colr_p);
              }
@@ -82,7 +110,7 @@
              v
          },
      };
-@@ -275,7 +297,7 @@
+@@ -275,7 +323,7 @@
      write_ftyp(&mut out);
  
      // meta
@@ -91,7 +119,7 @@
          &mut out,
          &image_items,
          &ipma_entries,
-@@ -293,6 +315,19 @@
+@@ -293,6 +341,18 @@
          has_alpha,
      );
  
@@ -99,20 +127,35 @@
 +    // before copying payloads, and avoid Vec's geometric growth past it.
 +    let payload_size = tile_data.iter().copied()
 +        .chain(alpha_data.into_iter().flatten().copied())
-+        .try_fold(0usize, |total, tile| total.checked_add(tile.len()))
++        .try_fold(0usize, |total, len| total.checked_add(len as usize))
 +        .ok_or(io::ErrorKind::InvalidInput)?;
 +    let total_size = out.len().checked_add(8 + grid_descriptor.len()
 +        + alpha_grid_descriptor.as_ref().map_or(0, Vec::len))
 +        .and_then(|n| n.checked_add(payload_size))
 +        .filter(|&n| n <= u32::MAX as usize)
 +        .ok_or(io::ErrorKind::InvalidInput)?;
-+    out.try_reserve_exact(total_size - out.len()).map_err(|_| io::ErrorKind::OutOfMemory)?;
 +
      // mdat
      let mdat_pos = begin_box(&mut out, b"mdat");
      let mdat_data_start = out.len() as u32;
-@@ -322,7 +357,7 @@
-     end_box(&mut out, mdat_pos);
+@@ -307,22 +367,10 @@
+         out.extend_from_slice(agd);
+     }
+ 
+-    // Color tile data
+-    for tile in tile_data {
+-        out.extend_from_slice(tile);
+-    }
+-
+-    // Alpha tile data
+-    if let Some(alpha) = alpha_data {
+-        for tile in alpha {
+-            out.extend_from_slice(tile);
+-        }
+-    }
+-
+-    end_box(&mut out, mdat_pos);
++    out[mdat_pos..mdat_pos + 4].copy_from_slice(&((total_size - mdat_pos) as u32).to_be_bytes());
  
      // Patch iloc offsets
 -    patch_iloc_offsets(&mut out, mdat_data_start);
@@ -120,7 +163,15 @@
  
      Ok(out)
      }
-@@ -406,7 +441,8 @@
+@@ -400,13 +448,14 @@
+     grid_descriptor: &[u8],
+     alpha_grid_descriptor: Option<&[u8]>,
+     alpha_grid_id: u16,
+-    tile_data: &[&[u8]],
+-    alpha_data: Option<&[&[u8]]>,
++    tile_data: &[u32],
++    alpha_data: Option<&[u32]>,
+     color_tile_base: u16,
      alpha_tile_base: u16,
      tile_count: usize,
      has_alpha: bool,
@@ -130,7 +181,7 @@
      let meta_pos = begin_box(out, b"meta");
      write_fullbox(out, 0, 0);
  
-@@ -447,6 +483,7 @@
+@@ -447,6 +496,7 @@
          write_u16(out, primary_id);
          write_u16(out, 0); // data_reference_index
          write_u16(out, 1); // extent_count
@@ -138,7 +189,7 @@
          write_u32(out, ILOC_PLACEHOLDER);
          write_u32(out, grid_descriptor.len() as u32);
  
-@@ -455,6 +492,7 @@
+@@ -455,6 +505,7 @@
              write_u16(out, alpha_grid_id);
              write_u16(out, 0);
              write_u16(out, 1);
@@ -146,23 +197,29 @@
              write_u32(out, ILOC_PLACEHOLDER);
              write_u32(out, alpha_grid_descriptor.map_or(0, |d| d.len() as u32));
          }
-@@ -464,6 +502,7 @@
+@@ -464,8 +515,9 @@
              write_u16(out, color_tile_base + i as u16);
              write_u16(out, 0);
              write_u16(out, 1);
 +            iloc_offsets.push(out.len());
              write_u32(out, ILOC_PLACEHOLDER);
-             write_u32(out, tile.len() as u32);
+-            write_u32(out, tile.len() as u32);
++            write_u32(out, *tile);
          }
-@@ -474,6 +513,7 @@
+ 
+         // Alpha tile items
+@@ -474,8 +526,9 @@
                  write_u16(out, alpha_tile_base + i as u16);
                  write_u16(out, 0);
                  write_u16(out, 1);
 +                iloc_offsets.push(out.len());
                  write_u32(out, ILOC_PLACEHOLDER);
-                 write_u32(out, tile.len() as u32);
+-                write_u32(out, tile.len() as u32);
++                write_u32(out, *tile);
              }
-@@ -509,12 +549,19 @@
+         }
+ 
+@@ -509,12 +562,19 @@
      if !irefs.is_empty() {
          let iref_pos = begin_box(out, b"iref");
          write_fullbox(out, 0, 0);
@@ -185,7 +242,7 @@
          }
          end_box(out, iref_pos);
      }
-@@ -551,30 +598,17 @@
+@@ -551,30 +611,17 @@
      }
  
      end_box(out, meta_pos);

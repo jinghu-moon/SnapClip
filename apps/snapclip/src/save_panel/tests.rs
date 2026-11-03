@@ -89,10 +89,56 @@ fn hdr_formats_are_gated_by_the_production_encoder_not_transitive_codec_dependen
                 .contains("保留 HDR 仅支持 PNG16")
         );
     }
+    export.format = SaveFormat::Avif;
+    #[cfg(not(feature = "avif"))]
     assert!(
-        serde_json::from_str::<SaveFormat>("\"avif\"").is_err(),
-        "AVIF must stay unavailable until a production HDR encoder/decoder is verified"
+        matches!(
+            export.encoded_bytes(),
+            Err(SaveError::UnsupportedFormat(SaveFormat::Avif))
+        ),
+        "default builds must reject before encoding"
     );
+    #[cfg(feature = "avif")]
+    {
+        let encoded = export.encoded_bytes().unwrap();
+        let decoded = snapclip_pin::decode_image(&encoded).unwrap();
+        assert!(decoded.is_hdr());
+        assert_eq!(decoded.pixels().size(), [1, 1]);
+        let actual = snapclip_model::pixel_color::linear_rgba(decoded.pixels())
+            .next()
+            .unwrap();
+        assert!((actual[0] - 12.5).abs() < 0.08);
+        assert!((actual[3] - 0.5).abs() < 0.002);
+        assert_eq!(
+            preview::encode(&export).unwrap().encoded.color_space(),
+            yue_component::ImagePreviewColorSpace::ScRgb
+        );
+        export.output = Size::new(snapclip_avif::MAX_PREVIEW_PIXELS + 1, 1);
+        assert!(
+            export
+                .avif_bytes(snapclip_avif::StopToken::new(snapclip_avif::Unstoppable))
+                .unwrap_err()
+                .message()
+                .contains("2400 万像素"),
+            "oversized previews must fail before resizing or encoding"
+        );
+        export.output = Size::new(1, 1);
+        export.color_export = ColorExport::Sdr {
+            source_peak_nits: 1000.,
+        };
+        assert!(
+            export.encoded_bytes().is_err(),
+            "must not relabel an SDR derivative as PQ"
+        );
+        let owner = preview::CancelOnDrop::new();
+        let token = owner.token();
+        drop(owner);
+        export.color_export = ColorExport::PreserveHdr;
+        assert!(
+            matches!(export.avif_bytes(token), Err(SaveError::Cancelled)),
+            "closing or superseding a preview must cancel the real encoder"
+        );
+    }
     assert_eq!(picture.original_pixels().as_bytes(), bytes);
 }
 

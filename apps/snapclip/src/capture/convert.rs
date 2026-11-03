@@ -247,6 +247,9 @@ impl SinkWriter {
             SaveFormat::Png => Err(ExportError::Sink(
                 "PNG is a copy, so it never reaches a row sink".into(),
             )),
+            SaveFormat::Avif => Err(ExportError::Sink(
+                "AVIF requires the explicit HDR pixel source, not an SDR PNG transcode".into(),
+            )),
         }
     }
 

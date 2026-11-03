@@ -23,7 +23,7 @@
       "src/encoder.rs",
       "src/yuv_convert.rs"
     ],
-    "patch_checksum": "d43ef4b7e5c691eab6e1272c8532ec3b0bf9ee7c2292a0162c1547a0b7c50905"
+    "patch_checksum": "c8643ebc58e7f7b384a2e9695069b8a0522dd2901bf1d9daf3966d0a3ea2a49d"
   },
   {
     "name": "zenravif",
@@ -72,7 +72,7 @@
     "patch_files": [
       "src/grid.rs"
     ],
-    "patch_checksum": "76311ad717ebf2d2204cedd3971213b744cf450fdd80ce58dcad5dff215f3c66"
+    "patch_checksum": "4c74c800263922eef2654a04b88c54820594edad52b1d48cb10db3b2820c4150"
   },
   {
     "name": "zenrav1e",

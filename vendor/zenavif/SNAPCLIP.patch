@@ -17,7 +17,7 @@
              prefer_8bit: false,
          }
      }
-@@ -75,6 +78,13 @@
+@@ -75,6 +78,19 @@
          self
      }
  
@@ -25,6 +25,12 @@
 +    /// This does not change the pixel or per-tile decode limits.
 +    pub fn grid_tile_limit(mut self, limit: u32) -> Self {
 +        self.parser_max_grid_tiles = Some(limit);
++        self
++    }
++
++    /// Bound parser metadata allocations independently of decoded pixel limits.
++    pub fn parser_memory_limit(mut self, bytes: u64) -> Self {
++        self.parser_peak_memory_limit = Some(bytes);
 +        self
 +    }
 +

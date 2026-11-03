@@ -70,16 +70,68 @@ pub(super) fn original(picture: &Picture) -> Result<ImagePreviewImage, String> {
 }
 
 pub(super) fn encode(export: &Export) -> Result<EncodedPreview, String> {
+    #[cfg(feature = "avif")]
+    if export.format == snapclip_capture::save_format::SaveFormat::Avif {
+        return encode_avif(
+            export,
+            snapclip_avif::StopToken::new(snapclip_avif::Unstoppable),
+        );
+    }
     super::model::validate_preview_size(export.output).map_err(str::to_owned)?;
     let encoded = export.encoded_bytes().map_err(|e| e.message())?;
     // Native detail within the same budget as the source; oversized output is
     // explicitly a proxy. Byte counts still measure the exact export file.
-    let encoded_image =
+    let encoded_image = {
         ImagePreviewImage::from_encoded(&encoded, &ImagePreviewLimits::default(), "编码后的图片")
-            .map_err(|e| format!("无法解码预览：{e}"))?;
+            .map_err(|e| format!("无法解码预览：{e}"))?
+    };
     Ok(EncodedPreview {
         bytes: encoded.len() as u64,
         encoded: encoded_image,
+    })
+}
+
+#[cfg(feature = "avif")]
+pub(super) struct CancelOnDrop(snapclip_avif::Stopper);
+#[cfg(feature = "avif")]
+impl CancelOnDrop {
+    pub fn new() -> Self {
+        Self(snapclip_avif::Stopper::new())
+    }
+    pub fn token(&self) -> snapclip_avif::StopToken {
+        self.0.clone().into()
+    }
+}
+#[cfg(feature = "avif")]
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[cfg(feature = "avif")]
+pub(super) fn encode_avif(
+    export: &Export,
+    stop: snapclip_avif::StopToken,
+) -> Result<EncodedPreview, String> {
+    super::model::validate_preview_size(export.output).map_err(str::to_owned)?;
+    let encoded = export.avif_bytes(stop.clone()).map_err(|e| e.message())?;
+    let pixels =
+        snapclip_avif::decode(&encoded, &stop).map_err(|e| format!("无法解码 AVIF 预览：{e}"))?;
+    let [w, h] = pixels.size();
+    let stride = pixels.row_stride();
+    let image = yue_component::ImagePreviewPixels::from_rgba16f(
+        w,
+        h,
+        stride,
+        pixels.into_bytes(),
+        yue_component::ImagePreviewColorSpace::ScRgb,
+    )
+    .and_then(|pixels| pixels.into_preview(&ImagePreviewLimits::default(), "编码后的图片"))
+    .map_err(|e| e.to_string())?;
+    Ok(EncodedPreview {
+        bytes: encoded.len() as u64,
+        encoded: image,
     })
 }
 

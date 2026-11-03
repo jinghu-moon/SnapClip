@@ -1,0 +1,21 @@
+[package]
+name = "snapclip-avif"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+description = "Bounded CPU AVIF encoding and explicit color decoding for SnapClip"
+
+[dependencies]
+snapclip-model = { path = "../snapclip-model" }
+zenavif = { version = "=0.1.6", default-features = false, features = ["encode"] }
+zenavif-parse = "=0.6.2"
+zenavif-serialize = "=0.1.4"
+almost-enough = "0.4.5"
+enough = "0.4.5"
+imgref = "1.12"
+rgb = "0.8"
+tempfile = "=3.27.0"
+half = { version = "2.7", default-features = false, features = ["std"] }
+moxcms = { version = "=0.8.1", features = ["extended_range"] }
+yue-color = { path = "../../../GPUI-Yue-Component/crates/yue-color" }

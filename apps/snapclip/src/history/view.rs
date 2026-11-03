@@ -182,7 +182,11 @@ impl HistoryView {
         self.pins = Some(pins);
     }
 
-    fn export_capture(&mut self, cx: &mut Context<Self>) {
+    fn export_capture(
+        &mut self,
+        format: snapclip_capture::save_format::SaveFormat,
+        cx: &mut Context<Self>,
+    ) {
         if self.capture_busy {
             return;
         }
@@ -191,7 +195,13 @@ impl HistoryView {
         };
         let selection = cx.prompt_for_new_path(
             std::path::Path::new(&crate::save::dirs::desktop()),
-            Some("SnapClip-original.png"),
+            Some(
+                if format == snapclip_capture::save_format::SaveFormat::Avif {
+                    "SnapClip-original.avif"
+                } else {
+                    "SnapClip-original.png"
+                },
+            ),
         );
         self.capture_busy = true;
         self.capture_operation = Some(cx.spawn(async move |this, cx| {
@@ -890,8 +900,31 @@ impl Render for HistoryView {
                                         })),
                                 )
                                 .child(button("history-export-original", export_label).on_click(
-                                    cx.listener(|this, _, _, cx| this.export_capture(cx)),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.export_capture(
+                                            snapclip_capture::save_format::SaveFormat::Png,
+                                            cx,
+                                        )
+                                    }),
                                 ))
+                                .when(
+                                    cfg!(feature = "avif")
+                                        && self.state.selected_capture().is_some_and(|s| {
+                                            s.metadata.source.descriptor().encoding()
+                                                == snapclip_model::pixels::PixelEncoding::ScRgb
+                                        }),
+                                    |bar| {
+                                        bar.child(
+                                            button("history-export-avif", "导出 HDR AVIF…")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.export_capture(
+                                                    snapclip_capture::save_format::SaveFormat::Avif,
+                                                    cx,
+                                                )
+                                                })),
+                                        )
+                                    },
+                                )
                                 .child(button("history-copy-sdr", "复制 SDR").on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.capture_action(CaptureAction::CopySdr, cx)

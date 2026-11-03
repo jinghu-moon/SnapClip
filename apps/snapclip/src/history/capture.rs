@@ -135,12 +135,27 @@ pub(crate) fn export_source(
     path: &std::path::Path,
 ) -> Result<crate::save::service::SaveOutcome, String> {
     use crate::save::service::{ConflictPolicy, NoCancel, SaveRequest, commit_stream, target_of};
-    if !path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
-    {
-        return Err("请选择 .png 文件名".into());
-    }
+    let format = match path.extension().and_then(|v| v.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("png") => {
+            snapclip_capture::save_format::SaveFormat::Png
+        }
+        #[cfg(feature = "avif")]
+        Some(ext) if ext.eq_ignore_ascii_case("avif") => {
+            if source.metadata.source.descriptor().encoding()
+                != snapclip_model::pixels::PixelEncoding::ScRgb
+            {
+                return Err("AVIF 当前仅支持 HDR 保真源".into());
+            }
+            snapclip_capture::save_format::SaveFormat::Avif
+        }
+        _ => return Err("请选择当前构建支持的 .png 文件名或 HDR .avif 文件名".into()),
+    };
+    crate::save::caps::check(
+        format,
+        u64::from(source.metadata.width),
+        u64::from(source.metadata.height),
+    )
+    .map_err(|e| format!("{e:?}"))?;
     let request = SaveRequest {
         directory: path.parent().ok_or("保存路径无父目录")?.to_path_buf(),
         stem: path
@@ -148,7 +163,7 @@ pub(crate) fn export_source(
             .ok_or("保存路径无文件名")?
             .to_string_lossy()
             .into_owned(),
-        format: snapclip_capture::save_format::SaveFormat::Png,
+        format,
         conflict: ConflictPolicy::Overwrite,
     };
     let target = target_of(&request).map_err(|e| e.message())?;
@@ -160,6 +175,14 @@ pub(crate) fn export_source(
         return Err("不能覆盖历史保真源，请选择其他路径".into());
     }
     commit_stream(&request, &mut NoCancel, |file| {
+        #[cfg(feature = "avif")]
+        if format == snapclip_capture::save_format::SaveFormat::Avif {
+            return crate::save::avif::write_source(
+                source,
+                file,
+                snapclip_avif::StopToken::new(snapclip_avif::Unstoppable),
+            );
+        }
         crate::capture::pixel_export::write_capture_source_png(source, file)
             .map_err(std::io::Error::other)
     })

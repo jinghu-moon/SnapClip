@@ -591,10 +591,12 @@ impl SavePanel {
                                 div()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child(if self.format == SaveFormat::Png {
-                                        "PNG 是无损压缩，不支持质量调整"
-                                    } else {
-                                        "WebP 使用无损编码，不支持质量调整"
+                                    .child(match self.format {
+                                        SaveFormat::Png => "PNG 是无损压缩，不支持质量调整",
+                                        SaveFormat::Avif => {
+                                            "AVIF 使用固定 PQ10 高质量编码，需等待编码完成"
+                                        }
+                                        _ => "WebP 使用无损编码，不支持质量调整",
                                     })
                                     .into_any_element()
                             })

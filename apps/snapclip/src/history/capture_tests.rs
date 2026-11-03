@@ -194,6 +194,38 @@ fn history_export_checks_the_resolved_target_and_never_overwrites_its_source() {
     assert!(!normalized_alias.exists());
 }
 
+#[cfg(feature = "avif")]
+#[test]
+fn history_avif_streams_the_master_and_rejects_corruption_without_replacing_target() {
+    let (root, store, archive, pixels) = fixture(true);
+    archive.persist(&pixels).unwrap();
+    let source = store.history_page(None, None).unwrap().items[0]
+        .capture_source
+        .clone()
+        .unwrap();
+    let original = std::fs::read(&source.artifact.absolute_path).unwrap();
+    let path = root.0.join("history.avif");
+    let saved = export_source(&source, &path).unwrap();
+    assert_eq!(
+        saved.format,
+        snapclip_capture::save_format::SaveFormat::Avif
+    );
+    let encoded = std::fs::read(&path).unwrap();
+    let image = snapclip_pin::decode_image(&encoded).unwrap();
+    assert!(image.is_hdr());
+    assert_eq!(image.pixels().size(), pixels.size());
+    assert_eq!(
+        std::fs::read(&source.artifact.absolute_path).unwrap(),
+        original
+    );
+    let mut corrupt = original;
+    *corrupt.last_mut().unwrap() ^= 1;
+    std::fs::write(&source.artifact.absolute_path, corrupt).unwrap();
+    assert!(export_source(&source, &path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), encoded);
+    assert!(!root.0.join("history.avif.partial").exists());
+}
+
 #[test]
 fn corrupt_sdr_and_hdr_exports_preserve_the_target_and_clean_their_own_partial() {
     for hdr in [false, true] {

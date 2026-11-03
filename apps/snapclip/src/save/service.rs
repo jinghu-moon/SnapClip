@@ -395,6 +395,7 @@ fn extension_of(format: SaveFormat) -> &'static str {
         SaveFormat::Jpeg => "jpg",
         SaveFormat::Webp => "webp",
         SaveFormat::Bmp => "bmp",
+        SaveFormat::Avif => "avif",
     }
 }
 

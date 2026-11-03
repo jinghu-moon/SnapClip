@@ -68,6 +68,13 @@ pub(crate) fn load(path: &str) -> Result<PinImage, String> {
     decode_image(&bytes)
 }
 pub fn decode_image(bytes: &[u8]) -> Result<PinImage, String> {
+    #[cfg(feature = "avif")]
+    if snapclip_avif::is_avif(bytes) {
+        let pixels =
+            snapclip_avif::decode(bytes, &snapclip_avif::Unstoppable).map_err(|e| e.to_string())?;
+        return PinImage::from_pixels(PixelSource::new(pixels.descriptor(), 0), Arc::new(pixels))
+            .ok_or_else(|| "图片为空".into());
+    }
     let limits = ImagePreviewLimits::default()
         .max_pixels(24_000_000)
         .max_decode_bytes(24_000_000 * 8);
@@ -126,6 +133,32 @@ mod contract_tests;
 mod tests {
     use super::decode_image as decode;
     use super::*;
+    #[cfg(feature = "avif")]
+    #[test]
+    fn avif_uses_the_shared_hdr_decoder_and_existing_preview_resource() {
+        let mut bytes = Vec::new();
+        snapclip_avif::write_pq_tiles(
+            1,
+            1,
+            &std::env::temp_dir(),
+            &mut bytes,
+            snapclip_avif::StopToken::new(snapclip_avif::Unstoppable),
+            |_, _, tile| {
+                tile.resize(128 * 128, [49271_u16, 49271, 49271, 32768].into());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let pin = decode(&bytes).unwrap();
+        assert!(pin.is_hdr());
+        let source = pin.pixels().as_bytes().to_vec();
+        let display = render(&pin).unwrap();
+        assert_eq!(display.color_space(), ImagePreviewColorSpace::ScRgb);
+        assert_eq!(display.image().as_bytes(0).unwrap(), source);
+        let value = half::f16::from_le_bytes(source[..2].try_into().unwrap()).to_f32();
+        assert!((value - 12.5).abs() < 0.08);
+        assert_eq!(pin.pixels().as_bytes(), source);
+    }
     #[test]
     fn sixteen_bit_sdr_has_an_explicit_eight_bit_copy_derivative() {
         let pixels =

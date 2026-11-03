@@ -26,6 +26,11 @@ pub fn bmp_file_bytes(width: u64, height: u64) -> u64 {
 /// Why a format cannot hold this image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapabilityError {
+    EncoderUnavailable(SaveFormat),
+    GridBudget {
+        width: u64,
+        height: u64,
+    },
     /// One side past what the format can describe.
     TooWide {
         width: u64,
@@ -62,6 +67,16 @@ pub fn check(format: SaveFormat, width: u64, height: u64) -> Result<(), Capabili
     }
 
     match format {
+        SaveFormat::Avif => {
+            #[cfg(feature = "avif")]
+            {
+                if !snapclip_avif::within_export_geometry(width, height) {
+                    return Err(CapabilityError::GridBudget { width, height });
+                }
+            }
+            #[cfg(not(feature = "avif"))]
+            return Err(CapabilityError::EncoderUnavailable(format));
+        }
         SaveFormat::Jpeg => {
             let pixels = width.saturating_mul(height);
             if pixels > JPEG_FRAME_BUDGET_PIXELS {

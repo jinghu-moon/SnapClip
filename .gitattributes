@@ -7,3 +7,6 @@
 # Preserve upstream release bytes and reproducible local patches across Windows
 # checkouts; tools/check-hdr-codec-vendor.py verifies them against official tarballs.
 /vendor/** -text
+
+# Pinned upstream notice hashes refer to their original bytes.
+/tools/codec-bench/license-texts/** -text

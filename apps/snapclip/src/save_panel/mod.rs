@@ -133,6 +133,14 @@ impl Export {
         .map(|(size, _)| size)
     }
     fn encoded_bytes(&self) -> Result<Vec<u8>, SaveError> {
+        if self.format == SaveFormat::Avif {
+            #[cfg(feature = "avif")]
+            {
+                return self.avif_bytes(snapclip_avif::StopToken::new(snapclip_avif::Unstoppable));
+            }
+            #[cfg(not(feature = "avif"))]
+            return Err(SaveError::UnsupportedFormat(self.format));
+        }
         if self.color_export == ColorExport::PreserveHdr {
             if self.format != SaveFormat::Png {
                 return Err(SaveError::Io(
@@ -146,6 +154,49 @@ impl Export {
             return pixel_export::encode_pixels(&pixels, self.color_export).map_err(SaveError::Io);
         }
         assemble::encoded_bytes(&self.values(), &self.picture.frame(self.output))
+    }
+    #[cfg(feature = "avif")]
+    fn avif_bytes(&self, stop: snapclip_avif::StopToken) -> Result<Vec<u8>, SaveError> {
+        use snapclip_avif::Stop;
+        if stop.check().is_err() {
+            return Err(SaveError::Cancelled);
+        }
+        if self.color_export != ColorExport::PreserveHdr {
+            return Err(SaveError::Io(
+                "AVIF 当前仅支持保留 HDR，请选择 PNG 导出 SDR".into(),
+            ));
+        }
+        // This byte buffer exists only for interactive round-trip previews.
+        // Refuse before resizing/encoding; large file saves use the row source
+        // and streaming commit path with their separate export geometry budget.
+        if u64::from(self.output.width) * u64::from(self.output.height)
+            > u64::from(snapclip_avif::MAX_PREVIEW_PIXELS)
+        {
+            return Err(SaveError::Io("AVIF 预览最多支持 2400 万像素".into()));
+        }
+        crate::save::caps::check(
+            self.format,
+            u64::from(self.output.width),
+            u64::from(self.output.height),
+        )
+        .map_err(SaveError::Capability)?;
+        let pixels = self
+            .picture
+            .resized_pixels(self.output)
+            .map_err(SaveError::Io)?;
+        let mut bytes = Vec::new();
+        let mut bounded = crate::save::avif::Limited::new(
+            &mut bytes,
+            Some(snapclip_avif::MAX_INPUT_BYTES as u64),
+        );
+        crate::save::avif::write_pixels(&pixels, &mut bounded, stop).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                SaveError::Cancelled
+            } else {
+                SaveError::Io(e.to_string())
+            }
+        })?;
+        Ok(bytes)
     }
     fn values(&self) -> assemble::PanelValues<'_> {
         source::values_with(
@@ -161,6 +212,33 @@ impl Export {
         )
     }
     fn save(&self) -> Result<SaveOutcome, SaveError> {
+        if self.format == SaveFormat::Avif {
+            #[cfg(feature = "avif")]
+            {
+                if self.color_export != ColorExport::PreserveHdr {
+                    return Err(SaveError::Io(
+                        "AVIF 当前仅支持保留 HDR，请选择 PNG 导出 SDR".into(),
+                    ));
+                }
+                let request = assemble::request_for(
+                    &self.values(),
+                    u64::from(self.output.width),
+                    u64::from(self.output.height),
+                )?;
+                let pixels = self
+                    .picture
+                    .resized_pixels(self.output)
+                    .map_err(SaveError::Io)?;
+                return crate::save::avif::save_pixels(
+                    &pixels,
+                    &request,
+                    self.limit,
+                    snapclip_avif::StopToken::new(snapclip_avif::Unstoppable),
+                );
+            }
+            #[cfg(not(feature = "avif"))]
+            return Err(SaveError::UnsupportedFormat(self.format));
+        }
         if self.color_export == ColorExport::PreserveHdr {
             let bytes = self.encoded_bytes()?;
             if self.limit.is_some_and(|limit| bytes.len() as u64 > limit) {
@@ -217,6 +295,8 @@ pub struct SavePanel {
     _original_task: Option<Task<()>>,
     adding_directory: bool,
     preview_task: Option<Task<()>>,
+    #[cfg(feature = "avif")]
+    preview_cancel: Option<preview::CancelOnDrop>,
     operation: Option<Task<()>>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -228,7 +308,7 @@ impl SavePanel {
             return;
         }
         self.preserve_hdr = preserve;
-        if preserve {
+        if preserve || self.format == SaveFormat::Avif {
             self.format = SaveFormat::Png;
             self.format_select.update(cx, |state, cx| {
                 state
@@ -246,23 +326,31 @@ impl SavePanel {
         }
         let preserve = self.preserve_hdr;
         self.format_select.update(cx, |state, cx| {
+            let options = vec![
+                SelectOption::new("png", ".PNG").with_description(if preserve {
+                    "HDR · 16 位 PQ"
+                } else {
+                    "无损 · 支持透明"
+                }),
+                SelectOption::new("jpeg", ".JPG")
+                    .with_description("需转换为 SDR")
+                    .disabled(preserve),
+                SelectOption::new("webp", ".WebP")
+                    .with_description("需转换为 SDR")
+                    .disabled(preserve),
+            ];
+            #[cfg(feature = "avif")]
+            let options = {
+                let mut options = options;
+                options.push(
+                    SelectOption::new("avif", ".AVIF")
+                        .with_description("HDR · PQ10 · 编码较慢")
+                        .disabled(!preserve),
+                );
+                options
+            };
             state
-                .set_options(
-                    [
-                        SelectOption::new("png", ".PNG").with_description(if preserve {
-                            "HDR · 16 位 PQ"
-                        } else {
-                            "无损 · 支持透明"
-                        }),
-                        SelectOption::new("jpeg", ".JPG")
-                            .with_description("需转换为 SDR")
-                            .disabled(preserve),
-                        SelectOption::new("webp", ".WebP")
-                            .with_description("需转换为 SDR")
-                            .disabled(preserve),
-                    ],
-                    cx,
-                )
+                .set_options(options, cx)
                 .expect("unique color-policy formats");
         });
     }
@@ -338,6 +426,7 @@ impl SavePanel {
                     this.format = match change.after().keys().first().map(|s| s.as_ref()) {
                         Some("jpeg") => SaveFormat::Jpeg,
                         Some("webp") => SaveFormat::Webp,
+                        Some("avif") => SaveFormat::Avif,
                         _ => SaveFormat::Png,
                     };
                     this.schedule_preview(window, cx);
@@ -404,6 +493,8 @@ impl SavePanel {
             _original_task: None,
             adding_directory: false,
             preview_task: None,
+            #[cfg(feature = "avif")]
+            preview_cancel: None,
             operation: None,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -485,6 +576,10 @@ impl SavePanel {
                 // Cancel stale preview jobs as well as refusing save.
                 self.revision += 1;
                 self.preview_task = None;
+                #[cfg(feature = "avif")]
+                {
+                    self.preview_cancel = None;
+                }
                 self.measuring = false;
                 self.bytes = None;
                 self.preview.encoded = ImagePreviewLoad::Empty;
@@ -527,6 +622,10 @@ impl SavePanel {
     }
 
     fn schedule_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "avif")]
+        {
+            self.preview_cancel = None;
+        }
         self.revision += 1;
         self.status = None;
         self.saved_path = None;
@@ -553,6 +652,13 @@ impl SavePanel {
         self.measuring = true;
         let revision = self.revision;
         let export = self.export(cx);
+        #[cfg(feature = "avif")]
+        let avif_stop = {
+            let cancel = preview::CancelOnDrop::new();
+            let token = cancel.token();
+            self.preview_cancel = Some(cancel);
+            token
+        };
         self.preview.encoded = ImagePreviewLoad::Loading;
         self.publish_preview(window, cx);
         self.preview_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -561,7 +667,13 @@ impl SavePanel {
                 .await;
             let result = cx
                 .background_executor()
-                .spawn(async move { preview::encode(&export) })
+                .spawn(async move {
+                    #[cfg(feature = "avif")]
+                    if export.format == SaveFormat::Avif {
+                        return preview::encode_avif(&export, avif_stop);
+                    }
+                    preview::encode(&export)
+                })
                 .await;
             _ = this.update_in(cx, |panel, window, cx| {
                 if panel.revision != revision {

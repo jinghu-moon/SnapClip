@@ -62,7 +62,7 @@ pub fn write_capture_source_png(
     )
 }
 
-struct MasterBands(snapclip_history::pixel_master::PixelMaster);
+pub(crate) struct MasterBands(pub(crate) snapclip_history::pixel_master::PixelMaster);
 impl BandSource for MasterBands {
     fn source(&self) -> PixelSource {
         self.0.metadata().source
@@ -199,7 +199,7 @@ pub fn encode_pixels(pixels: &PixelBuffer, policy: ColorExport) -> Result<Vec<u8
     Ok(output)
 }
 
-struct PixelBands<'a>(&'a PixelBuffer);
+pub(crate) struct PixelBands<'a>(pub(crate) &'a PixelBuffer);
 impl BandSource for PixelBands<'_> {
     fn source(&self) -> PixelSource {
         PixelSource::new(self.0.descriptor(), 0)

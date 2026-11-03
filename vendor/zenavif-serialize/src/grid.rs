@@ -62,6 +62,32 @@ impl GridImage {
                      output_width: u32, output_height: u32,
                      tile_width: u32, tile_height: u32,
                      tile_data: &[&[u8]], alpha_data: Option<&[&[u8]]>) -> io::Result<Vec<u8>> {
+        let lengths = |tiles: &[&[u8]]| tiles.iter().map(|tile| {
+            u32::try_from(tile.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+        }).collect::<io::Result<Vec<_>>>();
+        let colors = lengths(tile_data)?;
+        let alphas = alpha_data.map(lengths).transpose()?;
+        let mut out = self.header(rows, columns, output_width, output_height,
+            tile_width, tile_height, &colors, alphas.as_deref())?;
+        let size = colors.iter().chain(alphas.iter().flatten())
+            .map(|&len| len as usize).sum();
+        out.try_reserve_exact(size).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        for tile in tile_data.iter().copied().chain(alpha_data.into_iter().flatten().copied()) {
+            out.extend_from_slice(tile);
+        }
+        Ok(out)
+    }
+
+    /// Build only the container header and grid descriptors. Append each color
+    /// payload followed by each alpha payload, with precisely these lengths.
+    /// The returned mdat size and iloc offsets describe the complete file; no
+    /// payload allocation or seekable output is required. Errors must discard
+    /// the caller's partial output. This writer uses 32-bit file offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn header(&self, rows: u8, columns: u8,
+                  output_width: u32, output_height: u32,
+                  tile_width: u32, tile_height: u32,
+                  tile_data: &[u32], alpha_data: Option<&[u32]>) -> io::Result<Vec<u8>> {
     let image = self;
     let tile_count = rows as usize * columns as usize;
     let has_alpha = alpha_data.is_some();
@@ -319,14 +345,13 @@ impl GridImage {
     // before copying payloads, and avoid Vec's geometric growth past it.
     let payload_size = tile_data.iter().copied()
         .chain(alpha_data.into_iter().flatten().copied())
-        .try_fold(0usize, |total, tile| total.checked_add(tile.len()))
+        .try_fold(0usize, |total, len| total.checked_add(len as usize))
         .ok_or(io::ErrorKind::InvalidInput)?;
     let total_size = out.len().checked_add(8 + grid_descriptor.len()
         + alpha_grid_descriptor.as_ref().map_or(0, Vec::len))
         .and_then(|n| n.checked_add(payload_size))
         .filter(|&n| n <= u32::MAX as usize)
         .ok_or(io::ErrorKind::InvalidInput)?;
-    out.try_reserve_exact(total_size - out.len()).map_err(|_| io::ErrorKind::OutOfMemory)?;
 
     // mdat
     let mdat_pos = begin_box(&mut out, b"mdat");
@@ -342,19 +367,7 @@ impl GridImage {
         out.extend_from_slice(agd);
     }
 
-    // Color tile data
-    for tile in tile_data {
-        out.extend_from_slice(tile);
-    }
-
-    // Alpha tile data
-    if let Some(alpha) = alpha_data {
-        for tile in alpha {
-            out.extend_from_slice(tile);
-        }
-    }
-
-    end_box(&mut out, mdat_pos);
+    out[mdat_pos..mdat_pos + 4].copy_from_slice(&((total_size - mdat_pos) as u32).to_be_bytes());
 
     // Patch iloc offsets
     patch_iloc_offsets(&mut out, mdat_data_start, &iloc_offsets);
@@ -435,8 +448,8 @@ fn write_meta_grid(
     grid_descriptor: &[u8],
     alpha_grid_descriptor: Option<&[u8]>,
     alpha_grid_id: u16,
-    tile_data: &[&[u8]],
-    alpha_data: Option<&[&[u8]]>,
+    tile_data: &[u32],
+    alpha_data: Option<&[u32]>,
     color_tile_base: u16,
     alpha_tile_base: u16,
     tile_count: usize,
@@ -504,7 +517,7 @@ fn write_meta_grid(
             write_u16(out, 1);
             iloc_offsets.push(out.len());
             write_u32(out, ILOC_PLACEHOLDER);
-            write_u32(out, tile.len() as u32);
+            write_u32(out, *tile);
         }
 
         // Alpha tile items
@@ -515,7 +528,7 @@ fn write_meta_grid(
                 write_u16(out, 1);
                 iloc_offsets.push(out.len());
                 write_u32(out, ILOC_PLACEHOLDER);
-                write_u32(out, tile.len() as u32);
+                write_u32(out, *tile);
             }
         }
 

@@ -168,7 +168,7 @@ pub(crate) fn scroll_format(
     // save-time transcode, so it has no arm here.
     // BMP is a save-time target rather than a capture format: the artifact every capture keeps is
     // PNG (`docs/42`), and BMP exists to transcode that master on the way out.
-    if matches!(preferred, SaveFormat::Bmp) {
+    if matches!(preferred, SaveFormat::Bmp | SaveFormat::Avif) {
         return (SaveFormat::Png, Some(Lowering::SaveTimeOnly));
     }
     if matches!(preferred, SaveFormat::Jpeg)
