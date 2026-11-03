@@ -5,7 +5,8 @@
     [string]$Ffprobe = '',
     [switch]$Resources,
     [switch]$EnforceStreamingBudget,
-    [switch]$GridResources
+    [switch]$GridResources,
+    [switch]$BandResources
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,6 +37,12 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Independent decode matrix failed' }
     python tools/verify-hdr-avif-grid.py --probe $probe --ffmpeg $Ffmpeg --ffprobe $Ffprobe
     if ($LASTEXITCODE -ne 0) { throw 'Independent grid/alpha/ICC verification failed' }
+    python tools/verify-hdr-avif-bands.py --probe $probe --ffmpeg $Ffmpeg --ffprobe $Ffprobe
+    if ($LASTEXITCODE -ne 0) { throw 'Independent FP16 band/master color verification failed' }
+    if ($BandResources) {
+        python tools/verify-hdr-avif-resources.py --probe $probe --bands --enforce-streaming-budget
+        if ($LASTEXITCODE -ne 0) { throw 'Band/master resource gate failed' }
+    }
     if ($GridResources) {
         python tools/verify-hdr-avif-resources.py --probe $probe --grid --enforce-streaming-budget
         if ($LASTEXITCODE -ne 0) { throw 'Bounded grid resource gate failed' }

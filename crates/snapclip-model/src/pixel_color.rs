@@ -49,31 +49,45 @@ pub fn to_sdr_bgra8(
 /// export, not a replacement for the lossless FP16 master. Nonrepresentable
 /// negative/out-of-gamut or >10000 nit colors are errors, not silent clipping.
 pub fn to_rec2020_pq16(source: &PixelBuffer) -> Result<Vec<u8>, &'static str> {
-    let descriptor = source.descriptor();
-    if descriptor.encoding() != PixelEncoding::ScRgb {
-        return Err("HDR PQ export requires an absolute scRGB source");
-    }
+    let pixels = rec2020_pq16_pixels(source)?;
     let mut output = Vec::new();
     output
         .try_reserve_exact(source.as_bytes().len())
         .map_err(|_| "cannot allocate PQ export band")?;
-    for pixel in source.as_bytes().chunks_exact(descriptor.bytes_per_pixel()) {
-        let [r, g, b, alpha] = straight_linear(descriptor, pixel);
+    for pixel in pixels {
+        for channel in pixel? {
+            output.extend_from_slice(&channel.to_be_bytes());
+        }
+    }
+    Ok(output)
+}
+
+/// Iterate full-range, straight-alpha Rec.2020/PQ RGBA16 without allocating an
+/// output band. The caller must discard partial output on any pixel error.
+/// Absolute scRGB is required; alpha remains linear coverage. The same conversion
+/// backs PNG16 and bounded tile exports, so neither invents a second color path.
+pub fn rec2020_pq16_pixels(
+    source: &PixelBuffer,
+) -> Result<impl Iterator<Item = Result<[u16; 4], &'static str>> + '_, &'static str> {
+    if source.descriptor().encoding() != PixelEncoding::ScRgb {
+        return Err("HDR PQ export requires an absolute scRGB source");
+    }
+    Ok(linear_rgba(source).map(|[r, g, b, alpha]| {
         let rgb = yue_color::rec709_to_rec2020([r, g, b]);
-        for channel in rgb {
+        let mut rgba = [0; 4];
+        for (output, channel) in rgba[..3].iter_mut().zip(rgb) {
             let nits = channel * 80.0;
             // Only accommodate matrix roundoff at the exact representable ends.
             if !nits.is_finite() || !(-1e-8..=10000.0 + 1e-8).contains(&nits) {
                 return Err(
-                    "source color is outside HDR PNG Rec.2020/PQ range; preserve the FP16 master or explicitly export SDR",
+                    "source color is outside Rec.2020/PQ range; preserve the FP16 master or explicitly export SDR",
                 );
             }
-            let code = (yue_color::nits_to_pq(nits.clamp(0.0, 10000.0)) * 65535.0).round() as u16;
-            output.extend_from_slice(&code.to_be_bytes());
+            *output = (yue_color::nits_to_pq(nits.clamp(0.0, 10000.0)) * 65535.0).round() as u16;
         }
-        output.extend_from_slice(&((alpha * 65535.0).round() as u16).to_be_bytes());
-    }
-    Ok(output)
+        rgba[3] = (alpha * 65535.0).round() as u16;
+        Ok(rgba)
+    }))
 }
 
 fn straight_linear(descriptor: PixelDescriptor, pixel: &[u8]) -> [f64; 4] {
@@ -165,6 +179,34 @@ mod tests {
             .collect();
         assert_eq!(&codes[..4], &[33297, 33297, 33297, 32768]);
         assert_eq!(&codes[4..], &[49271, 49271, 49271, 65535]);
+        assert_eq!(
+            rec2020_pq16_pixels(&source)
+                .unwrap()
+                .flat_map(|p| p.unwrap().into_iter().flat_map(u16::to_be_bytes))
+                .collect::<Vec<_>>(),
+            encoded
+        );
+    }
+
+    #[test]
+    fn pq_iterator_reports_invalid_later_pixels_and_rejects_relative_sources() {
+        let source = floats(
+            &[[1.25, 1.25, 1.25, 0.5], [-1., 0., 0., 1.]],
+            PixelEncoding::ScRgb,
+            AlphaMode::Straight,
+        );
+        let original = source.as_bytes().to_vec();
+        let mut pixels = rec2020_pq16_pixels(&source).unwrap();
+        assert_eq!(
+            pixels.next().unwrap().unwrap(),
+            [33297, 33297, 33297, 32768]
+        );
+        assert!(pixels.next().unwrap().is_err());
+        assert!(pixels.next().is_none());
+        assert!(to_rec2020_pq16(&source).is_err());
+        assert_eq!(source.as_bytes(), original);
+        let relative = floats(&[[1.; 4]], PixelEncoding::LinearSrgb, AlphaMode::Straight);
+        assert!(rec2020_pq16_pixels(&relative).is_err());
     }
 
     #[test]

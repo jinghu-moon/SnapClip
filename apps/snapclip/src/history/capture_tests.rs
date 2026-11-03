@@ -235,7 +235,7 @@ fn unrepresentable_hdr_export_fails_without_clipping_or_replacing_the_original()
     assert!(
         export_source(&source, &target)
             .unwrap_err()
-            .contains("outside HDR PNG")
+            .contains("outside Rec.2020/PQ range")
     );
     assert_eq!(std::fs::read(&target).unwrap(), b"old-target");
     assert!(!root.0.join("keep.png.partial").exists());

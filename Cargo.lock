@@ -1040,6 +1040,8 @@ dependencies = [
  "png 0.18.1",
  "rgb",
  "snapclip-capture",
+ "snapclip-history",
+ "snapclip-model",
  "windows-sys 0.59.0",
  "zenavif",
  "zenavif-parse",

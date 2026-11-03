@@ -23,11 +23,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe", type=Path, required=True)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--grid", action="store_true", help="measure the bounded qualification grid, retaining the same memory limits")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--grid", action="store_true", help="measure the bounded qualification grid, retaining the same memory limits")
+    modes.add_argument("--bands", action="store_true", help="measure real BandSource and SCPX row reads, retaining the same memory limits")
     parser.add_argument("--enforce-streaming-budget", action="store_true",
                         help="exit 1 if either size exceeds the existing 32 MiB extra heap / 16 MiB single allocation limits")
     args = parser.parse_args()
-    args.output = args.output or Path("target/hdr-avif-grid-resources" if args.grid else "target/hdr-avif-resources")
+    mode = "bands" if args.bands else "grid" if args.grid else "full-frame"
+    args.output = args.output or Path("target/hdr-avif-bands-resources" if args.bands else
+                                     "target/hdr-avif-grid-resources" if args.grid else "target/hdr-avif-resources")
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
@@ -41,7 +45,8 @@ def main():
         path = args.output / f"{width}x{height}.log"
         with path.open("w", encoding="utf8") as output:
             start = time.perf_counter()
-            child = subprocess.Popen([str(args.probe.resolve()), "--grid-resources" if args.grid else "--resources", str(width), str(height)],
+            flag = "--band-resources" if args.bands else "--grid-resources" if args.grid else "--resources"
+            child = subprocess.Popen([str(args.probe.resolve()), flag, str(width), str(height)],
                                      stdout=output, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
             handle = kernel.OpenProcess(0x1000 | 0x10, False, child.pid)
             if not handle:
@@ -65,14 +70,17 @@ def main():
         log = path.read_text(encoding="utf8")
         stages = {}
         for line in log.splitlines():
-            if line.startswith(("resource_encode ", "resource_decode ", "resource_cancel ")):
+            if line.startswith(("resource_encode ", "resource_decode ", "resource_cancel ", "resource_master_write ", "resource_master_encode ")):
                 values = dict(token.split("=", 1) for token in line.split()[1:])
                 stages[line.split()[0] + ("_" + values["operation"] if "operation" in values else "")] = values
-        fits = (all(name in stages for name in ["resource_encode", "resource_decode"])
+        required = ["resource_encode", "resource_decode"]
+        if args.bands:
+            required += ["resource_master_write", "resource_master_encode"]
+        fits = (all(name in stages for name in required)
                 and all(int(stages[name]["heap_peak_delta"]) < 32 * 1024 * 1024
                         and int(stages[name]["largest_allocation"]) < 16 * 1024 * 1024
-                        for name in ["resource_encode", "resource_decode"]))
-        report = dict(width=width, height=height, mode="grid" if args.grid else "full-frame", process_ms=(time.perf_counter() - start) * 1000,
+                        for name in required))
+        report = dict(width=width, height=height, mode=mode, process_ms=(time.perf_counter() - start) * 1000,
                       peak_working_set=peak, stages=stages, fits_streaming_budget=fits, exit_code=child.returncode)
         reports.append(report)
         print(log, end="", flush=True)

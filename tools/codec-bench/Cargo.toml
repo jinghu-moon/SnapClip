@@ -45,7 +45,15 @@ miniz_oxide = "0.9"
 
 [features]
 # Qualification only. The application and MIT Yue library do not enable this.
-hdr-avif-probe = ["dep:zenavif", "dep:zenavif-parse", "dep:zenavif-serialize", "dep:imgref", "dep:rgb", "dep:almost-enough", "dep:moxcms"]
+hdr-avif-probe = ["dep:zenavif", "dep:zenavif-parse", "dep:zenavif-serialize", "dep:imgref", "dep:rgb", "dep:almost-enough", "dep:moxcms", "dep:snapclip-model", "dep:snapclip-history"]
+
+[dependencies.snapclip-model]
+path = "../../crates/snapclip-model"
+optional = true
+
+[dependencies.snapclip-history]
+path = "../../crates/snapclip-history"
+optional = true
 
 [dependencies.zenavif-parse]
 version = "=0.6.2"

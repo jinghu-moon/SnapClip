@@ -23,7 +23,7 @@ def words(path):
     return values
 
 
-def decode_groups(source, groups, ffmpeg, output):
+def decode_groups(source, groups, ffmpeg, output, layout=(133, 71, 6)):
     planes = []
     if len(groups) != 2:
         raise RuntimeError("expected separate color and alpha grid groups")
@@ -32,7 +32,7 @@ def decode_groups(source, groups, ffmpeg, output):
             raise RuntimeError("independent demuxer did not recognize the grid")
         component = group["components"][0]
         width, height = component["width"], component["height"]
-        if (width, height, component["nb_tiles"]) != (133, 71, 6):
+        if (width, height, component["nb_tiles"]) != layout:
             raise RuntimeError("independent grid layout differs from the fixture")
         streams = {stream["index"]: stream for stream in group["streams"]}
         alpha = all(stream["pix_fmt"] == "gray10le" for stream in streams.values())

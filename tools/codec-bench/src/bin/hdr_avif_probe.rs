@@ -15,6 +15,8 @@ use zenavif::{
 
 #[path = "../alloc_probe.rs"]
 mod alloc_probe;
+#[path = "../avif_bands.rs"]
+mod avif_bands;
 #[path = "../avif_grid.rs"]
 mod avif_grid;
 #[global_allocator]
@@ -151,6 +153,19 @@ fn main() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, directory] = arguments.as_slice()
+        && flag == "--band-fixture-dir"
+    {
+        return avif_bands::fixtures(std::path::Path::new(directory));
+    }
+    if let [flag, width, height] = arguments.as_slice()
+        && flag == "--band-resources"
+    {
+        return avif_bands::resources(
+            width.parse().map_err(|_| "invalid width")?,
+            height.parse().map_err(|_| "invalid height")?,
+        );
+    }
     if let [flag, directory] = arguments.as_slice()
         && flag == "--grid-fixture-dir"
     {

@@ -7,10 +7,10 @@ use zenavif_serialize::{Av1CBox, ColrBox, constants::*, grid::GridImage};
 
 // Both compressed tiles and their serialized container are bounded. This is a
 // qualification contract, not a general-purpose large-file AVIF writer.
-const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
+pub(super) const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 const MAX_FILE: usize = MAX_PAYLOAD + 1024 * 1024;
 const MAX_TILES: usize = 4096;
-const TILE_SIDE: usize = 128;
+pub(super) const TILE_SIDE: usize = 128;
 
 fn av1_config(meta: &AV1Metadata) -> Av1CBox {
     let mut config = Av1CBox::default();
@@ -43,6 +43,35 @@ fn encode_with_payload_limit(
     stop: StopToken,
     payload_limit: usize,
 ) -> Result<Vec<u8>, String> {
+    encode_tiles(
+        width,
+        height,
+        side,
+        icc,
+        stop,
+        payload_limit,
+        |left, top, tile| {
+            tile.extend((0..side).flat_map(|y| {
+                let pixel = &pixel;
+                (0..side).map(move |x| pixel((left + x).min(width - 1), (top + y).min(height - 1)))
+            }));
+            Ok(())
+        },
+    )
+}
+
+// The fallible tile provider lets real row sources reject a changed generation,
+// invalid color or failed read before any partial compressed result is returned.
+pub(super) fn encode_tiles(
+    width: usize,
+    height: usize,
+    side: usize,
+    icc: Option<&[u8]>,
+    stop: StopToken,
+    payload_limit: usize,
+    mut fill: impl FnMut(usize, usize, &mut Vec<Rgba<u16>>) -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    stop.check().map_err(|e| e.to_string())?;
     if width == 0 || height == 0 || !matches!(side, 64 | 128) {
         return Err("unsupported grid geometry".into());
     }
@@ -67,20 +96,16 @@ fn encode_with_payload_limit(
     let mut colors = Vec::with_capacity(count);
     let mut alphas = Vec::with_capacity(count);
     let mut payload = 0usize;
+    let mut tile = Vec::with_capacity(side * side);
     for row in 0..rows {
         for column in 0..columns {
             stop.check().map_err(|e| e.to_string())?;
-            let tile: Vec<_> = (0..side)
-                .flat_map(|y| {
-                    let pixel = &pixel;
-                    (0..side).map(move |x| {
-                        pixel(
-                            (column * side + x).min(width - 1),
-                            (row * side + y).min(height - 1),
-                        )
-                    })
-                })
-                .collect();
+            tile.clear();
+            fill(column * side, row * side, &mut tile)?;
+            if tile.len() != side * side {
+                return Err("source returned an incomplete grid tile".into());
+            }
+            stop.check().map_err(|e| e.to_string())?;
             let encoded = zenavif::encode_rgba16(
                 imgref::Img::new(tile.as_slice(), side, side),
                 &super::config(),
@@ -131,6 +156,7 @@ fn encode_with_payload_limit(
     if bytes.len() > MAX_FILE {
         return Err("serialized grid file limit exceeded".into());
     }
+    stop.check().map_err(|e| e.to_string())?;
     Ok(bytes)
 }
 
