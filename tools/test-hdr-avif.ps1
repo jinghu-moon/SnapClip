@@ -2,8 +2,10 @@
     [string]$TargetDir = 'target',
     [string]$CargoConfig = '',
     [string]$Ffmpeg = 'ffmpeg',
+    [string]$Ffprobe = '',
     [switch]$Resources,
-    [switch]$EnforceStreamingBudget
+    [switch]$EnforceStreamingBudget,
+    [switch]$GridResources
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,12 +23,27 @@ try {
     cargo build -p codec-bench --bin hdr-avif-probe --features hdr-avif-probe --release @common
     if ($LASTEXITCODE -ne 0) { throw 'AVIF Release build failed' }
     $probe = Join-Path $TargetDir 'release/hdr-avif-probe.exe'
+    if (-not $Ffprobe) {
+        $ffmpegDirectory = Split-Path -Parent $Ffmpeg
+        if ($ffmpegDirectory) { $Ffprobe = Join-Path $ffmpegDirectory 'ffprobe.exe' }
+        else { $Ffprobe = 'ffprobe' }
+    }
     python tools/verify-hdr-avif.py --probe $probe --ffmpeg $Ffmpeg
     if ($LASTEXITCODE -ne 0) { throw 'Independent encoder pixel gate failed' }
     python tools/verify-hdr-avif-metadata.py --probe $probe
     if ($LASTEXITCODE -ne 0) { throw 'Dual-colr metadata gate failed' }
     python tools/verify-hdr-avif-matrix.py --probe $probe --ffmpeg $Ffmpeg
     if ($LASTEXITCODE -ne 0) { throw 'Independent decode matrix failed' }
+    python tools/verify-hdr-avif-grid.py --probe $probe --ffmpeg $Ffmpeg --ffprobe $Ffprobe
+    if ($LASTEXITCODE -ne 0) { throw 'Independent grid/alpha/ICC verification failed' }
+    if ($GridResources) {
+        python tools/verify-hdr-avif-resources.py --probe $probe --grid --enforce-streaming-budget
+        if ($LASTEXITCODE -ne 0) { throw 'Bounded grid resource gate failed' }
+        foreach ($size in @(@(3840, 2160), @(8256, 5504))) {
+            & $probe --grid-noise-resources $size[0] $size[1]
+            if ($LASTEXITCODE -ne 0) { throw 'Grid noise exceeded its bounded-refusal contract' }
+        }
+    }
     if ($Resources -or $EnforceStreamingBudget) {
         $limits = @()
         if ($EnforceStreamingBudget) { $limits += '--enforce-streaming-budget' }

@@ -45,7 +45,15 @@ miniz_oxide = "0.9"
 
 [features]
 # Qualification only. The application and MIT Yue library do not enable this.
-hdr-avif-probe = ["dep:zenavif", "dep:imgref", "dep:rgb", "dep:almost-enough", "dep:moxcms"]
+hdr-avif-probe = ["dep:zenavif", "dep:zenavif-parse", "dep:zenavif-serialize", "dep:imgref", "dep:rgb", "dep:almost-enough", "dep:moxcms"]
+
+[dependencies.zenavif-parse]
+version = "=0.6.2"
+optional = true
+
+[dependencies.zenavif-serialize]
+version = "=0.1.4"
+optional = true
 
 [dependencies.zenavif]
 version = "=0.1.6"

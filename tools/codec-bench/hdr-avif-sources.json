@@ -17,12 +17,13 @@
       "Cargo.lock"
     ],
     "patch_files": [
+      "src/config.rs",
       "src/convert.rs",
       "src/decoder_managed.rs",
       "src/encoder.rs",
       "src/yuv_convert.rs"
     ],
-    "patch_checksum": "ce4d92dcc65bb9b12ac6d03124be5581de2d4010529d0bb971e92db816dd050c"
+    "patch_checksum": "d43ef4b7e5c691eab6e1272c8532ec3b0bf9ee7c2292a0162c1547a0b7c50905"
   },
   {
     "name": "zenravif",
@@ -52,7 +53,7 @@
     "patch_files": [
       "src/lib.rs"
     ],
-    "patch_checksum": "8906c85f9ecc5165e20eba916654f81e12166760387ee2b168797ccf4e6ff844"
+    "patch_checksum": "e01b3e7cef1d285203fc6c6a3c48e04a4425e2fb1b468da343d93ff71c0428ae"
   },
   {
     "name": "zenavif-serialize",
@@ -63,7 +64,15 @@
     "source": "https://crates.io/api/v1/crates/zenavif-serialize/0.1.4",
     "extracted_source_matches_verified_archive": {
       "Cargo.toml": true
-    }
+    },
+    "vendor": "vendor/zenavif-serialize",
+    "archive_omissions": [
+      "Cargo.lock"
+    ],
+    "patch_files": [
+      "src/grid.rs"
+    ],
+    "patch_checksum": "76311ad717ebf2d2204cedd3971213b744cf450fdd80ce58dcad5dff215f3c66"
   },
   {
     "name": "zenrav1e",

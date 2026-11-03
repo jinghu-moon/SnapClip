@@ -864,9 +864,9 @@ impl DecodeConfig {
 /// - When non-zero, they specify the exact output dimensions of the composed image
 pub struct GridConfig {
     /// Number of tile rows (1-256)
-    pub rows: u8,
+    pub rows: u16,
     /// Number of tile columns (1-256)
-    pub columns: u8,
+    pub columns: u16,
     /// Output width in pixels (0 = calculate from tiles)
     pub output_width: u32,
     /// Output height in pixels (0 = calculate from tiles)
@@ -1285,6 +1285,7 @@ struct MdatBounds {
 
 /// Where an item's data lives: construction method + extent ranges.
 struct ItemExtents {
+    dimensions: Option<(u32, u32)>,
     construction_method: ConstructionMethod,
     extents: TryVec<ExtentRange>,
 }
@@ -1322,6 +1323,7 @@ pub struct AvifParser<'data> {
     alpha: Option<ItemExtents>,
     grid_config: Option<GridConfig>,
     tiles: TryVec<ItemExtents>,
+    alpha_tiles: TryVec<ItemExtents>,
     animation_data: Option<AnimationParserData>,
     premultiplied_alpha: bool,
     av1_config: Option<AV1Config>,
@@ -1401,7 +1403,7 @@ impl<'data> AvifParser<'data> {
         stop: &dyn Stop,
     ) -> Result<Self> {
         let parsed = Self::parse_raw(data, config, stop)?;
-        Self::build(Cow::Borrowed(data), parsed, config)
+        Self::build(Cow::Borrowed(data), parsed, config, stop)
     }
 
     /// Parse AVIF from an owned buffer.
@@ -1419,7 +1421,7 @@ impl<'data> AvifParser<'data> {
         stop: &dyn Stop,
     ) -> Result<AvifParser<'static>> {
         let parsed = AvifParser::parse_raw(&data, config, stop)?;
-        AvifParser::build(Cow::Owned(data), parsed, config)
+        AvifParser::build(Cow::Owned(data), parsed, config, stop)
     }
 
     /// Parse AVIF from a reader (reads all bytes, then parses).
@@ -1530,7 +1532,8 @@ impl<'data> AvifParser<'data> {
     }
 
     /// Build an AvifParser from raw bytes + parsed structure.
-    fn build(raw: Cow<'data, [u8]>, parsed: ParsedStructure, config: &DecodeConfig) -> Result<Self> {
+    fn build(raw: Cow<'data, [u8]>, parsed: ParsedStructure, config: &DecodeConfig, stop: &dyn Stop) -> Result<Self> {
+        stop.check()?;
         let tracker = ResourceTracker::new(config);
 
         // Store animation metadata if present
@@ -1558,10 +1561,11 @@ impl<'data> AvifParser<'data> {
                 raw,
                 mdat_bounds: parsed.mdat_bounds,
                 idat: None,
-                primary: ItemExtents { construction_method: ConstructionMethod::File, extents: TryVec::new() },
+                primary: ItemExtents { dimensions: None, construction_method: ConstructionMethod::File, extents: TryVec::new() },
                 alpha: None,
                 grid_config: None,
                 tiles: TryVec::new(),
+                alpha_tiles: TryVec::new(),
                 animation_data,
                 premultiplied_alpha: false,
                 av1_config: track_config.av1_config,
@@ -1723,49 +1727,35 @@ impl<'data> AvifParser<'data> {
             .find(|x| x.item_id == meta.primary_item_id)
             .is_some_and(|info| info.item_type == b"grid");
 
-        // Extract grid configuration and tile extents if this is a grid
+        // Grid descriptors are item payloads, not ipco properties. Never infer
+        // rows/columns from ispe: edge tiles may be cropped in the output.
         let (grid_config, tiles) = if is_grid {
-            let mut tiles_with_index: TryVec<(u32, u16)> = TryVec::new();
-            for iref in meta.item_references.iter() {
-                if iref.from_item_id == meta.primary_item_id && iref.item_type == b"dimg" {
-                    tiles_with_index.push((iref.to_item_id, iref.reference_index))?;
-                }
-            }
-
-            tracker.validate_grid_tiles(tiles_with_index.len() as u32)?;
-            tiles_with_index.sort_by_key(|&(_, idx)| idx);
-
-            let mut tile_extents = TryVec::new();
-            for (tile_id, _) in tiles_with_index.iter() {
-                tile_extents.push(Self::get_item_extents(&meta, *tile_id)?)?;
-            }
-
-            let mut tile_ids = TryVec::new();
-            for (tile_id, _) in tiles_with_index.iter() {
-                tile_ids.push(*tile_id)?;
-            }
-
-            let grid_config = Self::calculate_grid_config(&meta, &tile_ids)?;
-
-            // AVIF 1.2: transformative properties SHALL NOT be on grid tile items
-            for (tile_id, _) in tiles_with_index.iter() {
-                for prop in meta.properties.iter() {
-                    if prop.item_id == *tile_id {
-                        match &prop.property {
-                            ItemProperty::Rotation(_)
-                            | ItemProperty::Mirror(_)
-                            | ItemProperty::CleanAperture(_) => {
-                                warn!("grid tile {} has a transformative property (irot/imir/clap), violating AVIF spec", tile_id);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            (Some(grid_config), tile_extents)
+            let (grid, tiles) = Self::read_grid_item(
+                &meta, &raw, &parsed.mdat_bounds, meta.primary_item_id, &tracker, stop,
+            )?;
+            (Some(grid), tiles)
         } else {
             (None, TryVec::new())
+        };
+        let alpha_tiles = if let Some(alpha_id) = alpha_item_id
+            && meta.item_infos.iter().any(|item| item.item_id == alpha_id && item.item_type == b"grid")
+        {
+            let (grid, tiles) = Self::read_grid_item(
+                &meta, &raw, &parsed.mdat_bounds, alpha_id, &tracker, stop,
+            )?;
+            let color = grid_config.as_ref()
+                .ok_or(Error::Unsupported("alpha grid on a non-grid primary"))?;
+            if (grid.rows, grid.columns, grid.output_width, grid.output_height)
+                != (color.rows, color.columns, color.output_width, color.output_height)
+            {
+                return Err(Error::Unsupported("alpha and color grid layouts differ"));
+            }
+            tiles
+        } else {
+            if is_grid && alpha.is_some() {
+                return Err(Error::Unsupported("non-grid alpha on a grid primary"));
+            }
+            TryVec::new()
         };
 
         // Detect gain map (tmap derived image item)
@@ -1887,6 +1877,7 @@ impl<'data> AvifParser<'data> {
             alpha,
             grid_config,
             tiles,
+            alpha_tiles,
             animation_data,
             premultiplied_alpha,
             av1_config,
@@ -1934,6 +1925,11 @@ impl<'data> AvifParser<'data> {
             extents.push(extent.extent_range.clone())?;
         }
         Ok(ItemExtents {
+            dimensions: meta.properties.iter().find_map(|p| {
+                if p.item_id == item_id && let ItemProperty::ImageSpatialExtents(d) = &p.property {
+                    Some((d.width, d.height))
+                } else { None }
+            }),
             construction_method: item.construction_method,
             extents,
         })
@@ -2127,62 +2123,108 @@ impl<'data> AvifParser<'data> {
         })
     }
 
-    /// Calculate grid configuration from metadata.
-    fn calculate_grid_config(meta: &AvifInternalMeta, tile_ids: &[u32]) -> Result<GridConfig> {
-        // Try explicit grid property first
-        for prop in &meta.properties {
-            if prop.item_id == meta.primary_item_id
-                && let ItemProperty::ImageGrid(grid) = &prop.property {
-                    return Ok(grid.clone());
-                }
+    /// Resolve and validate the small grid descriptor before any tile decode.
+    fn read_grid_item(
+        meta: &AvifInternalMeta,
+        raw: &[u8],
+        mdat_bounds: &[MdatBounds],
+        item_id: u32,
+        tracker: &ResourceTracker<'_>,
+        stop: &dyn Stop,
+    ) -> Result<(GridConfig, TryVec<ItemExtents>)> {
+        stop.check()?;
+        let item = Self::get_item_extents(meta, item_id)?;
+        let mut length = 0u64;
+        for extent in &item.extents {
+            let ExtentRange::WithLength(range) = extent else {
+                return Err(Error::InvalidData("grid descriptor requires explicit length"));
+            };
+            length = length.checked_add(range.end.checked_sub(range.start)
+                .ok_or(Error::InvalidData("grid extent range reversed"))?)
+                .filter(|&n| n <= 12).ok_or(Error::InvalidData("grid descriptor too long"))?;
         }
-
-        // Fall back to ispe calculation
-        let grid_dims = meta
-            .properties
-            .iter()
-            .find(|p| p.item_id == meta.primary_item_id)
-            .and_then(|p| match &p.property {
-                ItemProperty::ImageSpatialExtents(e) => Some(e),
-                _ => None,
-            });
-
-        let tile_dims = tile_ids.first().and_then(|&tile_id| {
-            meta.properties
-                .iter()
-                .find(|p| p.item_id == tile_id)
-                .and_then(|p| match &p.property {
-                    ItemProperty::ImageSpatialExtents(e) => Some(e),
-                    _ => None,
-                })
-        });
-
-        if let (Some(grid), Some(tile)) = (grid_dims, tile_dims)
-            && tile.width != 0
-                && tile.height != 0
-                && grid.width % tile.width == 0
-                && grid.height % tile.height == 0
-            {
-                let columns = grid.width / tile.width;
-                let rows = grid.height / tile.height;
-
-                if columns <= 255 && rows <= 255 {
-                    return Ok(GridConfig {
-                        rows: rows as u8,
-                        columns: columns as u8,
-                        output_width: grid.width,
-                        output_height: grid.height,
-                    });
+        let data = match item.construction_method {
+            ConstructionMethod::File => Self::resolve_extents_from_raw(raw, mdat_bounds, &item)?,
+            ConstructionMethod::Idat => {
+                let idat = meta.idat.as_ref().ok_or(Error::InvalidData("missing grid idat"))?;
+                let mut data = std::vec::Vec::with_capacity(length as usize);
+                for extent in &item.extents {
+                    let ExtentRange::WithLength(range) = extent else { unreachable!() };
+                    data.extend_from_slice(idat.get(usize::try_from(range.start)?..usize::try_from(range.end)?)
+                        .ok_or(Error::InvalidData("grid idat extent out of bounds"))?);
                 }
+                data
             }
-
-        let tile_count = tile_ids.len();
-        Ok(GridConfig {
-            rows: tile_count.min(255) as u8,
-            columns: 1,
-            output_width: 0,
-            output_height: 0,
-        })
+            ConstructionMethod::Item => return Err(Error::Unsupported("grid item construction")),
+        };
+        if data.len() < 4 || data[0] != 0 || data[1] & !1 != 0 {
+            return Err(Error::InvalidData("invalid grid descriptor header"));
+        }
+        let wide = data[1] & 1 != 0;
+        if data.len() != if wide { 12 } else { 8 } {
+            return Err(Error::InvalidData("invalid grid descriptor length"));
+        }
+        let (output_width, output_height) = if wide {
+            (u32::from_be_bytes(data[4..8].try_into().unwrap()),
+             u32::from_be_bytes(data[8..12].try_into().unwrap()))
+        } else {
+            (u32::from(u16::from_be_bytes(data[4..6].try_into().unwrap())),
+             u32::from(u16::from_be_bytes(data[6..8].try_into().unwrap())))
+        };
+        let grid = GridConfig {
+            rows: u16::from(data[2]) + 1,
+            columns: u16::from(data[3]) + 1,
+            output_width,
+            output_height,
+        };
+        let count = u32::from(grid.rows) * u32::from(grid.columns);
+        tracker.validate_grid_tiles(count)?;
+        tracker.validate_total_megapixels(output_width, output_height)?;
+        let dimensions = |id| meta.properties.iter().find_map(|property| {
+            if property.item_id == id && let ItemProperty::ImageSpatialExtents(d) = &property.property {
+                Some((d.width, d.height))
+            } else { None }
+        });
+        if dimensions(item_id) != Some((output_width, output_height)) {
+            return Err(Error::InvalidData("grid descriptor and ispe dimensions differ"));
+        }
+        let mut ids = TryVec::new();
+        for reference in &meta.item_references {
+            stop.check()?;
+            if reference.from_item_id == item_id && reference.item_type == b"dimg" {
+                ids.push((reference.to_item_id, reference.reference_index))?;
+            }
+        }
+        if ids.len() != count as usize {
+            return Err(Error::InvalidData("grid tile count differs from descriptor"));
+        }
+        ids.sort_by_key(|&(_, index)| index);
+        let (tile_width, tile_height) = dimensions(ids[0].0)
+            .ok_or(Error::InvalidData("grid tile missing ispe"))?;
+        if tile_width == 0 || tile_height == 0 || output_width == 0 || output_height == 0
+            || u64::from(output_width) > u64::from(tile_width) * u64::from(grid.columns)
+            || u64::from(output_height) > u64::from(tile_height) * u64::from(grid.rows)
+            || u64::from(output_width) <= u64::from(tile_width) * u64::from(grid.columns - 1)
+            || u64::from(output_height) <= u64::from(tile_height) * u64::from(grid.rows - 1)
+        {
+            return Err(Error::InvalidData("invalid grid tile coverage"));
+        }
+        let mut tiles = TryVec::new();
+        for &(id, _) in &ids {
+            stop.check()?;
+            if dimensions(id) != Some((tile_width, tile_height))
+                || !meta.item_infos.iter().any(|info| info.item_id == id && info.item_type == b"av01")
+            {
+                return Err(Error::InvalidData("grid tiles must be equal-sized av01 items"));
+            }
+            if meta.properties.iter().any(|property| property.item_id == id && matches!(
+                property.property, ItemProperty::Rotation(_) | ItemProperty::Mirror(_) | ItemProperty::CleanAperture(_)
+            )) {
+                return Err(Error::InvalidData("transformative property on grid tile"));
+            }
+            tiles.push(Self::get_item_extents(meta, id)?)?;
+        }
+        Ok((grid, tiles))
     }
 
     /// Calculate frame duration from sample table.
@@ -2231,8 +2273,10 @@ impl<'data> AvifParser<'data> {
         self.resolve_item(&self.primary)
     }
 
-    /// Get alpha item data, if present.
+    /// Get a directly coded alpha item, if present. Grid alpha is accessed
+    /// through `alpha_tile_data`, never submitted as an AV1 descriptor payload.
     pub fn alpha_data(&self) -> Option<Result<Cow<'_, [u8]>>> {
+        if !self.alpha_tiles.is_empty() { return None; }
         self.alpha.as_ref().map(|item| self.resolve_item(item))
     }
 
@@ -2241,6 +2285,19 @@ impl<'data> AvifParser<'data> {
         let item = self.tiles.get(index)
             .ok_or(Error::InvalidData("tile index out of bounds"))?;
         self.resolve_item(item)
+    }
+
+    /// Declared tile dimensions, checked against AV1 before decoding by bounded callers.
+    pub fn tile_dimensions(&self, index: usize) -> Option<(u32, u32)> {
+        self.tiles.get(index).and_then(|item| item.dimensions)
+    }
+
+    /// Get an alpha grid tile in the same row-major order as `tile_data`.
+    pub fn alpha_tile_data(&self, index: usize) -> Option<Result<Cow<'_, [u8]>>> {
+        if self.alpha_tiles.is_empty() { return None; }
+        Some(self.alpha_tiles.get(index)
+            .ok_or(Error::InvalidData("alpha tile index out of bounds"))
+            .and_then(|item| self.resolve_item(item)))
     }
 
     /// Get a single animation frame by index.
@@ -2478,16 +2535,16 @@ impl<'data> AvifParser<'data> {
         &self.compatible_brands
     }
 
-    /// Parse AV1 metadata from the primary item.
+    /// Parse AV1 metadata from the primary item (the first tile for a grid).
     pub fn primary_metadata(&self) -> Result<AV1Metadata> {
-        let data = self.primary_data()?;
+        let data = if self.grid_config.is_some() { self.tile_data(0)? } else { self.primary_data()? };
         AV1Metadata::parse_av1_bitstream(&data)
     }
 
-    /// Parse AV1 metadata from the alpha item, if present.
+    /// Parse AV1 metadata from the alpha item (the first alpha tile for a grid).
     pub fn alpha_metadata(&self) -> Option<Result<AV1Metadata>> {
         self.alpha.as_ref().map(|item| {
-            let data = self.resolve_item(item)?;
+            let data = if let Some(tile) = self.alpha_tiles.first() { self.resolve_item(tile)? } else { self.resolve_item(item)? };
             AV1Metadata::parse_av1_bitstream(&data)
         })
     }
@@ -3100,7 +3157,6 @@ impl<'a> ResourceTracker<'a> {
         self.current_memory = self.current_memory.saturating_sub(bytes);
     }
 
-    #[cfg(feature = "eager")]
     fn validate_total_megapixels(&self, width: u32, height: u32) -> Result<()> {
         if let Some(limit) = self.config.total_megapixels_limit {
             let megapixels = (width as u64)
@@ -3320,8 +3376,8 @@ pub fn read_avif_with_config<T: Read>(
                     } else {
                         log::debug!("Grid: calculated {}×{} layout from ispe dimensions", rows, columns);
                         grid_config = Some(GridConfig {
-                            rows: rows as u8,
-                            columns: columns as u8,
+                            rows: rows as u16,
+                            columns: columns as u16,
                             output_width: grid.width,
                             output_height: grid.height,
                         });
@@ -3336,7 +3392,7 @@ pub fn read_avif_with_config<T: Read>(
             if grid_config.is_none() {
                 log::debug!("Grid: using fallback {}×1 layout inference", ids.len());
                 grid_config = Some(GridConfig {
-                    rows: ids.len() as u8,  // Changed: vertical stack
+                    rows: ids.len() as u16,  // Changed: vertical stack
                     columns: 1,              // Changed: single column
                     output_width: 0,  // Will be calculated from tiles
                     output_height: 0, // Will be calculated from tiles
@@ -5382,8 +5438,8 @@ fn read_grid<T: Read>(src: &mut BMFFBox<'_, T>, options: &ParseOptions) -> Resul
     };
 
     Ok(GridConfig {
-        rows,
-        columns,
+        rows: u16::from(rows) + 1,
+        columns: u16::from(columns) + 1,
         output_width,
         output_height,
     })

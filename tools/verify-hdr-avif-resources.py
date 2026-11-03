@@ -22,10 +22,12 @@ class ProcessMemory(ctypes.Structure):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--probe", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path("target/hdr-avif-resources"))
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--grid", action="store_true", help="measure the bounded qualification grid, retaining the same memory limits")
     parser.add_argument("--enforce-streaming-budget", action="store_true",
                         help="exit 1 if either size exceeds the existing 32 MiB extra heap / 16 MiB single allocation limits")
     args = parser.parse_args()
+    args.output = args.output or Path("target/hdr-avif-grid-resources" if args.grid else "target/hdr-avif-resources")
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
@@ -39,7 +41,7 @@ def main():
         path = args.output / f"{width}x{height}.log"
         with path.open("w", encoding="utf8") as output:
             start = time.perf_counter()
-            child = subprocess.Popen([str(args.probe.resolve()), "--resources", str(width), str(height)],
+            child = subprocess.Popen([str(args.probe.resolve()), "--grid-resources" if args.grid else "--resources", str(width), str(height)],
                                      stdout=output, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW)
             handle = kernel.OpenProcess(0x1000 | 0x10, False, child.pid)
             if not handle:
@@ -70,7 +72,7 @@ def main():
                 and all(int(stages[name]["heap_peak_delta"]) < 32 * 1024 * 1024
                         and int(stages[name]["largest_allocation"]) < 16 * 1024 * 1024
                         for name in ["resource_encode", "resource_decode"]))
-        report = dict(width=width, height=height, process_ms=(time.perf_counter() - start) * 1000,
+        report = dict(width=width, height=height, mode="grid" if args.grid else "full-frame", process_ms=(time.perf_counter() - start) * 1000,
                       peak_working_set=peak, stages=stages, fits_streaming_budget=fits, exit_code=child.returncode)
         reports.append(report)
         print(log, end="", flush=True)

@@ -131,6 +131,13 @@ pub struct ManagedAvifDecoder {
 impl ManagedAvifDecoder {
     /// Create new decoder with AVIF data and configuration
     pub fn new(data: &[u8], config: &DecoderConfig) -> Result<Self> {
+        Self::new_with_stop(data, config, &enough::Unstoppable)
+    }
+
+    /// Create a decoder with cancellation before input copying and during grid indexing.
+    /// The copy itself is synchronous; callers must bound compressed input size.
+    pub fn new_with_stop(data: &[u8], config: &DecoderConfig, stop: &impl Stop) -> Result<Self> {
+        stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
         // Use zero-copy AvifParser — primary/alpha data returned as Cow::Borrowed
         let mut parse_config = zenavif_parse::DecodeConfig::default().lenient(true);
         // Forward resource limits to the parser when configured.
@@ -143,12 +150,17 @@ impl ManagedAvifDecoder {
         if let Some(frames) = config.parser_max_animation_frames {
             parse_config = parse_config.with_max_animation_frames(frames);
         }
+        if let Some(tiles) = config.parser_max_grid_tiles {
+            parse_config = parse_config.with_max_grid_tiles(tiles);
+        }
         let parser = zenavif_parse::AvifParser::from_owned_with_config(
             data.to_vec(),
             &parse_config,
-            &enough::Unstoppable,
+            stop,
         )
         .map_err(|e| at!(Error::from(e)))?;
+
+        stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
 
         let mut settings = Settings::default();
         settings.threads = config.threads;
@@ -271,9 +283,7 @@ impl ManagedAvifDecoder {
         stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
 
         if self.parser.grid_config().is_some() {
-            let pixels = self.decode_grid(stop)?;
-            let info = self.probe_info()?;
-            return Ok((pixels, info));
+            return self.decode_grid_full(stop);
         }
 
         let primary_data = self
@@ -488,7 +498,9 @@ impl ManagedAvifDecoder {
         let has_alpha = self.parser.alpha_metadata().is_some();
 
         // AV1 config for bit depth
-        let bit_depth = self.parser.av1_config().map(|c| c.bit_depth).unwrap_or(8);
+        let sequence = self.parser.primary_metadata().ok();
+        let bit_depth = sequence.as_ref().map(|m| m.bit_depth)
+            .or_else(|| self.parser.av1_config().map(|c| c.bit_depth)).unwrap_or(8);
 
         // CICP from container (colr box) or AV1 config fallback
         let (
@@ -544,7 +556,13 @@ impl ManagedAvifDecoder {
                     ChromaSampling::Cs444
                 }
             })
-            .unwrap_or(ChromaSampling::Cs420);
+            .unwrap_or_else(|| match sequence.as_ref() {
+                Some(m) if m.monochrome => ChromaSampling::Monochrome,
+                Some(m) if m.chroma_subsampling.horizontal && m.chroma_subsampling.vertical => ChromaSampling::Cs420,
+                Some(m) if m.chroma_subsampling.horizontal => ChromaSampling::Cs422,
+                Some(_) => ChromaSampling::Cs444,
+                None => ChromaSampling::Cs420,
+            });
 
         Ok(ImageInfo {
             width,
@@ -691,124 +709,122 @@ impl ManagedAvifDecoder {
         }))
     }
 
-    /// Decode a grid-based AVIF (tiled image)
-    fn decode_grid(&mut self, stop: &(impl Stop + ?Sized)) -> Result<PixelBuffer> {
-        let grid_config = self
-            .parser
-            .grid_config()
-            .ok_or_else(|| {
-                at!(Error::Decode {
-                    code: -1,
-                    msg: "Expected grid config but found none",
-                })
-            })?
-            .clone();
-
-        // Decode all tiles
-        let mut tile_frames = Vec::new();
-        for i in 0..self.parser.grid_tile_count() {
+    /// Decode a grid one tile at a time in row-major order.
+    ///
+    /// `max_tile_pixels` is enforced against both ispe and the AV1 sequence
+    /// header BEFORE submitting any tile to the codec. Only one color frame,
+    /// one alpha frame and one converted tile are retained internally. The
+    /// input container is still owned by this decoder; callers must separately
+    /// bound compressed input size and avoid retaining tiles in `consume`.
+    ///
+    /// Edge tiles are cropped to output coverage. The callback receives the
+    /// output x/y and a borrowed pixel buffer valid only during that callback.
+    /// Returned metadata describes the whole image and comes from the decoded
+    /// sequence header plus primary-container metadata, never an 8-bit default.
+    /// Cancellation and sink errors stop delivery immediately; a sink may have
+    /// received partial output and must publish only after this returns `Ok`.
+    pub fn decode_grid_tiles(
+        &mut self,
+        stop: &(impl Stop + ?Sized),
+        max_tile_pixels: u32,
+        mut consume: impl FnMut(u32, u32, &PixelBuffer) -> Result<()>,
+    ) -> Result<ImageInfo> {
+        let grid = self.parser.grid_config().cloned()
+            .ok_or_else(|| at!(Error::Unsupported("expected a grid image")))?;
+        let dimensions = self.parser.tile_dimensions(0)
+            .ok_or_else(|| at!(Error::Unsupported("grid tile dimensions missing")))?;
+        let mut image_info: Option<ImageInfo> = None;
+        for index in 0..self.parser.grid_tile_count() {
             stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
-
-            let tile_data = self.parser.tile_data(i).map_err(|e| at!(Error::from(e)))?;
-            let frame =
-                Self::decode_frame(&mut self.decoder, &tile_data, "Failed to decode grid tile")?;
-
-            tile_frames.push(frame);
+            let data = self.parser.tile_data(index).map_err(|e| at!(Error::from(e)))?;
+            let metadata = zenavif_parse::AV1Metadata::parse_av1_bitstream(&data)
+                .map_err(|e| at!(Error::from(e)))?;
+            let actual = (metadata.max_frame_width.get(), metadata.max_frame_height.get());
+            if actual != dimensions || self.parser.tile_dimensions(index) != Some(actual) {
+                return Err(at!(Error::Unsupported("grid ispe and AV1 tile dimensions differ")));
+            }
+            if u64::from(actual.0) * u64::from(actual.1) > u64::from(max_tile_pixels) {
+                return Err(at!(Error::ResourceLimit("grid tile pixel limit exceeded".into())));
+            }
+            let primary = Self::decode_frame(&mut self.decoder, &data, "Failed to decode grid tile")?;
+            if (primary.width(), primary.height()) != actual {
+                return Err(at!(Error::Unsupported("grid frame dimensions differ from sequence header")));
+            }
+            stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
+            let alpha = if let Some(result) = self.parser.alpha_tile_data(index) {
+                let data = result.map_err(|e| at!(Error::from(e)))?;
+                let alpha_meta = zenavif_parse::AV1Metadata::parse_av1_bitstream(&data)
+                    .map_err(|e| at!(Error::from(e)))?;
+                if (alpha_meta.max_frame_width.get(), alpha_meta.max_frame_height.get()) != actual
+                    || alpha_meta.bit_depth != metadata.bit_depth || !alpha_meta.monochrome {
+                    return Err(at!(Error::Unsupported("alpha tile dimensions, depth or layout differ")));
+                }
+                let frame = Self::decode_frame(&mut self.decoder, &data, "Failed to decode grid alpha tile")?;
+                if (frame.width(), frame.height()) != actual {
+                    return Err(at!(Error::Unsupported("grid alpha frame dimensions differ")));
+                }
+                Some(frame)
+            } else { None };
+            stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
+            let (mut pixels, mut info) = self.convert_to_image(primary, alpha, stop)?;
+            info.width = grid.output_width;
+            info.height = grid.output_height;
+            if let Some(first) = &image_info {
+                if (info.bit_depth, info.has_alpha, info.chroma_sampling, info.matrix_coefficients, info.color_range)
+                    != (first.bit_depth, first.has_alpha, first.chroma_sampling, first.matrix_coefficients, first.color_range)
+                    || info.color_primaries != first.color_primaries
+                    || info.transfer_characteristics != first.transfer_characteristics {
+                    return Err(at!(Error::Unsupported("grid tile pixel formats differ")));
+                }
+            } else { image_info = Some(info); }
+            let x = (index as u32 % u32::from(grid.columns)) * dimensions.0;
+            let y = (index as u32 / u32::from(grid.columns)) * dimensions.1;
+            let width = dimensions.0.min(grid.output_width - x);
+            let height = dimensions.1.min(grid.output_height - y);
+            if width != dimensions.0 || height != dimensions.1 {
+                pixels = Self::crop_image(pixels, width as usize, height as usize)?;
+            }
+            stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
+            consume(x, y, &pixels)?;
         }
-
         stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
-
-        // Stitch tiles together
-        self.stitch_tiles(tile_frames, &grid_config, stop)
+        image_info.ok_or_else(|| at!(Error::Unsupported("empty grid")))
     }
 
-    /// Stitch decoded tile frames into a single image
-    fn stitch_tiles(
-        &self,
-        tiles: Vec<Frame>,
-        grid_config: &zenavif_parse::GridConfig,
-        stop: &(impl Stop + ?Sized),
-    ) -> Result<PixelBuffer> {
-        if tiles.is_empty() {
-            return Err(at!(Error::Decode {
-                code: -1,
-                msg: "No tiles to stitch",
-            }));
-        }
+    /// Full-image convenience API, sharing the validated single-tile path.
+    fn decode_grid(&mut self, stop: &(impl Stop + ?Sized)) -> Result<PixelBuffer> {
+        self.decode_grid_full(stop).map(|(pixels, _)| pixels)
+    }
 
-        let rows = grid_config.rows as usize;
-        let cols = grid_config.columns as usize;
-
-        if tiles.len() != rows * cols {
-            return Err(at!(Error::Decode {
-                code: -1,
-                msg: "Tile count doesn't match grid dimensions",
-            }));
-        }
-
-        // Get dimensions from first tile (all tiles should be same size)
-        let tile_width = tiles[0].width() as usize;
-        let tile_height = tiles[0].height() as usize;
-
-        // Calculate output dimensions
-        let output_width = if grid_config.output_width > 0 {
-            grid_config.output_width as usize
-        } else {
-            tile_width * cols
-        };
-        let output_height = if grid_config.output_height > 0 {
-            grid_config.output_height as usize
-        } else {
-            tile_height * rows
-        };
-
-        // Convert each tile to RGB/RGBA
-        let mut tile_images = Vec::new();
-        for tile in tiles {
-            let (img, _info) = self.convert_to_image(tile, None, stop)?;
-            tile_images.push(img);
-        }
-
-        stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
-
-        // Stitch tiles using byte-level row access (format-agnostic)
-        let descriptor = tile_images[0].descriptor();
-        let bpp = descriptor.bytes_per_pixel();
-        let alloc_size = output_width
-            .checked_mul(output_height)
-            .and_then(|n| n.checked_mul(bpp))
-            .ok_or_else(|| at!(Error::OutOfMemory))?;
-        let data = vec![0u8; alloc_size];
-        let mut output =
-            PixelBuffer::from_vec(data, output_width as u32, output_height as u32, descriptor)
-                .map_err(|_| {
-                    at!(Error::Decode {
-                        code: -1,
-                        msg: "failed to create output buffer for grid stitch",
-                    })
-                })?;
-
-        for (tile_idx, tile) in tile_images.iter().enumerate() {
-            let row = tile_idx / cols;
-            let col = tile_idx % cols;
-            let tile_w = tile.width() as usize;
-            let tile_h = tile.height() as usize;
-            let dst_x = col * tile_w;
-            let dst_y = row * tile_h;
-
-            let tile_slice = tile.as_slice();
-            let mut out_slice = output.as_slice_mut();
-            for y in 0..tile_h.min(output_height - dst_y) {
-                let src = tile_slice.row(y as u32);
-                let copy_w = tile_w.min(output_width - dst_x);
-                let copy_bytes = copy_w * bpp;
-                let dst_row = out_slice.row_mut((dst_y + y) as u32);
-                let dst_start = dst_x * bpp;
-                dst_row[dst_start..dst_start + copy_bytes].copy_from_slice(&src[..copy_bytes]);
+    fn decode_grid_full(&mut self, stop: &(impl Stop + ?Sized)) -> Result<(PixelBuffer, ImageInfo)> {
+        let grid = self.parser.grid_config().cloned()
+            .ok_or_else(|| at!(Error::Unsupported("expected a grid image")))?;
+        let mut output: Option<PixelBuffer> = None;
+        let info = self.decode_grid_tiles(stop, u32::MAX, |x, y, pixels| {
+            if output.is_none() {
+                let size = (grid.output_width as usize).checked_mul(grid.output_height as usize)
+                    .and_then(|n| n.checked_mul(pixels.descriptor().bytes_per_pixel()))
+                    .ok_or_else(|| at!(Error::OutOfMemory))?;
+                output = Some(PixelBuffer::from_vec(vec![0; size], grid.output_width,
+                    grid.output_height, pixels.descriptor())
+                    .map_err(|_| at!(Error::OutOfMemory))?);
             }
-        }
-
-        Ok(output)
+            let output = output.as_mut().unwrap();
+            if output.descriptor() != pixels.descriptor() {
+                return Err(at!(Error::Unsupported("grid tile descriptors differ")));
+            }
+            let bpp = pixels.descriptor().bytes_per_pixel();
+            let source = pixels.as_slice();
+            let mut target = output.as_slice_mut();
+            for row in 0..pixels.height() {
+                stop.check().map_err(|e| at!(Error::Cancelled(e)))?;
+                let start = x as usize * bpp;
+                let count = pixels.width() as usize * bpp;
+                target.row_mut(y + row)[start..start + count].copy_from_slice(&source.row(row)[..count]);
+            }
+            Ok(())
+        })?;
+        Ok((output.ok_or_else(|| at!(Error::Unsupported("empty grid")))?, info))
     }
 
     /// Crop an image to the specified dimensions

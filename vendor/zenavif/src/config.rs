@@ -19,6 +19,8 @@ pub struct DecoderConfig {
     pub(crate) parser_total_megapixels_limit: Option<u32>,
     /// Parser max animation frames (forwarded to zenavif-parse).
     pub(crate) parser_max_animation_frames: Option<u32>,
+    /// Optional tile-count limit; absent retains the parser's default of 1000.
+    pub(crate) parser_max_grid_tiles: Option<u32>,
     /// When true, 10/12-bit AV1 content is downscaled to 8-bit RGB output.
     /// Most AVIF encoders (including zenravif) default to 10-bit encoding
     /// even for 8-bit input. This option returns 8-bit output for those files.
@@ -38,6 +40,7 @@ impl Default for DecoderConfig {
             parser_peak_memory_limit: None,
             parser_total_megapixels_limit: None,
             parser_max_animation_frames: None,
+            parser_max_grid_tiles: None,
             prefer_8bit: false,
         }
     }
@@ -72,6 +75,13 @@ impl DecoderConfig {
     /// 0 means no limit.
     pub fn frame_size_limit(mut self, limit: u32) -> Self {
         self.frame_size_limit = limit;
+        self
+    }
+
+    /// Bound the number of independently coded grid tiles accepted by the parser.
+    /// This does not change the pixel or per-tile decode limits.
+    pub fn grid_tile_limit(mut self, limit: u32) -> Self {
+        self.parser_max_grid_tiles = Some(limit);
         self
     }
 

@@ -1,0 +1,224 @@
+--- a/src/grid.rs
++++ b/src/grid.rs
+@@ -16,6 +16,7 @@
+     alpha_config: Option<Av1CBox>,
+     depth_bits: u8,
+     colr: Option<ColrBox>,
++    icc_profile: Option<Vec<u8>>,
+     premultiplied_alpha: bool,
+ }
+ 
+@@ -31,6 +32,7 @@
+             alpha_config: None,
+             depth_bits: 8,
+             colr: None,
++            icc_profile: None,
+             premultiplied_alpha: false,
+         }
+     }
+@@ -43,12 +45,14 @@
+     pub fn set_depth_bits(&mut self, depth: u8) -> &mut Self { self.depth_bits = depth; self }
+     /// CICP color info (nclx).
+     pub fn set_colr(&mut self, colr: ColrBox) -> &mut Self { self.colr = Some(colr); self }
++    /// ICC profile for the primary grid. It may coexist with nclx.
++    pub fn set_icc_profile(&mut self, profile: Vec<u8>) -> &mut Self { self.icc_profile = Some(profile); self }
+     /// Whether alpha is premultiplied. Default: false.
+     pub fn set_premultiplied_alpha(&mut self, premultiplied: bool) -> &mut Self { self.premultiplied_alpha = premultiplied; self }
+ 
+     /// Serialize a grid AVIF image.
+     ///
+-    /// - `rows`, `columns`: tile grid layout (1-256 each)
++    /// - `rows`, `columns`: tile grid layout (1-255 each)
+     /// - `output_width`, `output_height`: final image dimensions
+     /// - `tile_width`, `tile_height`: dimensions of each tile
+     /// - `tile_data`: AV1-encoded data for each tile in row-major order (length must equal `rows * columns`)
+@@ -60,6 +64,19 @@
+                      tile_data: &[&[u8]], alpha_data: Option<&[&[u8]]>) -> io::Result<Vec<u8>> {
+     let image = self;
+     let tile_count = rows as usize * columns as usize;
++    let has_alpha = alpha_data.is_some();
++    if rows == 0 || columns == 0 || tile_width == 0 || tile_height == 0
++        || output_width == 0 || output_height == 0
++        || !matches!(image.depth_bits, 8 | 10 | 12)
++        || (has_alpha && image.alpha_config.is_none())
++        || 1 + tile_count + if has_alpha { 1 + tile_count } else { 0 } > u16::MAX as usize
++        || u64::from(output_width) > u64::from(tile_width) * u64::from(columns)
++        || u64::from(output_height) > u64::from(tile_height) * u64::from(rows)
++        || u64::from(output_width) <= u64::from(tile_width) * u64::from(columns - 1)
++        || u64::from(output_height) <= u64::from(tile_height) * u64::from(rows - 1)
++    {
++        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid grid geometry or alpha configuration"));
++    }
+     if tile_data.len() != tile_count {
+         return Err(io::Error::new(io::ErrorKind::InvalidInput,
+             format!("tile_data.len() ({}) != rows*columns ({})", tile_data.len(), tile_count)));
+@@ -69,8 +86,6 @@
+             return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                 format!("alpha_data.len() ({}) != rows*columns ({})", alpha.len(), tile_count)));
+         }
+-
+-    let has_alpha = alpha_data.is_some() && image.alpha_config.is_some();
+ 
+     // Item IDs:
+     // 1 = color grid item
+@@ -132,6 +147,10 @@
+     } else {
+         None
+     };
++    let icc_prop = image.icc_profile.as_ref().map(|profile| {
++        ipco.push(IpcoProp::ColrIcc(ColrIccBox::new(profile.clone())))
++            .ok_or(io::ErrorKind::InvalidInput)
++    }).transpose()?;
+ 
+     // Alpha AV1C + pixi + auxC (if applicable)
+     let (av1c_alpha, pixi_alpha, auxc_alpha) = if has_alpha {
+@@ -166,6 +185,9 @@
+             if let Some(colr_p) = colr_prop {
+                 v.push(colr_p);
+             }
++            if let Some(icc_p) = icc_prop {
++                v.push(icc_p);
++            }
+             v
+         },
+     };
+@@ -275,7 +297,7 @@
+     write_ftyp(&mut out);
+ 
+     // meta
+-    write_meta_grid(
++    let iloc_offsets = write_meta_grid(
+         &mut out,
+         &image_items,
+         &ipma_entries,
+@@ -293,6 +315,19 @@
+         has_alpha,
+     );
+ 
++    // Every iloc offset/length in this writer is 32-bit. Refuse overflow
++    // before copying payloads, and avoid Vec's geometric growth past it.
++    let payload_size = tile_data.iter().copied()
++        .chain(alpha_data.into_iter().flatten().copied())
++        .try_fold(0usize, |total, tile| total.checked_add(tile.len()))
++        .ok_or(io::ErrorKind::InvalidInput)?;
++    let total_size = out.len().checked_add(8 + grid_descriptor.len()
++        + alpha_grid_descriptor.as_ref().map_or(0, Vec::len))
++        .and_then(|n| n.checked_add(payload_size))
++        .filter(|&n| n <= u32::MAX as usize)
++        .ok_or(io::ErrorKind::InvalidInput)?;
++    out.try_reserve_exact(total_size - out.len()).map_err(|_| io::ErrorKind::OutOfMemory)?;
++
+     // mdat
+     let mdat_pos = begin_box(&mut out, b"mdat");
+     let mdat_data_start = out.len() as u32;
+@@ -322,7 +357,7 @@
+     end_box(&mut out, mdat_pos);
+ 
+     // Patch iloc offsets
+-    patch_iloc_offsets(&mut out, mdat_data_start);
++    patch_iloc_offsets(&mut out, mdat_data_start, &iloc_offsets);
+ 
+     Ok(out)
+     }
+@@ -406,7 +441,8 @@
+     alpha_tile_base: u16,
+     tile_count: usize,
+     has_alpha: bool,
+-) {
++) -> Vec<usize> {
++    let mut iloc_offsets = Vec::new();
+     let meta_pos = begin_box(out, b"meta");
+     write_fullbox(out, 0, 0);
+ 
+@@ -447,6 +483,7 @@
+         write_u16(out, primary_id);
+         write_u16(out, 0); // data_reference_index
+         write_u16(out, 1); // extent_count
++        iloc_offsets.push(out.len());
+         write_u32(out, ILOC_PLACEHOLDER);
+         write_u32(out, grid_descriptor.len() as u32);
+ 
+@@ -455,6 +492,7 @@
+             write_u16(out, alpha_grid_id);
+             write_u16(out, 0);
+             write_u16(out, 1);
++            iloc_offsets.push(out.len());
+             write_u32(out, ILOC_PLACEHOLDER);
+             write_u32(out, alpha_grid_descriptor.map_or(0, |d| d.len() as u32));
+         }
+@@ -464,6 +502,7 @@
+             write_u16(out, color_tile_base + i as u16);
+             write_u16(out, 0);
+             write_u16(out, 1);
++            iloc_offsets.push(out.len());
+             write_u32(out, ILOC_PLACEHOLDER);
+             write_u32(out, tile.len() as u32);
+         }
+@@ -474,6 +513,7 @@
+                 write_u16(out, alpha_tile_base + i as u16);
+                 write_u16(out, 0);
+                 write_u16(out, 1);
++                iloc_offsets.push(out.len());
+                 write_u32(out, ILOC_PLACEHOLDER);
+                 write_u32(out, tile.len() as u32);
+             }
+@@ -509,12 +549,19 @@
+     if !irefs.is_empty() {
+         let iref_pos = begin_box(out, b"iref");
+         write_fullbox(out, 0, 0);
+-        for entry in irefs {
++        let mut index = 0;
++        while index < irefs.len() {
++            let entry = &irefs[index];
++            let mut end = index + 1;
++            while end < irefs.len() && irefs[end].from_id == entry.from_id && irefs[end].typ.0 == entry.typ.0 {
++                end += 1;
++            }
+             let entry_pos = begin_box(out, &entry.typ.0);
+             write_u16(out, entry.from_id);
+-            write_u16(out, 1); // reference_count
+-            write_u16(out, entry.to_id);
++            write_u16(out, (end - index) as u16);
++            for reference in &irefs[index..end] { write_u16(out, reference.to_id); }
+             end_box(out, entry_pos);
++            index = end;
+         }
+         end_box(out, iref_pos);
+     }
+@@ -551,30 +598,17 @@
+     }
+ 
+     end_box(out, meta_pos);
++    iloc_offsets
+ }
+ 
+ /// Patch iloc placeholder offsets with actual mdat offsets.
+ /// Items are laid out in iloc order: grid desc(s), then tiles.
+-fn patch_iloc_offsets(out: &mut [u8], mdat_data_start: u32) {
+-    let placeholder = ILOC_PLACEHOLDER.to_be_bytes();
++fn patch_iloc_offsets(out: &mut [u8], mdat_data_start: u32, positions: &[usize]) {
+     let mut current_offset = mdat_data_start;
+-    let mut i = 0;
+-
+-    while i + 4 <= out.len() {
+-        if out[i..i + 4] == placeholder {
+-            // Read the length that follows this offset (4 bytes after)
+-            let len = if i + 8 <= out.len() {
+-                u32::from_be_bytes([out[i + 4], out[i + 5], out[i + 6], out[i + 7]])
+-            } else {
+-                0
+-            };
+-
+-            out[i..i + 4].copy_from_slice(&current_offset.to_be_bytes());
+-            current_offset += len;
+-            i += 8; // skip past offset + length
+-        } else {
+-            i += 1;
+-        }
++    for &i in positions {
++        let len = u32::from_be_bytes(out[i + 4..i + 8].try_into().unwrap());
++        out[i..i + 4].copy_from_slice(&current_offset.to_be_bytes());
++        current_offset += len;
+     }
+ }
+ 

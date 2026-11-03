@@ -15,6 +15,8 @@ use zenavif::{
 
 #[path = "../alloc_probe.rs"]
 mod alloc_probe;
+#[path = "../avif_grid.rs"]
+mod avif_grid;
 #[global_allocator]
 static ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
 
@@ -149,6 +151,27 @@ fn main() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, directory] = arguments.as_slice()
+        && flag == "--grid-fixture-dir"
+    {
+        return avif_grid::fixtures(std::path::Path::new(directory));
+    }
+    if let [flag, width, height] = arguments.as_slice()
+        && flag == "--grid-resources"
+    {
+        return avif_grid::resources(
+            width.parse().map_err(|_| "invalid width")?,
+            height.parse().map_err(|_| "invalid height")?,
+        );
+    }
+    if let [flag, width, height] = arguments.as_slice()
+        && flag == "--grid-noise-resources"
+    {
+        return avif_grid::noise_resources(
+            width.parse().map_err(|_| "invalid width")?,
+            height.parse().map_err(|_| "invalid height")?,
+        );
+    }
     if let [flag, width, height] = arguments.as_slice()
         && flag == "--resources"
     {
@@ -170,7 +193,7 @@ fn run() -> Result<(), String> {
         [flag, directory] if flag == "--fixture-dir" => {
             write_fixtures(std::path::Path::new(directory), &pixels, &bytes)?
         }
-        _ => return Err("usage: hdr-avif-probe [--fixture-dir DIRECTORY | --decode INPUT OUTPUT | --resources WIDTH HEIGHT]".into()),
+        _ => return Err("usage: hdr-avif-probe [--fixture-dir DIRECTORY | --grid-fixture-dir DIRECTORY | --decode INPUT OUTPUT | --resources WIDTH HEIGHT | --grid-resources WIDTH HEIGHT | --grid-noise-resources WIDTH HEIGHT]".into()),
     }
     let mut decoder =
         ManagedAvifDecoder::new(&bytes, &decode_config()).map_err(|e| e.to_string())?;

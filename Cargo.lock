@@ -1042,6 +1042,8 @@ dependencies = [
  "snapclip-capture",
  "windows-sys 0.59.0",
  "zenavif",
+ "zenavif-parse",
+ "zenavif-serialize",
  "zenjpeg",
  "zenwebp",
 ]
@@ -9685,8 +9687,6 @@ dependencies = [
 [[package]]
 name = "zenavif-serialize"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc63468f1ad230080baa8f87b0bf1b6aad9987f85e533566337181e0a5349c6"
 dependencies = [
  "arrayvec",
 ]
