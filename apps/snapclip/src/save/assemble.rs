@@ -300,7 +300,6 @@ pub fn encoded_bytes(values: &PanelValues<'_>, frame: &Frame<'_>) -> Result<Vec<
 }
 
 /// The pixels the panel already holds, offered to the encoder a band at a time.
-
 ///
 /// The banded path exists for captures that never exist whole (`docs/35`); a selection does
 /// exist whole, so this source simply hands out the rows it was given. It is still a

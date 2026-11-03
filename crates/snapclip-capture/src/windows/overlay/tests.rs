@@ -437,10 +437,12 @@ fn wheel_units_become_one_level_per_notch_and_add_up_for_a_touchpad() {
     assert_eq!(wheel.steps(small, at(32)), 0);
     assert_eq!(wheel.steps(small, at(48)), 1);
     // …and the inertia tail of that same gesture is swallowed, not banked.
-    assert!(
-        WHEEL_SETTLE_MS < 120,
-        "the tail of a flick, not the next flick"
-    );
+    const {
+        assert!(
+            WHEEL_SETTLE_MS < 120,
+            "the tail of a flick, not the next flick"
+        );
+    }
     assert_eq!(wheel.steps(small, at(64)), 0);
     assert_eq!(wheel.steps(small, at(120)), 0);
 
@@ -1213,7 +1215,7 @@ fn dim_test_checkerboard(width: u32, height: u32, cell: u32) -> Vec<u8> {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
-            let value: u8 = if ((x / cell) + (y / cell)) % 2 == 0 {
+            let value: u8 = if ((x / cell) + (y / cell)).is_multiple_of(2) {
                 230
             } else {
                 26
@@ -1232,7 +1234,7 @@ fn dim_test_checkerboard(width: u32, height: u32, cell: u32) -> Vec<u8> {
 fn dim_test_wash(pixels: &mut [u8]) {
     let [b, g, r, a] = super::dim_layer::dim_pixel();
     let keep = 255u32 - a as u32;
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
         pixel[0] = ((pixel[0] as u32 * keep + 127) / 255) as u8 + b;
         pixel[1] = ((pixel[1] as u32 * keep + 127) / 255) as u8 + g;
         pixel[2] = ((pixel[2] as u32 * keep + 127) / 255) as u8 + r;
@@ -1242,7 +1244,9 @@ fn dim_test_wash(pixels: &mut [u8]) {
 
 fn dim_test_mean(pixels: &[u8]) -> f64 {
     let sum: f64 = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| pixel[0] as f64 + pixel[1] as f64 + pixel[2] as f64)
         .sum();
     sum / (pixels.len() / 4).max(1) as f64
@@ -1287,7 +1291,9 @@ fn dim_box_blur(pixels: &[u8], width: u32, height: u32, radius: i32) -> Vec<u8> 
 fn dim_test_screen_mean(rect: Rect) -> f64 {
     let (pixels, _) = dim_test_screen_bgra(rect);
     let sum: f64 = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| pixel[0] as f64 + pixel[1] as f64 + pixel[2] as f64)
         .sum();
     sum / (pixels.len() / 4).max(1) as f64

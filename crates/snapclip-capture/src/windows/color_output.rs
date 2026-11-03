@@ -111,7 +111,7 @@ impl ColorSnapshot {
                 ..Default::default()
             };
             let advanced = (unsafe { DisplayConfigGetDeviceInfo(&mut color.header) } == 0)
-                .then(|| unsafe { color.Anonymous.value } & 2 != 0);
+                .then_some(unsafe { color.Anonymous.value } & 2 != 0);
             let mut white = DISPLAYCONFIG_SDR_WHITE_LEVEL {
                 header: header(
                     DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,

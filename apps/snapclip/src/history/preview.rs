@@ -179,8 +179,8 @@ pub fn row_preview_png(source: &[u8]) -> Result<Vec<u8>, PreviewError> {
             continue;
         }
         let target = &mut out[out_row * out_width * 4..(out_row + 1) * out_width * 4];
-        for block in 0..out_width {
-            let divisor = covered * column_counts[block];
+        for (block, &columns) in column_counts.iter().enumerate().take(out_width) {
+            let divisor = covered * columns;
             for channel in 0..4 {
                 let index = block * 4 + channel;
                 target[index] = (sum[index] / divisor) as u8;
@@ -428,7 +428,9 @@ mod tests {
         );
 
         let mean = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| u32::from(pixel[0]))
             .sum::<u32>()
             / (pixels.len() as u32 / 4);

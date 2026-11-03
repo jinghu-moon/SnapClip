@@ -16,8 +16,10 @@ use crate::geometry::{Point, Rect};
 /// What the overlay's size and coordinate readouts are measured in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum LengthUnit {
     /// Physical screen pixels: what the capture measures and what an exported image contains.
+    #[default]
     Px,
     /// Device-independent pixels (`dp`): the size the same region has in a UI toolkit, which is
     /// what makes a selection on a scaled display comparable with a design.
@@ -34,12 +36,6 @@ impl LengthUnit {
             Self::Px => 0,
             Self::Dp => 1,
         }
-    }
-}
-
-impl Default for LengthUnit {
-    fn default() -> Self {
-        Self::Px
     }
 }
 

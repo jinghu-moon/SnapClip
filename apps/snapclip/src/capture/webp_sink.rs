@@ -101,7 +101,7 @@ impl WebpWriter {
     pub fn write_rows(&mut self, first_row: u64, rows: &[u8]) -> Result<(), ExportError> {
         let row_bytes = self.meta.width * 4;
         let got = rows.len() as u64;
-        if row_bytes == 0 || got % row_bytes != 0 {
+        if row_bytes == 0 || !got.is_multiple_of(row_bytes) {
             return Err(ExportError::RowLength {
                 expected: row_bytes,
                 got,
@@ -208,7 +208,7 @@ mod tests {
     /// The source rows are BGRA; `image` decodes to RGBA. Same pixels, two orders.
     fn rgba_of(bgra: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(bgra.len());
-        for pixel in bgra.chunks_exact(4) {
+        for pixel in bgra.as_chunks::<4>().0.iter() {
             out.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
         }
         out

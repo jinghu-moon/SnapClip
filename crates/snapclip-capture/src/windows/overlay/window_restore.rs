@@ -60,10 +60,9 @@ impl OverlayController {
             if self.previous_foreground.is_null() {
                 self.previous_foreground = GetForegroundWindow();
             }
-            // `HWND` is `*mut c_void` in both bindings; the cast keeps the two crate
-            // versions from leaking into each other.
+            // Both Win32 bindings use the same raw HWND representation.
             SetWindowPos(
-                self.window as *mut core::ffi::c_void,
+                self.window,
                 HWND_TOPMOST,
                 layout.bounds.left,
                 layout.bounds.top,
@@ -73,7 +72,7 @@ impl OverlayController {
             );
             // `SW_SHOW` (not `SW_SHOWNOACTIVATE`): activation is what routes the
             // keyboard to the overlay.
-            ShowWindow(self.window as *mut core::ffi::c_void, SW_SHOW);
+            ShowWindow(self.window, SW_SHOW);
             self.take_focus();
         }
         eprintln!("[snapclip][capture] overlay focus requested");
@@ -86,7 +85,7 @@ impl OverlayController {
     /// and `WM_MOUSEACTIVATE` re-asserts focus if the user clicks first.
     pub(super) fn take_focus(&self) {
         unsafe {
-            let window = self.window as *mut core::ffi::c_void;
+            let window = self.window;
             if GetForegroundWindow() != self.window {
                 let _ = SetForegroundWindow(window);
             }
@@ -142,13 +141,13 @@ impl OverlayController {
             return;
         }
         unsafe {
-            let _ = SetForegroundWindow(previous as *mut core::ffi::c_void);
+            let _ = SetForegroundWindow(previous);
         }
     }
 
     pub(super) fn hide_overlay(&mut self) {
         unsafe {
-            ShowWindow(self.window as *mut core::ffi::c_void, SW_HIDE);
+            ShowWindow(self.window, SW_HIDE);
         }
         self.restore_foreground();
         self.previous_foreground = null_mut();

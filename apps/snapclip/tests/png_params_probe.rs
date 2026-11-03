@@ -161,7 +161,7 @@ impl SyntheticImage {
         let mut luma = base.saturating_sub(noise);
 
         // Card border.
-        if y % 36 == 0 {
+        if y.is_multiple_of(36) {
             luma = 0xC8;
         }
         // Text-like runs: dense on some rows of the band, absent on others.
@@ -175,7 +175,11 @@ impl SyntheticImage {
         }
         // Scrollbar rail on the right.
         if x + 6 >= self.width {
-            luma = if (y / 24) % 2 == 0 { 0xD0 } else { 0xBC };
+            luma = if (y / 24).is_multiple_of(2) {
+                0xD0
+            } else {
+                0xBC
+            };
         }
 
         let tint = (hash(x / 5, y / 7, 0x1234) & 0x0F) as u8;
@@ -245,7 +249,7 @@ fn the_artifact_decodes_back_to_the_expected_pixels() {
     for y in 0..96u32 {
         image.row_bgra(y, &mut row);
         let at = y as usize * 64 * 4;
-        for (x, chunk) in row.chunks_exact(4).enumerate() {
+        for (x, chunk) in row.as_chunks::<4>().0.iter().enumerate() {
             let out = &decoded.rgba[at + x * 4..at + x * 4 + 4];
             assert_eq!(out, [chunk[2], chunk[1], chunk[0], chunk[3]], "at {x},{y}");
         }
@@ -382,7 +386,12 @@ fn encode_streaming<W: std::io::Write>(
 
 /// Swap the channels in place, BGRA in, RGBA out.
 fn bgra_to_rgba(bgra: &[u8], rgba: &mut [u8]) {
-    for (source, target) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+    for (source, target) in bgra
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgba.as_chunks_mut::<4>().0.iter_mut())
+    {
         target[0] = source[2];
         target[1] = source[1];
         target[2] = source[0];

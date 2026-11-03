@@ -10,6 +10,8 @@ use snapclip_history::StoreError;
 use snapclip_history::store::Store;
 use snapclip_model::{ClipSummary, PayloadKind, PayloadRef};
 
+pub type SelectedPayload = (PayloadRef, PayloadKind, Vec<u8>);
+
 /// Rows fetched per page. The list is virtualized, so this is a paging decision only.
 /// `None` would let the store pick its own default; the shell asks for an explicit page.
 const PAGE_SIZE: Option<u32> = Some(50);
@@ -239,9 +241,7 @@ impl HistoryState {
     ///
     /// Returns the reference *and* its bytes, because the caller (the shell) is what turns
     /// them into a clipboard write; the model never touches the clipboard.
-    pub fn selected_payload_bytes(
-        &self,
-    ) -> Option<Result<(PayloadRef, PayloadKind, Vec<u8>), StoreError>> {
+    pub fn selected_payload_bytes(&self) -> Option<Result<SelectedPayload, StoreError>> {
         let id = self.selected.as_deref()?;
         let item = self.items.iter().find(|item| item.id == id)?;
         if item.capture_source.is_some() {

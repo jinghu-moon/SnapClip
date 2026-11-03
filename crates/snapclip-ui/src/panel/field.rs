@@ -4251,7 +4251,7 @@ mod tests {
     #[test]
     fn the_format_menu_hangs_from_the_button_and_holds_three_items() {
         let metrics = crate::panel::DEMO;
-        let px = |dip: i32| dip as i32;
+        let px = |dip: i32| dip;
         assert_eq!(
             fmt_menu_height_dip(),
             100,
@@ -4539,13 +4539,10 @@ mod tests {
             assert_eq!(items[0].top, menu.top + (5.0 * scale).round() as i32);
 
             // Exactly one row answers for any point inside it, and the padding answers for none.
-            for index in 0..items.len() {
+            for (index, item) in items.iter().enumerate() {
                 let centre =
                     |rect: Rect| ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
-                assert_eq!(
-                    context_item_at(menu, scale, centre(items[index])),
-                    Some(index)
-                );
+                assert_eq!(context_item_at(menu, scale, centre(*item)), Some(index));
             }
             assert_eq!(
                 context_item_at(menu, scale, (menu.left + 1, menu.top + 1)),
@@ -4937,14 +4934,14 @@ mod tests {
         for scale in [1.0f32, 1.25, 1.5, 2.0] {
             let rects = crate::panel::DEMO.rects(scale);
             let widths = [52, 64];
-            for index in 0..SIZE_MODE_WORDS.len() {
+            for (index, word) in SIZE_MODE_WORDS.iter().enumerate() {
                 let rect = size_mode_button_rect(&crate::panel::DEMO, &rects, scale, widths, index);
                 let centre = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
                 assert_eq!(
                     size_mode_contains(&crate::panel::DEMO, &rects, scale, widths, centre),
                     Some(index),
                     "{:?} answers its own centre at {scale}",
-                    SIZE_MODE_WORDS[index]
+                    word
                 );
                 // A point just outside the left edge is the other button, or nothing.
                 let outside = (rect.left - 1, centre.1);
@@ -4952,7 +4949,7 @@ mod tests {
                     size_mode_contains(&crate::panel::DEMO, &rects, scale, widths, outside),
                     Some(index),
                     "{:?} must not answer one pixel to its left at {scale}",
-                    SIZE_MODE_WORDS[index]
+                    word
                 );
             }
         }

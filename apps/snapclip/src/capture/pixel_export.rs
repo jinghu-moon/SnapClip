@@ -172,7 +172,7 @@ pub fn write_png(
                         snapclip_model::pixel_color::to_sdr_bgra8(&pixels, source_peak_nits)
                             .map_err(str::to_owned)?
                             .into_bytes();
-                    for pixel in bytes.chunks_exact_mut(4) {
+                    for pixel in bytes.as_chunks_mut::<4>().0.iter_mut() {
                         pixel.swap(0, 2);
                     }
                     bytes
@@ -274,9 +274,7 @@ mod tests {
             .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
             .collect();
         Bands {
-            pixels: PixelBuffer::from_tight(1, 2, descriptor, bytes)
-                .unwrap()
-                .into(),
+            pixels: PixelBuffer::from_tight(1, 2, descriptor, bytes).unwrap(),
             source: PixelSource::new(descriptor, 77),
             changed: false,
         }
@@ -311,7 +309,9 @@ mod tests {
         );
         let floats: Vec<f32> = decoded
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
             .collect();
         for (actual, expected) in floats
@@ -342,10 +342,15 @@ mod tests {
             .into_rgba8()
             .into_raw();
         for (actual, expected) in decoded
-            .chunks_exact(4)
-            .zip(expected.as_bytes().chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(expected.as_bytes().as_chunks::<4>().0.iter())
         {
-            assert_eq!(actual, [expected[2], expected[1], expected[0], expected[3]]);
+            assert_eq!(
+                *actual,
+                [expected[2], expected[1], expected[0], expected[3]]
+            );
         }
     }
 }

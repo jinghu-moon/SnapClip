@@ -99,7 +99,7 @@ impl BmpRowBandWriter {
             });
         }
         let row_bytes = self.width as usize * 4;
-        if rows.is_empty() || rows.len() % row_bytes != 0 {
+        if rows.is_empty() || !rows.len().is_multiple_of(row_bytes) {
             return Err(ExportError::RowLength {
                 expected: row_bytes as u64,
                 got: rows.len() as u64,

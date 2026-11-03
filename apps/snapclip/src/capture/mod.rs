@@ -66,15 +66,17 @@ use crate::adapters::CaptureEvents;
 use crate::clipboard::SystemClipboardWriter;
 use crate::events::EventBus;
 
+pub type CaptureHandles = (Arc<CaptureRuntime>, Arc<PinSource>, Arc<CaptureEvents>);
+
 /// Start the overlay and hand back the runtime the shell keeps for the session.
 ///
 /// F5 is registered by the overlay itself (`RegisterHotKey` on its own thread), so hosting
 /// capture is what gives the shell its screenshot entry point.
 ///
 /// The returned [`PinSource`] is the shell's handle on "the picture the user just captured":
-/// the writer remembers every selection whose screen position is known, and F6 (handled by
-/// the pin host thread) takes it from there. It is returned rather than pushed somewhere
-/// because the shell is the one that has to hand it to the pin host — this function is not
+/// the writer remembers every selection whose screen position is known, and F6 hands it
+/// to the GPUI pin manager. It is returned rather than pushed somewhere
+/// because the shell is the one that has to hand it to that manager — this function is not
 /// the place that knows pins exist.
 ///
 /// `options` comes from the settings file, which is how a user preference reaches the window
@@ -87,7 +89,7 @@ pub fn start(
     events: EventBus,
     options: DetectionOptions,
     preferences: OverlayPreferences,
-) -> Result<(Arc<CaptureRuntime>, Arc<PinSource>, Arc<CaptureEvents>), String> {
+) -> Result<CaptureHandles, String> {
     // Per-Monitor V2 has to be declared before any window exists; the caller does that at the
     // very start of `run`. The overlay inherits the process context, so this only checks it.
     snapclip_capture::windows::monitor::set_per_monitor_v2_awareness()

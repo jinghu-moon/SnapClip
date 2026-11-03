@@ -75,7 +75,7 @@ pub(crate) enum ExportSource {
     Whole(SelectionPixels),
     Bands {
         /// Taken at the one materialisation.
-        bands: Option<crate::scroll::ScrollBands>,
+        bands: Option<Box<crate::scroll::ScrollBands>>,
         /// Filled by that materialisation.
         pixels: Option<SelectionPixels>,
         /// Everything about the picture except its pixels, so a banded writer can name it.
@@ -102,7 +102,7 @@ impl ExportSource {
             corner_radius: 0,
         };
         Self::Bands {
-            bands: Some(bands),
+            bands: Some(Box::new(bands)),
             pixels: None,
             spec,
         }
@@ -137,7 +137,7 @@ impl ExportSource {
     pub(crate) fn bands_mut(&mut self) -> Option<&mut crate::scroll::ScrollBands> {
         match self {
             Self::Whole(_) => None,
-            Self::Bands { bands, .. } => bands.as_mut(),
+            Self::Bands { bands, .. } => bands.as_deref_mut(),
         }
     }
 
@@ -353,6 +353,12 @@ impl Mailbox {
 pub struct ExportWorker {
     mailbox: Arc<Mailbox>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Default for ExportWorker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExportWorker {

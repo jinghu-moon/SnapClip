@@ -663,7 +663,7 @@ impl HistoryView {
             .rounded_sm()
             .text_xs()
             .border_1()
-            .border_color(if enabled { theme.border } else { theme.border })
+            .border_color(theme.border)
             .text_color(if enabled {
                 theme.foreground
             } else {
@@ -708,8 +708,7 @@ fn one_line_preview(text: &str, max_chars: usize) -> String {
     let mut pending_space = false;
     let mut chars = text.chars();
     let mut truncated = false;
-    loop {
-        let Some(character) = chars.next() else { break };
+    for character in chars.by_ref() {
         let is_space = character.is_whitespace() || character.is_control();
         if is_space {
             // A leading space is dropped, and a run of whitespace becomes one separator.

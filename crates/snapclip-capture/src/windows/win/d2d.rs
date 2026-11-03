@@ -2764,25 +2764,26 @@ impl OverlayRenderer {
             (!overlaps(rect)).then_some(SizeLabelPlacement { rect, where_ })
         };
         let above = selection.top - gap - height;
-        if above >= work_area.top {
-            if let Some(candidate) = clamp(selection.left, above, LabelWhere::Above) {
-                return Some(candidate);
-            }
+        if above >= work_area.top
+            && let Some(candidate) = clamp(selection.left, above, LabelWhere::Above)
+        {
+            return Some(candidate);
         }
         let below = selection.bottom + gap;
-        if below + height <= work_area.bottom {
-            if let Some(candidate) = clamp(selection.left, below, LabelWhere::Below) {
-                return Some(candidate);
-            }
+        if below + height <= work_area.bottom
+            && let Some(candidate) = clamp(selection.left, below, LabelWhere::Below)
+        {
+            return Some(candidate);
         }
-        if width + 2 * gap <= selection.width() && height + 2 * gap <= selection.height() {
-            if let Some(candidate) = clamp(
+        if width + 2 * gap <= selection.width()
+            && height + 2 * gap <= selection.height()
+            && let Some(candidate) = clamp(
                 selection.left + gap,
                 selection.top + gap,
                 LabelWhere::Inside,
-            ) {
-                return Some(candidate);
-            }
+            )
+        {
+            return Some(candidate);
         }
         None
     }

@@ -253,14 +253,13 @@ impl OverlayController {
             self.invalidate();
             return;
         }
-        if self.region_panel.is_some() {
-            if let Some(panel) = self.region_panel_rect() {
-                if panel.contains(point) {
-                    self.chrome_swallowed_press = true;
-                    self.on_region_panel_press(point);
-                    return;
-                }
-            }
+        if self.region_panel.is_some()
+            && let Some(panel) = self.region_panel_rect()
+            && panel.contains(point)
+        {
+            self.chrome_swallowed_press = true;
+            self.on_region_panel_press(point);
+            return;
         }
         // 尺寸栏上的按下：开关精确面板（docs/23 §14.54）。悬停只把它点亮，点才开面板。
         if self.label_badge.is_some_and(|badge| badge.contains(point)) {
@@ -801,20 +800,19 @@ impl OverlayController {
     pub(super) fn annotation_point_down(&mut self, point: Point) {
         if self.annotation_tool.is_none() {
             // Select tool: a control point resizes first, then the body moves.
-            if let Some(id) = self.annotation_doc.selected_id() {
-                if let Some(handle) =
+            if let Some(id) = self.annotation_doc.selected_id()
+                && let Some(handle) =
                     self.annotation_doc
                         .handle_at(id, point, self.annotation_handle_tol())
-                {
-                    let snapshot = self.annotation_doc.snapshot();
-                    self.annotation_gesture = Some(AnnotationGesture::Resize {
-                        id,
-                        handle,
-                        snapshot,
-                    });
-                    self.invalidate();
-                    return;
-                }
+            {
+                let snapshot = self.annotation_doc.snapshot();
+                self.annotation_gesture = Some(AnnotationGesture::Resize {
+                    id,
+                    handle,
+                    snapshot,
+                });
+                self.invalidate();
+                return;
             }
             match self.annotation_doc.hit_test(point) {
                 Some(id) => {
@@ -879,9 +877,8 @@ impl OverlayController {
                     .handle_at(id, point, self.annotation_handle_tol())
             })
             .is_some()
+            || self.annotation_doc.hit_test(point).is_some()
         {
-            IDC_SIZEALL
-        } else if self.annotation_doc.hit_test(point).is_some() {
             IDC_SIZEALL
         } else {
             IDC_ARROW
@@ -1323,6 +1320,16 @@ impl OverlayController {
     }
 }
 
+/// Ctrl, Shift and Alt as they were when the message being handled was posted.
+fn modifiers() -> (bool, bool, bool) {
+    let down = |vk: u16| unsafe { GetKeyState(vk as i32) < 0 };
+    (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU))
+}
+
+fn is_shift_vk(vk: u32) -> bool {
+    vk == VK_SHIFT as u32 || vk == VK_LSHIFT as u32 || vk == VK_RSHIFT as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::{OverlayController, nudge_point};
@@ -1412,10 +1419,12 @@ mod tests {
         let (_annotation_tx, annotation_rx) =
             std::sync::mpsc::sync_channel::<crate::annotation::AnnotationCommand>(1);
         OverlayController::new(
-            std::sync::Arc::new(crate::artifact::CaptureService::new()),
-            sink,
-            std::sync::Arc::new(TestClipboard),
-            std::sync::Arc::new(TestWriter),
+            crate::windows::overlay::OverlayPorts {
+                service: std::sync::Arc::new(crate::artifact::CaptureService::new()),
+                sink,
+                clipboard: std::sync::Arc::new(TestClipboard),
+                writer: std::sync::Arc::new(TestWriter),
+            },
             Default::default(),
             shared,
             annotation_rx,
@@ -1816,14 +1825,4 @@ mod tests {
         same(nudge_point(origin, -1, 0), 99, 200);
         same(nudge_point(origin, 1, 0), 101, 200);
     }
-}
-
-/// Ctrl, Shift and Alt as they were when the message being handled was posted.
-fn modifiers() -> (bool, bool, bool) {
-    let down = |vk: u16| unsafe { GetKeyState(vk as i32) < 0 };
-    (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU))
-}
-
-fn is_shift_vk(vk: u32) -> bool {
-    vk == VK_SHIFT as u32 || vk == VK_LSHIFT as u32 || vk == VK_RSHIFT as u32
 }

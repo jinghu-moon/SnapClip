@@ -114,10 +114,10 @@ const BAND_ROWS: u32 = 256;
 /// more than a band.
 fn fill_band(buf: &mut [u8], first_row: u64) {
     let width = WIDTH as usize;
-    for (index, pixel) in buf.chunks_exact_mut(4).enumerate() {
+    for (index, pixel) in buf.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         let x = index % width;
         let y = first_row as usize + index / width;
-        let ink = (x / 7) % 5 == 0 && (y % 13) < 9;
+        let ink = (x / 7).is_multiple_of(5) && (y % 13) < 9;
         let value = if ink { 32 } else { 244 };
         pixel.copy_from_slice(&[value, value, value, 255]);
     }

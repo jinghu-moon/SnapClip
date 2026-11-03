@@ -340,7 +340,7 @@ fn the_minimize_button_answers_only_inside_itself() {
             (rects.close.top + rects.close.bottom) / 2,
         );
         assert!(
-            minimize_button_contains(&rects, scale, close_middle) == false,
+            !minimize_button_contains(&rects, scale, close_middle),
             "a click on the close is not a click on the minimize at {scale}"
         );
     }

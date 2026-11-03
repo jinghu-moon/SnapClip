@@ -389,7 +389,7 @@ fn child_self() -> VARIANT {
         // `VARIANT`'s members are unions wrapped in `ManuallyDrop`, so the fields are reached
         // through explicit references rather than auto-deref.
         let inner: &mut ::windows::Win32::System::Variant::VARIANT_0 = &mut variant.Anonymous;
-        let body: &mut ::windows::Win32::System::Variant::VARIANT_0_0 = &mut *inner.Anonymous;
+        let body: &mut ::windows::Win32::System::Variant::VARIANT_0_0 = &mut inner.Anonymous;
         body.vt = VT_I4;
         body.Anonymous.lVal = CHILDID_SELF;
     }

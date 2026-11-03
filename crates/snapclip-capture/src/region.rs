@@ -885,12 +885,12 @@ impl RegionPanel {
         if self.editing.is_some() {
             match key {
                 PanelKey::Digit(digit) => {
-                    if let Some(edit) = self.editing.as_mut() {
-                        if edit.text.len() < 7 {
-                            let insert_at = edit.caret.min(edit.text.len());
-                            edit.text.insert(insert_at, char::from(b'0' + digit.min(9)));
-                            edit.caret = insert_at + 1;
-                        }
+                    if let Some(edit) = self.editing.as_mut()
+                        && edit.text.len() < 7
+                    {
+                        let insert_at = edit.caret.min(edit.text.len());
+                        edit.text.insert(insert_at, char::from(b'0' + digit.min(9)));
+                        edit.caret = insert_at + 1;
                     }
                     return match self.commit(region, dpi) {
                         Some(next) => PanelChange::Region(next),
@@ -955,10 +955,10 @@ impl RegionPanel {
             }
         }
 
-        if self.focus == PanelSlot::Radius {
-            if let Some(change) = self.radius_key(key, region) {
-                return change;
-            }
+        if self.focus == PanelSlot::Radius
+            && let Some(change) = self.radius_key(key, region)
+        {
+            return change;
         }
 
         match key {

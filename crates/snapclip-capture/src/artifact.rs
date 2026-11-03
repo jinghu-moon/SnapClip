@@ -474,7 +474,7 @@ mod tests {
         use super::round_corners;
         let (w, h) = (20u32, 20u32);
         let mut pixels = vec![7u8; (w * h * 4) as usize];
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel[3] = 255;
         }
         let before = pixels.clone();

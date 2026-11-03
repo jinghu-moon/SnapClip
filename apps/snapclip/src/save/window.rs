@@ -1216,9 +1216,6 @@ fn measure_footer_widths(
     }
 }
 
-/// The path row's `更改` button width, measured the same way and for the same reason: the input's
-/// rectangle leaves room for this button, so both the control and the paint read this one number.
-
 /// The conflict link's two words, measured once beside the footer's widths for the same reason: the
 /// word drawn is the word clicked, and the word changes with the policy.
 fn measure_conflict_link(
@@ -1454,7 +1451,7 @@ fn set_control_text_and_caret(
     unsafe {
         windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, terminated.as_ptr());
         let _ = text_ptr;
-        SendMessageW(hwnd, EM_SETSEL, caret as usize, caret as isize);
+        SendMessageW(hwnd, EM_SETSEL, caret, caret as isize);
     }
 }
 
@@ -1527,46 +1524,10 @@ pub(crate) fn format_of_index(index: usize) -> SaveFormat {
     }
 }
 
-/// The panel's answers as the save step wants them.
-///
-/// Separate from [`save_from_panel`] because the two fields it reads are both strings and of the
-/// same kind: swapping the directory and the name would produce a save that looks entirely
-/// reasonable and writes to the wrong place. A function can be asserted without a window.
-fn panel_values<'a>(
-    directory: &'a str,
-    name: &'a str,
-    date: &'a str,
-    time: &'a str,
-    sequence: u32,
-    format: SaveFormat,
-    quality: u8,
-    fill: [u8; 3],
-    conflict: ConflictPolicy,
-) -> PanelValues<'a> {
-    PanelValues {
-        directory,
-        name,
-        // The format control's choice, mapped from its index by the one function that knows the
-        // order of the menu.
-        format,
-        // The quality tier's number, mapped by the one function that knows `docs/42` D8.
-        quality,
-        // Whether a taken name is reused or numbered, which the footer's link can change.
-        conflict,
-        fill,
-        date,
-        time,
-        // Supplied by the shell's shared counter rather than assumed here: the number a save uses
-        // is the one the previous successful save left behind, and the panel has no copy of it.
-        sequence,
-        app: APP_NAME,
-    }
-}
-
 /// What a save attempt has to say in the footer's status line, if anything.
 ///
 /// One place decides this, and it is a pure function so it can be asserted without a window — the
-/// same reason `panel_values` and `initial_text` are functions. Three rules are visible here:
+/// same reason `initial_text` is a function. Three rules are visible here:
 ///
 /// - a **success** says nothing: the panel closes, so there is no line to read;
 /// - a **cancel** says nothing: nothing went wrong, the user changed their mind (`SaveError`'s own
@@ -2074,17 +2035,18 @@ fn with_panel_request<T>(
         .lock()
         .map(|remembered| remembered.sequence.next())
         .unwrap_or(1);
-    let values = panel_values(
-        &directory,
-        &name,
-        &date,
-        &time,
+    let values = PanelValues {
+        directory: &directory,
+        name: &name,
+        date: &date,
+        time: &time,
         sequence,
-        format_of_index(s.format),
-        super::assemble::quality_of_tier(s.chosen_quality()),
-        s.fill,
-        s.conflict,
-    );
+        format: format_of_index(s.format),
+        quality: super::assemble::quality_of_tier(s.chosen_quality()),
+        fill: s.fill,
+        conflict: s.conflict,
+        app: APP_NAME,
+    };
     let frame = super::scale::Frame {
         bgra,
         source,
@@ -2175,9 +2137,7 @@ fn save_with_limit(
     let fitted = super::estimate::fit_under(frame.output, limit, |size| {
         super::assemble::weigh(values, &frame.at(size)).ok()
     });
-    let Some((size, _bytes)) = fitted else {
-        return None;
-    };
+    let (size, _bytes) = fitted?;
     Some(save_panel(values, &frame.at(size)))
 }
 
@@ -2357,7 +2317,7 @@ unsafe extern "system" fn browse_initial(
     data: windows_sys::Win32::Foundation::LPARAM,
 ) -> i32 {
     use windows_sys::Win32::UI::Shell::{BFFM_INITIALIZED, BFFM_SETSELECTIONW};
-    if message == BFFM_INITIALIZED as u32 && data != 0 {
+    if message == BFFM_INITIALIZED && data != 0 {
         // A string pointer the caller owns crosses the boundary here; it lives in choose_folder's
         // frame for the whole call, which outlives the dialog.
         unsafe {
@@ -2396,7 +2356,8 @@ fn choose_folder(hwnd: windows_sys::Win32::Foundation::HWND) {
             .unwrap_or(0),
         iImage: 0,
     };
-    let pidl = unsafe { SHBrowseForFolderW(&mut info) };
+    // iImage is written by Shell even though the binding takes a const pointer.
+    let pidl = unsafe { SHBrowseForFolderW(&raw mut info) };
     if pidl.is_null() {
         // Cancelled. Nothing is written, because "no answer" is not an answer.
         return;
@@ -2830,13 +2791,13 @@ impl WindowState {
     /// rule is told as well, through the same call the native children make from `WM_COMMAND`, so
     /// the frame's border and the field's own state cannot disagree about who has the focus.
     fn focus_number(&mut self, id: snapclip_ui::panel::FieldId) {
-        if let Some(previous) = self.focused_number.replace(id) {
-            if previous != id {
-                if let Some(field) = self.numbers.get_mut(previous) {
-                    field.set_focused(false);
-                }
-                self.fields.set_focus(previous, false);
+        if let Some(previous) = self.focused_number.replace(id)
+            && previous != id
+        {
+            if let Some(field) = self.numbers.get_mut(previous) {
+                field.set_focused(false);
             }
+            self.fields.set_focus(previous, false);
         }
         if let Some(field) = self.numbers.get_mut(id) {
             field.set_focused(true);
@@ -3199,7 +3160,7 @@ fn create_field_edit(
             bytes.as_ptr() as *const core::ffi::c_void,
             bytes.len() as u32,
             std::ptr::null_mut(),
-            &mut loaded,
+            &raw mut loaded,
         );
 
         let dpi = GetDpiForWindow(parent).max(96);
@@ -3454,131 +3415,130 @@ extern "system" fn window_proc(
                 let mut client: RECT = std::mem::zeroed();
                 windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
                 let mut painted = false;
-                if let Some(s) = state(hwnd) {
-                    if let Some(renderer) = s.renderer.as_ref() {
-                        let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32;
-                        let area = snapclip_model::geometry::Rect::new(
-                            client.left,
-                            client.top,
-                            client.right,
-                            client.bottom,
-                        );
-                        // The estimate row's two strings live here rather than in the state: they are
-                        // formatted from the measurement and read by one paint, and a stored copy would
-                        // be a second place that has to be kept in step with the number it came from.
-                        let limit_note = limit_note(
-                            s.estimate,
-                            s.over_limit,
-                            format_of_index(s.format) == SaveFormat::Png,
-                        );
-                        let estimate_text = s.estimate.map(crate::save::estimate::format_bytes);
-                        // The over-resolution hint and the token menu's values, read here for the same
-                        // reason the save reads them there: the width and height the sentence warns
-                        // about are the size fields' own answer, and a menu promising a date the file
-                        // name would not get is worse than no menu.
-                        let (date_text, time_text) = local_date_and_time();
-                        let source_size = s
-                            .preview
-                            .as_ref()
-                            .map(|(_, width, height)| super::scale::Size::new(*width, *height))
-                            .unwrap_or(super::scale::Size::new(0, 0));
-                        let output_size = super::scale::output_size(
-                            super::scale::SizeMode::from_index(s.size_mode),
-                            &s.number_text(snapclip_ui::panel::FieldId::SizeWidth),
-                            &s.number_text(snapclip_ui::panel::FieldId::SizeHeight),
-                            source_size,
-                        );
-                        let warn_hint = snapclip_ui::panel::warn_hint_shown(
-                            (output_size.width, output_size.height),
-                            (source_size.width, source_size.height),
-                        );
-                        let sequence_text = s
-                            .remembered
-                            .lock()
-                            .map(|remembered| remembered.sequence.next())
-                            .unwrap_or(1)
-                            .to_string();
-                        let resolution_text =
-                            format!("{}x{}", output_size.width, output_size.height);
-                        // The window is the surface: with no material behind it, every pixel has to come
-                        // from this paint. `docs/42` D13 fourth deviation is why there is no material.
-                        painted = renderer
-                            .paint_with_preview(
-                                hdc as *mut _,
-                                area,
-                                &snapclip_ui::panel::PaintInput {
-                                    dpi,
-                                    fill_surface: true,
-                                    // A window keeps its pixels between frames, so it erases first;
-                                    // see `PaintInput::clear_first` for what the residue did.
-                                    clear_first: true,
-                                    fields: s.fields,
-                                    numbers: s.numbers.views(),
-                                    // The row is drawn, not typed into: the value comes from the one
-                                    // copy the save reads, and too long for its box means shortened in
-                                    // the middle by the painter.
-                                    path_text: Some(s.directory.as_str()),
-                                    preview: s
-                                        .preview
-                                        .as_ref()
-                                        .map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
-                                    quality: s.chosen_quality(),
-                                    format: s.format,
-                                    format_open: s.format_open,
-                                    fill: s.fill,
-                                    footer_widths: Some(s.footer_widths),
-                                    path_change: s.path_change,
-                                    conflict: s.conflict_shown.then(|| conflict_link(s.conflict)),
-                                    conflict_widths: Some(s.conflict_widths),
-                                    var_open: s.var_open,
-                                    context: s.context,
-                                    path_chips: Some(s.path_chips),
-                                    after_chips: Some(s.after_chips),
-                                    after: s.after,
-                                    size_presets: Some(s.size_presets),
-                                    size_mode: s.size_mode,
-                                    size_mode_widths: Some(s.size_mode_widths),
-                                    warn_hint,
-                                    variable_values: Some([
-                                        date_text.as_str(),
-                                        time_text.as_str(),
-                                        sequence_text.as_str(),
-                                        resolution_text.as_str(),
-                                        APP_NAME,
-                                    ]),
-                                    // The switch is always drawn — turning it on is the whole point of
-                                    // it — while the note and the escape hatch exist only when a
-                                    // measurement has something to say (`:234`, `:235`).
-                                    limit: Some(snapclip_ui::panel::LimitView {
-                                        on: s.limit_on,
-                                        switch_word_px: s.limit_words.switch_word_px,
-                                        note: limit_note.as_deref(),
-                                        note_warn: s.over_limit,
-                                        auto_shrink_px: if s.limit_on && s.over_limit {
-                                            s.limit_words.auto_shrink_px
-                                        } else {
-                                            0
-                                        },
-                                        estimate: estimate_text.as_deref(),
-                                        // A synchronous encode cannot show the state while it runs, so
-                                        // the finished word is the only one this panel can honestly
-                                        // draw; `docs/41` records why `编码中` would be theatre here.
-                                        encode_state: if s.estimate.is_some() {
-                                            Some(snapclip_ui::panel::ENCODE_STATE_DONE)
-                                        } else {
-                                            None
-                                        },
-                                        encode_done: s.estimate.is_some(),
-                                        encode_state_px: s.limit_words.measured_px,
-                                    }),
-                                    status: s
-                                        .status
-                                        .as_ref()
-                                        .map(|(level, text)| (*level, text.as_str())),
-                                },
-                            )
-                            .is_ok();
-                    }
+                if let Some(s) = state(hwnd)
+                    && let Some(renderer) = s.renderer.as_ref()
+                {
+                    let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32;
+                    let area = snapclip_model::geometry::Rect::new(
+                        client.left,
+                        client.top,
+                        client.right,
+                        client.bottom,
+                    );
+                    // The estimate row's two strings live here rather than in the state: they are
+                    // formatted from the measurement and read by one paint, and a stored copy would
+                    // be a second place that has to be kept in step with the number it came from.
+                    let limit_note = limit_note(
+                        s.estimate,
+                        s.over_limit,
+                        format_of_index(s.format) == SaveFormat::Png,
+                    );
+                    let estimate_text = s.estimate.map(crate::save::estimate::format_bytes);
+                    // The over-resolution hint and the token menu's values, read here for the same
+                    // reason the save reads them there: the width and height the sentence warns
+                    // about are the size fields' own answer, and a menu promising a date the file
+                    // name would not get is worse than no menu.
+                    let (date_text, time_text) = local_date_and_time();
+                    let source_size = s
+                        .preview
+                        .as_ref()
+                        .map(|(_, width, height)| super::scale::Size::new(*width, *height))
+                        .unwrap_or(super::scale::Size::new(0, 0));
+                    let output_size = super::scale::output_size(
+                        super::scale::SizeMode::from_index(s.size_mode),
+                        &s.number_text(snapclip_ui::panel::FieldId::SizeWidth),
+                        &s.number_text(snapclip_ui::panel::FieldId::SizeHeight),
+                        source_size,
+                    );
+                    let warn_hint = snapclip_ui::panel::warn_hint_shown(
+                        (output_size.width, output_size.height),
+                        (source_size.width, source_size.height),
+                    );
+                    let sequence_text = s
+                        .remembered
+                        .lock()
+                        .map(|remembered| remembered.sequence.next())
+                        .unwrap_or(1)
+                        .to_string();
+                    let resolution_text = format!("{}x{}", output_size.width, output_size.height);
+                    // The window is the surface: with no material behind it, every pixel has to come
+                    // from this paint. `docs/42` D13 fourth deviation is why there is no material.
+                    painted = renderer
+                        .paint_with_preview(
+                            hdc as *mut _,
+                            area,
+                            &snapclip_ui::panel::PaintInput {
+                                dpi,
+                                fill_surface: true,
+                                // A window keeps its pixels between frames, so it erases first;
+                                // see `PaintInput::clear_first` for what the residue did.
+                                clear_first: true,
+                                fields: s.fields,
+                                numbers: s.numbers.views(),
+                                // The row is drawn, not typed into: the value comes from the one
+                                // copy the save reads, and too long for its box means shortened in
+                                // the middle by the painter.
+                                path_text: Some(s.directory.as_str()),
+                                preview: s
+                                    .preview
+                                    .as_ref()
+                                    .map(|(bgra, w, h)| (bgra.as_slice(), *w, *h)),
+                                quality: s.chosen_quality(),
+                                format: s.format,
+                                format_open: s.format_open,
+                                fill: s.fill,
+                                footer_widths: Some(s.footer_widths),
+                                path_change: s.path_change,
+                                conflict: s.conflict_shown.then(|| conflict_link(s.conflict)),
+                                conflict_widths: Some(s.conflict_widths),
+                                var_open: s.var_open,
+                                context: s.context,
+                                path_chips: Some(s.path_chips),
+                                after_chips: Some(s.after_chips),
+                                after: s.after,
+                                size_presets: Some(s.size_presets),
+                                size_mode: s.size_mode,
+                                size_mode_widths: Some(s.size_mode_widths),
+                                warn_hint,
+                                variable_values: Some([
+                                    date_text.as_str(),
+                                    time_text.as_str(),
+                                    sequence_text.as_str(),
+                                    resolution_text.as_str(),
+                                    APP_NAME,
+                                ]),
+                                // The switch is always drawn — turning it on is the whole point of
+                                // it — while the note and the escape hatch exist only when a
+                                // measurement has something to say (`:234`, `:235`).
+                                limit: Some(snapclip_ui::panel::LimitView {
+                                    on: s.limit_on,
+                                    switch_word_px: s.limit_words.switch_word_px,
+                                    note: limit_note.as_deref(),
+                                    note_warn: s.over_limit,
+                                    auto_shrink_px: if s.limit_on && s.over_limit {
+                                        s.limit_words.auto_shrink_px
+                                    } else {
+                                        0
+                                    },
+                                    estimate: estimate_text.as_deref(),
+                                    // A synchronous encode cannot show the state while it runs, so
+                                    // the finished word is the only one this panel can honestly
+                                    // draw; `docs/41` records why `编码中` would be theatre here.
+                                    encode_state: if s.estimate.is_some() {
+                                        Some(snapclip_ui::panel::ENCODE_STATE_DONE)
+                                    } else {
+                                        None
+                                    },
+                                    encode_done: s.estimate.is_some(),
+                                    encode_state_px: s.limit_words.measured_px,
+                                }),
+                                status: s
+                                    .status
+                                    .as_ref()
+                                    .map(|(level, text)| (*level, text.as_str())),
+                            },
+                        )
+                        .is_ok();
                 }
                 if !painted {
                     // The mock's surface, as the fallback for a window whose painter could not start.
@@ -3610,22 +3570,18 @@ extern "system" fn window_proc(
                 // A click while the right-click menu is open belongs to it: a command runs and the menu
                 // closes, and a click anywhere else dismisses the menu and does nothing else — the first
                 // click after a menu opens is the menu's, the rule the format menu already follows.
-                if event == snapclip_ui::panel::PointerEvent::Down {
-                    if let Some(context) = state(hwnd).and_then(|s| s.context) {
-                        let hit = context.item_at((point.x, point.y));
-                        if let Some(index) = hit {
-                            run_context_command(hwnd, index);
-                            close_menus(hwnd, "a command was chosen");
-                        } else {
-                            close_menus(hwnd, "a click landed outside the context menu");
-                        }
-                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
-                            hwnd,
-                            std::ptr::null(),
-                            0,
-                        );
-                        return 0;
+                if event == snapclip_ui::panel::PointerEvent::Down
+                    && let Some(context) = state(hwnd).and_then(|s| s.context)
+                {
+                    let hit = context.item_at((point.x, point.y));
+                    if let Some(index) = hit {
+                        run_context_command(hwnd, index);
+                        close_menus(hwnd, "a command was chosen");
+                    } else {
+                        close_menus(hwnd, "a click landed outside the context menu");
                     }
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
+                    return 0;
                 }
                 // The close button is drawn by the frame, so its clicks arrive here too. The button is
                 // hit tested, not the 14 dip glyph inside it: the mockup's button is 26 dip (`:96`) and
@@ -4087,18 +4043,18 @@ extern "system" fn window_proc(
                     let shown = state(hwnd)
                         .map(|s| snapclip_ui::panel::fill_row_shown(s.format))
                         .unwrap_or(false);
-                    if shown {
-                        if let Some(index) = snapclip_ui::panel::fill_swatch_at(
+                    if shown
+                        && let Some(index) = snapclip_ui::panel::fill_swatch_at(
                             &metrics,
                             &rects,
                             scale,
                             (point.x, point.y),
-                        ) {
-                            if choose_fill(hwnd, index) {
-                                InvalidateRect(hwnd, std::ptr::null(), 0);
-                            }
-                            return 0;
+                        )
+                    {
+                        if choose_fill(hwnd, index) {
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
                         }
+                        return 0;
                     }
                 }
                 // The quality control only answers while it is drawn. PNG has no tier to pick, so the row
@@ -4157,14 +4113,10 @@ extern "system" fn window_proc(
             // A drawn number takes its characters here: the panel holds the keyboard focus on the
             // field's behalf, because a drawn field has no child window to send them to.
             WM_CHAR => {
-                if let Some(s) = state_mut(hwnd) {
-                    if number_key(s, message, wparam) {
-                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
-                            hwnd,
-                            std::ptr::null(),
-                            0,
-                        );
-                    }
+                if let Some(s) = state_mut(hwnd)
+                    && number_key(s, message, wparam)
+                {
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 0
             }
@@ -4185,15 +4137,11 @@ extern "system" fn window_proc(
             // The drawn number's caret leaves with the keyboard: a caret in a field that cannot take a
             // keystroke would be a lie about where typing goes.
             WM_KILLFOCUS => {
-                if let Some(s) = state_mut(hwnd) {
-                    if s.focused_number.is_some() {
-                        s.blur_number();
-                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
-                            hwnd,
-                            std::ptr::null(),
-                            0,
-                        );
-                    }
+                if let Some(s) = state_mut(hwnd)
+                    && s.focused_number.is_some()
+                {
+                    s.blur_number();
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 DefWindowProcW(hwnd, message, wparam, lparam)
             }
@@ -4201,14 +4149,11 @@ extern "system" fn window_proc(
                 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
                 // The number's own keys come first, and they do not take `Enter` or `Esc`: those still
                 // save and close, whatever has the focus.
-                if let Some(s) = state_mut(hwnd) {
-                    if s.focused_number.is_some() && number_key(s, message, wparam) {
-                        windows_sys::Win32::Graphics::Gdi::InvalidateRect(
-                            hwnd,
-                            std::ptr::null(),
-                            0,
-                        );
-                    }
+                if let Some(s) = state_mut(hwnd)
+                    && s.focused_number.is_some()
+                    && number_key(s, message, wparam)
+                {
+                    windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 if wparam == VK_ESCAPE as usize {
                     windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -4373,50 +4318,50 @@ extern "system" fn window_proc(
                 }
                 let mut repaint = false;
                 let mut conflict_dirty = false;
-                if let Some(s) = state_mut(hwnd) {
-                    if let Some(id) = s.field_of(control) {
-                        // The name field is a template, and the spec keeps it as it is typed (`:201`), so
-                        // the shell can open the next panel with what this one was left holding. Setting
-                        // a control's text fires the same notification as typing does — the panel's own
-                        // initial text arrives here too — which is why the rule, not this handler,
-                        // decides whether anything actually changed.
-                        if notification == EN_CHANGE {
-                            let edited = control_text(control);
-                            if let Ok(mut remembered) = s.remembered.lock() {
-                                note_edit(&mut remembered, id, true, &edited);
-                            }
-                            // The name decides which file the link is about, so a change re-asks the
-                            // question; the other fields cannot move the target. The directory used to
-                            // arrive here too, but the path is no longer a control: `set_directory` asks
-                            // directly, because that is the only thing that can change it.
-                            conflict_dirty = matches!(id, snapclip_ui::panel::FieldId::Name);
+                if let Some(s) = state_mut(hwnd)
+                    && let Some(id) = s.field_of(control)
+                {
+                    // The name field is a template, and the spec keeps it as it is typed (`:201`), so
+                    // the shell can open the next panel with what this one was left holding. Setting
+                    // a control's text fires the same notification as typing does — the panel's own
+                    // initial text arrives here too — which is why the rule, not this handler,
+                    // decides whether anything actually changed.
+                    if notification == EN_CHANGE {
+                        let edited = control_text(control);
+                        if let Ok(mut remembered) = s.remembered.lock() {
+                            note_edit(&mut remembered, id, true, &edited);
                         }
-                        // Focus is not allowed to overwrite a message about the value: the field would
-                        // fall silent exactly while the user is fixing what it complained about.
-                        let next = match notification {
-                            EN_SETFOCUS => Some(true),
-                            EN_KILLFOCUS => Some(false),
-                            _ => None,
-                        };
-                        if let Some(focused) = next {
-                            let before = s.fields.state_of(id);
-                            s.fields.set_focus(id, focused);
-                            repaint = s.fields.state_of(id) != before;
-                            // A focused box selects nothing by itself, but the window manager selects
-                            // the box's contents when it activates one, so the same collapse the panel
-                            // performs on its way up runs here too, and the log that follows reports
-                            // what the box holds after it rather than before.
-                            if focused {
-                                collapse_native_selection(s.control(id));
-                                match selection_log_values(s.control(id)) {
-                                    Some((start, end, length)) => eprintln!(
-                                        "[save-panel] edit selection field={id:?} start={start} end={end} len={length}"
-                                    ),
-                                    None => {
-                                        eprintln!(
-                                            "[save-panel] edit selection field={id:?} control=null"
-                                        )
-                                    }
+                        // The name decides which file the link is about, so a change re-asks the
+                        // question; the other fields cannot move the target. The directory used to
+                        // arrive here too, but the path is no longer a control: `set_directory` asks
+                        // directly, because that is the only thing that can change it.
+                        conflict_dirty = matches!(id, snapclip_ui::panel::FieldId::Name);
+                    }
+                    // Focus is not allowed to overwrite a message about the value: the field would
+                    // fall silent exactly while the user is fixing what it complained about.
+                    let next = match notification {
+                        EN_SETFOCUS => Some(true),
+                        EN_KILLFOCUS => Some(false),
+                        _ => None,
+                    };
+                    if let Some(focused) = next {
+                        let before = s.fields.state_of(id);
+                        s.fields.set_focus(id, focused);
+                        repaint = s.fields.state_of(id) != before;
+                        // A focused box selects nothing by itself, but the window manager selects
+                        // the box's contents when it activates one, so the same collapse the panel
+                        // performs on its way up runs here too, and the log that follows reports
+                        // what the box holds after it rather than before.
+                        if focused {
+                            collapse_native_selection(s.control(id));
+                            match selection_log_values(s.control(id)) {
+                                Some((start, end, length)) => eprintln!(
+                                    "[save-panel] edit selection field={id:?} start={start} end={end} len={length}"
+                                ),
+                                None => {
+                                    eprintln!(
+                                        "[save-panel] edit selection field={id:?} control=null"
+                                    )
                                 }
                             }
                         }
@@ -4904,17 +4849,18 @@ mod tests {
     /// writes somewhere else, which is why the pairing is asserted rather than noticed later.
     #[test]
     fn the_save_takes_the_directory_and_the_name_in_that_order() {
-        let values = panel_values(
-            r"C:\shots",
-            "SnapClip_[日期]",
-            "2026-10-24",
-            "0115",
-            7,
-            format_of_index(0),
-            crate::save::assemble::quality_of_tier(0),
-            snapclip_ui::panel::FILL_WHITE,
-            ConflictPolicy::AutoRename,
-        );
+        let values = PanelValues {
+            directory: r"C:\shots",
+            name: "SnapClip_[日期]",
+            date: "2026-10-24",
+            time: "0115",
+            sequence: 7,
+            format: format_of_index(0),
+            quality: crate::save::assemble::quality_of_tier(0),
+            fill: snapclip_ui::panel::FILL_WHITE,
+            conflict: ConflictPolicy::AutoRename,
+            app: APP_NAME,
+        };
         assert_eq!(values.directory, r"C:\shots");
         assert_eq!(values.name, "SnapClip_[日期]");
         assert_eq!(values.date, "2026-10-24");
@@ -4924,6 +4870,10 @@ mod tests {
             "the number comes from the shell's counter"
         );
         assert_eq!(values.app, "SnapClip");
+        let request = crate::save::assemble::request_for(&values, 640, 480).unwrap();
+        assert_eq!(request.directory, std::path::Path::new(r"C:\shots"));
+        assert_eq!(request.stem, "SnapClip_2026-10-24");
+        assert_eq!(request.format, SaveFormat::Png);
     }
 
     /// The menu's order is the design's (FMT_OPTIONS, :717), and the index it reports is not a
@@ -5866,18 +5816,17 @@ mod tests {
             output: size,
         };
         // A literal name, so the values' borrow outlives the call rather than the argument.
-        let values = |name: &'static str| {
-            panel_values(
-                &directory_text,
-                name,
-                "2026-10-24",
-                "1042",
-                1,
-                SaveFormat::Png,
-                92,
-                snapclip_ui::panel::FILL_WHITE,
-                ConflictPolicy::AutoRename,
-            )
+        let values = |name: &'static str| PanelValues {
+            directory: &directory_text,
+            name,
+            date: "2026-10-24",
+            time: "1042",
+            sequence: 1,
+            format: SaveFormat::Png,
+            quality: 92,
+            fill: snapclip_ui::panel::FILL_WHITE,
+            conflict: ConflictPolicy::AutoRename,
+            app: APP_NAME,
         };
 
         let unlimited = save_with_limit(None, &values("noise"), &frame)
@@ -5937,17 +5886,18 @@ fn the_conflict_link_offers_the_policy_that_is_not_in_force() {
 /// flag that nothing reads and the next save would quietly rename anyway.
 #[test]
 fn the_panels_conflict_choice_reaches_the_values() {
-    let values = panel_values(
-        r"C:\\shots",
-        "SnapClip_[日期]",
-        "2026-10-24",
-        "0115",
-        7,
-        format_of_index(0),
-        crate::save::assemble::quality_of_tier(0),
-        snapclip_ui::panel::FILL_WHITE,
-        ConflictPolicy::Overwrite,
-    );
+    let values = PanelValues {
+        directory: r"C:\\shots",
+        name: "SnapClip_[日期]",
+        date: "2026-10-24",
+        time: "0115",
+        sequence: 7,
+        format: format_of_index(0),
+        quality: crate::save::assemble::quality_of_tier(0),
+        fill: snapclip_ui::panel::FILL_WHITE,
+        conflict: ConflictPolicy::Overwrite,
+        app: APP_NAME,
+    };
     assert_eq!(values.conflict, ConflictPolicy::Overwrite);
 }
 
@@ -5978,18 +5928,17 @@ fn a_taken_name_is_replaced_or_kept_beside_by_the_panels_choice() {
         source: size,
         output: size,
     };
-    let values = |conflict: ConflictPolicy| {
-        panel_values(
-            &directory_text,
-            "shot",
-            "2026-10-24",
-            "1042",
-            1,
-            SaveFormat::Png,
-            92,
-            snapclip_ui::panel::FILL_WHITE,
-            conflict,
-        )
+    let values = |conflict: ConflictPolicy| PanelValues {
+        directory: &directory_text,
+        name: "shot",
+        date: "2026-10-24",
+        time: "1042",
+        sequence: 1,
+        format: SaveFormat::Png,
+        quality: 92,
+        fill: snapclip_ui::panel::FILL_WHITE,
+        conflict,
+        app: APP_NAME,
     };
 
     // Last night's screenshot, holding bytes no png encoder would ever write.

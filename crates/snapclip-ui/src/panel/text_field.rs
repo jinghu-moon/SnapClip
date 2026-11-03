@@ -299,6 +299,12 @@ pub fn right_aligned_left(box_rect: Rect, text_width: i32, padding: i32) -> i32 
     (box_rect.right - padding - text_width).max(box_rect.left)
 }
 
+impl Default for TextField {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,11 +495,5 @@ mod tests {
         assert_eq!(view.selection, Some((0, 2)));
         assert_eq!(view.caret, 2);
         assert!(view.focused);
-    }
-}
-
-impl Default for TextField {
-    fn default() -> Self {
-        Self::new("")
     }
 }

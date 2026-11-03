@@ -1630,7 +1630,7 @@ mod tests {
             values.sort_unstable();
             values[values.len() / 2]
         }
-        fn worst(values: &mut Vec<(u128, u128)>) -> u128 {
+        fn worst(values: &mut [(u128, u128)]) -> u128 {
             values.sort_unstable();
             values[values.len() - 1].1
         }

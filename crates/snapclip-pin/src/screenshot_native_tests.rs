@@ -18,10 +18,9 @@ use windows_sys::Win32::{Foundation::RECT, UI::WindowsAndMessaging::*};
 #[test]
 #[ignore = "Release own-window 20-cycle lifecycle and idle-render probe; no system input"]
 fn native_twenty_hdr_windows_release_sources_and_do_not_render_while_idle() {
-    assert!(
-        !cfg!(debug_assertions),
-        "run this measurement with --release"
-    );
+    if cfg!(debug_assertions) {
+        panic!("run this measurement with --release");
+    }
     let failures = Rc::new(RefCell::new(Vec::<String>::new()));
     let observed = failures.clone();
     gpui_kit::application().run(move |cx| {

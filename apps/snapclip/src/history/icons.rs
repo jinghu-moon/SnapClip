@@ -41,10 +41,10 @@ impl SourceIcons {
         if exe_path.is_empty() {
             return None;
         }
-        if let Ok(cache) = self.paths.lock() {
-            if let Some(hit) = cache.get(exe_path) {
-                return hit.clone();
-            }
+        if let Ok(cache) = self.paths.lock()
+            && let Some(hit) = cache.get(exe_path)
+        {
+            return hit.clone();
         }
         let extracted = self
             .icon_cache

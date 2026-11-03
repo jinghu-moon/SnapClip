@@ -54,7 +54,7 @@ impl Picture {
             };
             let mut bytes = image.as_bytes().to_vec();
             if descriptor == PixelDescriptor::bgra8() && !image.is_bgra8() {
-                for pixel in bytes.chunks_exact_mut(4) {
+                for pixel in bytes.as_chunks_mut::<4>().0.iter_mut() {
                     pixel.swap(0, 2);
                 }
             }

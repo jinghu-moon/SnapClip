@@ -150,7 +150,12 @@ impl Glyph {
 /// full-strength grey rather than the muted grey the design asks for.
 pub fn tint_rgba_to_premultiplied_bgra(rgba: &[u8], colour: [u8; 4]) -> Vec<u8> {
     let mut out = vec![0u8; rgba.len()];
-    for (src, dst) in rgba.chunks_exact(4).zip(out.chunks_exact_mut(4)) {
+    for (src, dst) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<4>().0)
+    {
         let alpha = u32::from(src[3]) * u32::from(colour[3]) / 255;
         let channel = |value: u8, tint: u8| -> u8 {
             let tinted = u32::from(value) * u32::from(tint) / 255;

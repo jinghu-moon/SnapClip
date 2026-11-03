@@ -464,7 +464,7 @@ fn capture(spec: &Spec, shared: &Shared, tracker: &mut Option<Tracker>) -> Resul
             total_us.push(us as u64);
             read_us_all.push(read_us as u64);
             #[cfg(any(test, feature = "test-support"))]
-            if frames % 1000 == 0 {
+            if frames.is_multiple_of(1000) {
                 // The three counters that grow with frames rather than with rows: the two
                 // per-frame sample vectors and the image itself. Whatever tracks `ws` is the
                 // owner of the rise (docs/39 section 3).
@@ -1232,10 +1232,11 @@ mod tests {
             "the recycled gather is the fresh gather"
         );
         assert!(
-            again
-                .bytes
-                .chunks_exact(row)
-                .all(|line| line.chunks_exact(4).any(|pixel| pixel != [0, 0, 0, 255])),
+            again.bytes.chunks_exact(row).all(|line| line
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| *pixel != [0, 0, 0, 255])),
             "every row of the window is page content, not leftover zeros"
         );
         worker.recycle_preview(again.bytes);

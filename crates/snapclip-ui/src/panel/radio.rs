@@ -38,9 +38,7 @@ impl RadioGroup {
             PointerEvent::Enter => state.hovered = self.target_at(point),
             PointerEvent::Leave => state.hovered = None,
             PointerEvent::Down => {
-                let Some(index) = self.target_at(point) else {
-                    return None;
-                };
+                let index = self.target_at(point)?;
                 if !self.options[index].disabled {
                     state.pressed = Some(index);
                     state.focused = Some(index);

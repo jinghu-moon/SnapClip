@@ -97,7 +97,7 @@ pub(crate) const LOG_EVERY_FRAMES: u64 = 60;
 /// A status change always prints, the first frame always prints, and otherwise every
 /// [`LOG_EVERY_FRAMES`] frames. Pure so the rule can be tested without a console.
 pub(crate) fn should_log(frame: u64, status: Status, previous: Option<Status>) -> bool {
-    previous.map_or(true, |prev| prev != status) || frame % LOG_EVERY_FRAMES == 0
+    (previous != Some(status)) || frame.is_multiple_of(LOG_EVERY_FRAMES)
 }
 
 /// Automatic scrolling, as the panel shows it.
@@ -612,7 +612,9 @@ mod tests {
         let source = PixelSource::new(descriptor, 53);
         let hdr = |pixels: Vec<u8>| {
             let bytes = pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| {
                     [
                         f32::from(p[2]) / 100.0,
@@ -669,7 +671,9 @@ mod tests {
         assert!(
             restored
                 .as_bytes()
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .any(|p| half::f16::from_le_bytes([p[0], p[1]]).to_f32() > 1.0)
         );
     }
@@ -913,10 +917,11 @@ mod tests {
     fn the_cost_of_one_frame_at_the_field_size() {
         // Timing numbers are only meaningful in release: a debug build of an encoder of this kind
         // can be thirty times slower, which is how a plausible reading turns into a wrong decision.
-        assert!(
-            !cfg!(debug_assertions),
-            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
-        );
+        if cfg!(debug_assertions) {
+            panic!(
+                "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+            );
+        }
         let (w, h) = (2148u32, 1344u32);
         let page = page(w, 8 * h, 31);
         let mut tracker = Tracker::new(&window(&page, w, 0, h), w, h, 160);
@@ -1174,7 +1179,7 @@ mod scroll_format_tests {
         // the screen cap: at 100 screens a viewport of 163 is the tallest that still fits the
         // format's 16383 rows. Derived here rather than written down, so the next cap change reads
         // as a boundary shift and not as a broken test.
-        let fits = 16_383 / super::MAX_SCREENS as u32; // 163
+        let fits = 16_383 / super::MAX_SCREENS; // 163
         assert_eq!(
             scroll_format(SaveFormat::Webp, 1280, fits),
             (SaveFormat::Webp, None)

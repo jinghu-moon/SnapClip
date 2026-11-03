@@ -228,10 +228,9 @@ impl Drop for Scratch {
     }
 }
 fn archive_and_export(width: u32, height: u32) {
-    assert!(
-        !cfg!(debug_assertions),
-        "run this measurement with --release"
-    );
+    if cfg!(debug_assertions) {
+        panic!("run this measurement with --release");
+    }
     let root = Scratch(std::env::temp_dir().join(format!(
         "snapclip-hdr-resources-{}-{width}-{height}-{}",
         std::process::id(),

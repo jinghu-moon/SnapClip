@@ -743,7 +743,7 @@ fn describe_window(hwnd: isize) -> String {
 /// The correctness gates say nothing about cost, and the walk grew (backtracking, look-through,
 /// a `ChildWindowFromPointEx` per window-backed candidate), so every probe reports it: the
 /// refinement budget is 1500 ms per query, and a regression here is as real as a wrong box.
-fn print_latency_summary(label: &str, latencies: &mut Vec<f64>) {
+fn print_latency_summary(label: &str, latencies: &mut [f64]) {
     if latencies.is_empty() {
         return;
     }

@@ -18,17 +18,12 @@ const TILE_SIZE: i32 = 32;
 /// How the sampled colour is rendered in the magnifier info panel's primary
 /// slot. `S` cycles the whole set — `Hex → Rgb → Hsl → Hex` — so the panel
 /// shows exactly one live format at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorFormat {
+    #[default]
     Hex,
     Rgb,
     Hsl,
-}
-
-impl Default for ColorFormat {
-    fn default() -> Self {
-        Self::Hex
-    }
 }
 
 impl ColorFormat {

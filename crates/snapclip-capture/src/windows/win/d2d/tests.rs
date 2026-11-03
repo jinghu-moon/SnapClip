@@ -498,7 +498,9 @@ fn window_snap_hints_are_painted_but_never_exported() {
     );
     assert!(
         exported
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .all(|pixel| pixel == background.as_slice()),
         "hover/preview hints must never be exported"
     );
@@ -1247,7 +1249,9 @@ fn the_hovered_badge_keeps_its_white_text_readable() {
 
 #[test]
 fn mask_alpha_is_translucent_but_dark() {
-    assert!(MASK_ALPHA > 0.0 && MASK_ALPHA < 1.0);
+    const {
+        assert!(MASK_ALPHA > 0.0 && MASK_ALPHA < 1.0);
+    }
 }
 
 #[test]
@@ -1668,7 +1672,7 @@ fn font_cost_probe() {
             bytes.as_ptr().cast(),
             bytes.len() as u32,
             None,
-            &mut installed,
+            &raw mut installed,
         )
     };
     println!(
@@ -2830,7 +2834,7 @@ fn checkerboard_bgra(width: u32, height: u32, cell: u32) -> Vec<u8> {
     let mut pixels = vec![0u8; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
-            let light = ((x / cell) + (y / cell)) % 2 == 0;
+            let light = ((x / cell) + (y / cell)).is_multiple_of(2);
             let value = if light { 230 } else { 30 };
             let at = ((y * width + x) * 4) as usize;
             pixels[at] = value;
@@ -2861,7 +2865,7 @@ fn horizontal_contrast(pixels: &[u8], width: u32) -> f64 {
 
 fn mean_luma(pixels: &[u8]) -> f64 {
     let mut sum = 0f64;
-    for chunk in pixels.chunks_exact(4) {
+    for chunk in pixels.as_chunks::<4>().0.iter() {
         sum += chunk[0] as f64 + chunk[1] as f64 + chunk[2] as f64;
     }
     sum / (pixels.len() / 4).max(1) as f64

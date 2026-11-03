@@ -157,7 +157,7 @@ impl Layered {
     /// 整窗填一种颜色（传 straight alpha，这里自己做 premultiply）。
     fn fill(&mut self, rgba: [u8; 4]) {
         let [r, g, b, a] = rgba;
-        let premul = |c: u8| ((c as u32 * a as u32) / 255) as u32;
+        let premul = |c: u8| (c as u32 * a as u32) / 255;
         let pixel = (a as u32) << 24 | premul(b) << 16 | premul(g) << 8 | premul(r);
         let count = (self.width * self.height) as usize;
         for index in 0..count {
@@ -542,10 +542,10 @@ fn rounded_premultiplied(width: u32, height: u32, colour: [u8; 3], radius: u32) 
         bgra.extend_from_slice(&[colour[2], colour[1], colour[0], 255]);
     }
     snapclip_capture::artifact::round_corners(&mut bgra, width, height, radius);
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         let alpha = pixel[3] as u32;
-        for channel in 0..3 {
-            pixel[channel] = ((pixel[channel] as u32 * alpha) / 255) as u8;
+        for channel in &mut pixel[..3] {
+            *channel = ((*channel as u32 * alpha) / 255) as u8;
         }
     }
     bgra
@@ -558,7 +558,7 @@ fn write_bgra(window: &Layered, bgra: &[u8]) {
         (window.width * window.height * 4) as usize,
         "内容尺寸与 DIB 不符"
     );
-    for (index, pixel) in bgra.chunks_exact(4).enumerate() {
+    for (index, pixel) in bgra.as_chunks::<4>().0.iter().enumerate() {
         let value = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
         unsafe { *window.bits.add(index) = value };
     }

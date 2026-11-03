@@ -75,7 +75,7 @@ pub struct CaptureFailure {
 }
 
 enum WorkerEvent {
-    Ready(Result<PreparedFrame, CaptureFailure>),
+    Ready(Box<Result<PreparedFrame, CaptureFailure>>),
     /// Providers had to be (re)created on this request and failed; nothing
     /// was captured and nothing can be until the next session.
     InitializationFailed(CaptureError),
@@ -249,6 +249,12 @@ pub struct CaptureWorker {
     thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
+impl Default for CaptureWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CaptureWorker {
     pub fn new() -> Self {
         Self {
@@ -319,6 +325,7 @@ impl CaptureWorker {
         let current = self.mailbox.current_generation();
         match event {
             WorkerEvent::Ready(result) => {
+                let result = *result;
                 let stale = match &result {
                     Ok(frame) => frame.generation != current,
                     Err(failure) => failure.generation != current,
@@ -408,12 +415,12 @@ fn worker_main(mailbox: Arc<Mailbox>) {
                     started_at.elapsed().as_millis(),
                     request.requested_at.elapsed().as_millis()
                 );
-                WorkerEvent::Ready(Ok(PreparedFrame {
+                WorkerEvent::Ready(Box::new(Ok(PreparedFrame {
                     generation: request.generation,
                     monitor: request.monitor.clone(),
                     captured_at: Instant::now(),
                     frozen,
-                }))
+                })))
             }
             Err(error) => {
                 eprintln!(
@@ -427,11 +434,11 @@ fn worker_main(mailbox: Arc<Mailbox>) {
                 } else {
                     "provider"
                 };
-                WorkerEvent::Ready(Err(CaptureFailure {
+                WorkerEvent::Ready(Box::new(Err(CaptureFailure {
                     generation: request.generation,
                     error,
                     stage,
-                }))
+                })))
             }
         };
         mailbox.put_providers(providers);

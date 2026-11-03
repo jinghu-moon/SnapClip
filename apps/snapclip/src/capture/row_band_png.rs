@@ -231,7 +231,7 @@ impl PngRowBandWriter {
     pub fn write_rows(&mut self, first_row: u64, rows: &[u8]) -> Result<(), ExportError> {
         let row_bytes = self.meta.width * 4;
         let got = rows.len() as u64;
-        if got % row_bytes != 0 {
+        if !got.is_multiple_of(row_bytes) {
             return Err(ExportError::RowLength {
                 expected: row_bytes,
                 got,
@@ -258,7 +258,13 @@ impl PngRowBandWriter {
         // image's worth of RGBA in one buffer is the copy `P4.03` exists to delete.
         self.row.resize(row_bytes as usize, 0);
         for band in rows.chunks_exact(row_bytes as usize) {
-            for (dst, src) in self.row.chunks_exact_mut(4).zip(band.chunks_exact(4)) {
+            for (dst, src) in self
+                .row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(band.as_chunks::<4>().0.iter())
+            {
                 dst[0] = src[2];
                 dst[1] = src[1];
                 dst[2] = src[0];

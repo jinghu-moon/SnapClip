@@ -1206,7 +1206,7 @@ mod tests {
             0,
             "a restored window has no region again"
         );
-        unsafe { DeleteObject(probe as *mut core::ffi::c_void) };
+        unsafe { DeleteObject(probe) };
     }
 
     #[test]

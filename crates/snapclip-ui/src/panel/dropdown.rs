@@ -183,7 +183,7 @@ mod tests {
 
 #[cfg(windows)]
 pub mod d2d {
-    use super::{Dropdown, DropdownTarget};
+    use super::Dropdown;
     use crate::panel::d2d::PanelPainter;
     use snapclip_model::geometry::Rect;
     use windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush;
@@ -205,24 +205,21 @@ pub mod d2d {
             painter: &PanelPainter<'_>,
             labels: &[&str],
             format: &IDWriteTextFormat,
-            selected: Option<usize>,
-            hovered: Option<DropdownTarget>,
-            focused: bool,
             colors: DropdownColors<'_>,
         ) {
             painter.fill_round(self.button, 5, colors.button);
             painter.stroke_round(self.button, 5, colors.line, 1.0);
-            if focused {
+            if self.focused {
                 painter.stroke_round(self.button, 5, colors.focus, 2.0);
             }
-            if let Some(index) = selected.and_then(|index| labels.get(index)) {
+            if let Some(index) = self.selected.and_then(|index| labels.get(index)) {
                 painter.draw_text(index, format, inset_text(self.button), colors.text);
             }
             if let Some(menu) = self.menu {
                 painter.fill_round(menu, 6, colors.menu);
                 painter.stroke_round(menu, 6, colors.line, 1.0);
                 for (index, rect) in self.items.iter().enumerate() {
-                    if hovered == Some(DropdownTarget::Item(index)) {
+                    if self.hovered == Some(index) {
                         painter.fill_round(*rect, 4, colors.selected);
                     }
                     if let Some(label) = labels.get(index) {
@@ -230,7 +227,7 @@ pub mod d2d {
                             label,
                             format,
                             inset_text(*rect),
-                            if selected == Some(index) {
+                            if self.selected == Some(index) {
                                 colors.text
                             } else {
                                 colors.muted

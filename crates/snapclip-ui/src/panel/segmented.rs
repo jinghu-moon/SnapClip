@@ -35,9 +35,7 @@ impl SegmentState {
             PointerEvent::Enter => self.hovered = self.target_at(point),
             PointerEvent::Leave => self.hovered = None,
             PointerEvent::Down => {
-                let Some(index) = self.target_at(point) else {
-                    return None;
-                };
+                let index = self.target_at(point)?;
                 if !self.segments[index].disabled {
                     self.pressed = Some(index);
                     self.hovered = Some(index);

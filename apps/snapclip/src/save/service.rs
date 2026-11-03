@@ -232,10 +232,10 @@ fn trim_trailing(stem: &str) -> (String, bool) {
 fn illegal_stem_chars(stem: &str) -> Option<String> {
     let mut seen = Vec::new();
     for c in stem.chars() {
-        if matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control() {
-            if !seen.contains(&c) {
-                seen.push(c);
-            }
+        if (matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') || c.is_control())
+            && !seen.contains(&c)
+        {
+            seen.push(c);
         }
     }
     if seen.is_empty() {

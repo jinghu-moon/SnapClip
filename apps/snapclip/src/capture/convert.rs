@@ -201,7 +201,12 @@ fn row_bytes(
 fn swap_to_bgra(source: &[u8], target: &mut [u8], color: png::ColorType) {
     match color {
         png::ColorType::Rgba => {
-            for (source, target) in source.chunks_exact(4).zip(target.chunks_exact_mut(4)) {
+            for (source, target) in source
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(target.as_chunks_mut::<4>().0.iter_mut())
+            {
                 target[0] = source[2];
                 target[1] = source[1];
                 target[2] = source[0];
@@ -211,8 +216,8 @@ fn swap_to_bgra(source: &[u8], target: &mut [u8], color: png::ColorType) {
         // The sinks take four bytes per pixel, so an RGB master is widened with an opaque
         // alpha rather than silently losing its shape.
         png::ColorType::Rgb => {
-            let mut source = source.chunks_exact(3);
-            for target in target.chunks_exact_mut(4) {
+            let mut source = source.as_chunks::<3>().0.iter();
+            for target in target.as_chunks_mut::<4>().0.iter_mut() {
                 let Some(pixel) = source.next() else { break };
                 target[0] = pixel[2];
                 target[1] = pixel[1];
@@ -226,7 +231,7 @@ fn swap_to_bgra(source: &[u8], target: &mut [u8], color: png::ColorType) {
 
 /// One of the row sinks, behind one interface for the loop above.
 enum SinkWriter {
-    Jpeg(super::row_band_jpeg::JpgRowBandWriter),
+    Jpeg(Box<super::row_band_jpeg::JpgRowBandWriter>),
     Webp(super::webp_sink::WebpWriter),
     Bmp(BmpRowBandWriter),
 }
@@ -234,9 +239,9 @@ enum SinkWriter {
 impl SinkWriter {
     fn begin(format: SaveFormat, quality: u8, meta: &ImageMeta) -> Result<Self, ExportError> {
         match format {
-            SaveFormat::Jpeg => Ok(Self::Jpeg(
+            SaveFormat::Jpeg => Ok(Self::Jpeg(Box::new(
                 JpgRowBandSink::with_quality(quality).begin(meta)?,
-            )),
+            ))),
             SaveFormat::Webp => Ok(Self::Webp(WebpSink::new().begin(meta)?)),
             SaveFormat::Bmp => Ok(Self::Bmp(BmpRowBandWriter::begin(meta)?)),
             SaveFormat::Png => Err(ExportError::Sink(
@@ -245,10 +250,6 @@ impl SinkWriter {
         }
     }
 
-    #[expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "the BMP arm does not mutate the writer, but it shares this signature with the accumulators"
-    )]
     fn write_rows(
         &mut self,
         first_row: u64,
@@ -292,7 +293,7 @@ mod tests {
             encoder.set_depth(png::BitDepth::Eight);
             let mut writer = encoder.write_header().expect("header");
             let mut rgba = Vec::with_capacity(bgra.len());
-            for pixel in bgra.chunks_exact(4) {
+            for pixel in bgra.as_chunks::<4>().0.iter() {
                 rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
             }
             writer.write_image_data(&rgba).expect("rows");
@@ -540,10 +541,11 @@ mod tests {
     #[test]
     #[ignore = "measurement: transcodes one real PNG into every format and prints the table"]
     fn measure_formats_on_a_file() {
-        assert!(
-            !cfg!(debug_assertions),
-            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
-        );
+        if cfg!(debug_assertions) {
+            panic!(
+                "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+            );
+        }
         use std::time::Instant;
         let Ok(path) = std::env::var("SNAPCLIP_MEASURE_PNG") else {
             println!(
@@ -577,7 +579,7 @@ mod tests {
             match result {
                 Ok(conversion) => {
                     if format == SaveFormat::Png {
-                        baseline = u64::from(conversion.bytes);
+                        baseline = conversion.bytes;
                     }
                     let ratio = if baseline > 0 {
                         format!("{:.2}x png", conversion.bytes as f64 / baseline as f64)

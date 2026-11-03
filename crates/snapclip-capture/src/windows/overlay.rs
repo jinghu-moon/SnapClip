@@ -287,10 +287,12 @@ impl WindowsOverlay {
             .name("snapclip-capture-overlay".into())
             .spawn(move || {
                 overlay_thread(
-                    service,
-                    sink,
-                    clipboard,
-                    writer,
+                    OverlayPorts {
+                        service,
+                        sink,
+                        clipboard,
+                        writer,
+                    },
                     options,
                     thread_shared,
                     annotation_rx,
@@ -487,6 +489,14 @@ enum AnnotationGesture {
     },
     /// Drawing a new shape anchored at `start` (the draft tracks the pointer).
     Create { start: Point },
+}
+
+/// Capability ports shared by overlay startup and its controller.
+struct OverlayPorts {
+    service: Arc<CaptureService>,
+    sink: Arc<dyn CaptureEventSink>,
+    clipboard: Arc<dyn ClipboardWriter>,
+    writer: Arc<dyn ArtifactWriter>,
 }
 
 /// Owns every session-scoped resource. Lives only on the overlay thread.
@@ -738,16 +748,19 @@ struct OverlayController {
 
 impl OverlayController {
     fn new(
-        service: Arc<CaptureService>,
-        sink: Arc<dyn CaptureEventSink>,
-        clipboard: Arc<dyn ClipboardWriter>,
-        writer: Arc<dyn ArtifactWriter>,
+        ports: OverlayPorts,
         options: crate::window_detection::DetectionOptions,
         shared: Arc<Mutex<OverlayShared>>,
         annotation_rx: mpsc::Receiver<AnnotationCommand>,
         window: HWND,
         thread_id: u32,
     ) -> Self {
+        let OverlayPorts {
+            service,
+            sink,
+            clipboard,
+            writer,
+        } = ports;
         let metrics = WindowDetectionMetrics::new();
         let detector = DetectionWorker::new(thread_id, metrics.clone());
         // The refinement worker gets the pass-through flag this window's `WM_NCHITTEST` reads

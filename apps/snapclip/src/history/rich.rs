@@ -149,7 +149,6 @@ pub fn spans_to_lines(spans: &[Span], max_lines: usize, max_chars: usize) -> Vec
                 text.push('…');
             }
             used += keep + usize::from(separator) + usize::from(cut);
-            let mut text = text;
             if separator {
                 text.insert(0, ' ');
             }

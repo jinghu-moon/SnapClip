@@ -890,8 +890,8 @@ pub enum LabelWhere {
 /// Place the size label near `selection`'s top-left, ladder-style (docs/21 §5.22).
 ///
 /// 1. outside, above; 2. outside, below; 3. **inside** the box when the box is as large as the work
-/// area (a maximised window has no room outside, and dropping the label there loses the only words
-/// that say "窗口"); 4. beside the cursor, for a box that is both full-height and too narrow.
+///    area (a maximised window has no room outside, and dropping the label there loses the only words
+///    that say "窗口"); 4. beside the cursor, for a box that is both full-height and too narrow.
 ///
 /// `cursor` is only consulted for step 4; pass `None` and the label is dropped instead, which is
 /// what callers that have no cursor (exports, tests) want.
@@ -1053,8 +1053,7 @@ const REGION_HEAD_GAP_DIP: f32 = 8.0;
 const REGION_UNIT_BUTTON_DIP: f32 = 32.0;
 /// 分段器里选中块相对容器的内缩：选中背景要缩在容器内，不能与容器等大。
 const REGION_UNIT_INSET_DIP: f32 = 3.0;
-/// 分段器的外层圆角（内层按嵌套规则减掉实际内缩）。
-
+/// 倍率块的宽度。
 const REGION_SCALE_WIDTH_DIP: f32 = 46.0;
 
 /// 单位分段器与倍率块之间的间距：沿用它们原来并排放在页头里时的值。

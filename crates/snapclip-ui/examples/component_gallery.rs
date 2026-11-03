@@ -10,9 +10,9 @@ mod windows_gallery {
     use snapclip_model::geometry::{Point, Rect};
     use snapclip_ui::panel::d2d::{PanelPainter, SegmentColors};
     use snapclip_ui::panel::{
-        Button, ButtonState, Checkbox, CheckboxState, Dropdown, DropdownKey, DropdownTarget,
-        PointerEvent, RadioGroup, RadioGroupState, RadioOption, Segment, SegmentState, Slider,
-        SliderKey, Tag, TagState, Toast, Toggle, ToggleState, Tooltip,
+        Button, ButtonState, Checkbox, CheckboxState, Dropdown, DropdownKey, PointerEvent,
+        RadioGroup, RadioGroupState, RadioOption, Segment, SegmentState, Slider, SliderKey, Tag,
+        TagState, Toast, Toggle, ToggleState, Tooltip,
     };
     use snapclip_ui::panel::{
         ButtonColors, CheckboxColors, DropdownColors, FeedbackColors, RadioColors, SliderColors,
@@ -162,7 +162,11 @@ mod windows_gallery {
             }
             let width = (client.right - client.left).max(1) as u32;
             let height = (client.bottom - client.top).max(1) as u32;
-            if self.target.is_none() {
+            if let Some(target) = &self.target {
+                unsafe {
+                    target.Resize(&D2D_SIZE_U { width, height })?;
+                }
+            } else {
                 self.target = Some(unsafe {
                     self.d2d_factory.CreateHwndRenderTarget(
                         &D2D1_RENDER_TARGET_PROPERTIES {
@@ -179,13 +183,6 @@ mod windows_gallery {
                         },
                     )?
                 });
-            } else {
-                unsafe {
-                    self.target
-                        .as_ref()
-                        .expect("target initialized")
-                        .Resize(&D2D_SIZE_U { width, height })?;
-                }
             }
             Ok(self.target.as_ref().expect("target initialized"))
         }
@@ -241,9 +238,6 @@ mod windows_gallery {
                 &painter,
                 &["PNG", "JPG", "WEBP"],
                 &self.text_format,
-                self.dropdown.selected,
-                self.dropdown.hovered.map(DropdownTarget::Item),
-                self.dropdown.focused,
                 DropdownColors {
                     button: &fill,
                     menu: &menu,
@@ -470,7 +464,7 @@ mod windows_gallery {
             self.tooltip.tick(16);
             self.toast.tick(16);
             unsafe {
-                InvalidateRect(Some(hwnd), None, false);
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
         }
     }
@@ -565,7 +559,7 @@ mod windows_gallery {
                         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
                     }
                     unsafe {
-                        EndPaint(hwnd, &ps);
+                        let _ = EndPaint(hwnd, &ps);
                     }
                 }
                 LRESULT(0)
@@ -591,7 +585,7 @@ mod windows_gallery {
                     s.segmented.hovered = s.segmented.target_at(p);
                     s.tooltip.set_hovered(s.button_state.hovered);
                     unsafe {
-                        InvalidateRect(Some(hwnd), None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 LRESULT(0)
@@ -626,7 +620,7 @@ mod windows_gallery {
                         }
                     }
                     unsafe {
-                        InvalidateRect(Some(hwnd), None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 LRESULT(0)
@@ -652,8 +646,8 @@ mod windows_gallery {
                     s.tag.pointer_event(&mut s.tag_state, PointerEvent::Up, p);
                     s.segmented.pointer_event(PointerEvent::Up, p);
                     unsafe {
-                        ReleaseCapture();
-                        InvalidateRect(Some(hwnd), None, false);
+                        let _ = ReleaseCapture();
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 LRESULT(0)
@@ -685,7 +679,7 @@ mod windows_gallery {
                         }
                     }
                     unsafe {
-                        InvalidateRect(Some(hwnd), None, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 LRESULT(0)
@@ -736,12 +730,12 @@ mod windows_gallery {
         };
         unsafe {
             SetTimer(Some(hwnd), TIMER_ID, 16, None);
-            SetFocus(Some(hwnd));
+            let _ = SetFocus(Some(hwnd));
         }
         let mut message = MSG::default();
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.into() {
             unsafe {
-                TranslateMessage(&message);
+                let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
         }

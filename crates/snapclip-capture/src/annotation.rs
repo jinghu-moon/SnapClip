@@ -291,6 +291,12 @@ pub struct AnnotationDocument {
     next_id: AnnotationId,
 }
 
+impl Default for AnnotationDocument {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AnnotationDocument {
     pub fn new() -> Self {
         Self {
@@ -871,7 +877,7 @@ mod tests {
         let item = rect_item(20, 20, 60, 40);
         let draft_id = item.id;
         doc.set_draft(item);
-        assert!(doc.can_undo() == false); // draft itself is not undoable yet
+        assert!(!doc.can_undo()); // draft itself is not undoable yet
         doc.commit_draft();
         assert_eq!(doc.items().len(), 1);
         assert_eq!(doc.selected_id(), Some(draft_id));

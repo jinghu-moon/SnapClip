@@ -266,7 +266,7 @@ impl Win32Renderer {
         let pixels = frozen
             .pixels()
             .map_err(|error| format!("frozen frame pixels unavailable: {error}"))?;
-        self.d2d.update_pixels(&pixels)
+        self.d2d.update_pixels(pixels)
     }
 
     /// Draw and present one frame.
@@ -319,7 +319,7 @@ impl Win32Renderer {
         let view = self.view(state, annotations);
         self.d2d.render(&view)?;
         self.d2d.present()?;
-        return self.composition.commit();
+        self.composition.commit()
     }
 
     /// The one description of a frame: the paint pass draws exactly this, and the pointer pass

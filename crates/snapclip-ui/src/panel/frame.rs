@@ -710,7 +710,7 @@ impl Frame<'_> {
         // by the line itself. The limit's box is drawn only while its line is: its input used to be
         // a control that was hidden when the switch was off, which left the frame's own box behind.
         let limit_line =
-            crate::panel::quality_line(self.format, self.limit.map_or(false, |limit| limit.on));
+            crate::panel::quality_line(self.format, self.limit.is_some_and(|limit| limit.on));
         // The states come from the field list, one per field: a field that is added later is drawn
         // from its own entry rather than from whatever state the window tracked before.
         for (id, state) in self.fields.iter() {
@@ -913,22 +913,22 @@ impl Frame<'_> {
         // not it shows. The icon is the design's info circle at the sentence's own size and in
         // `--warning`, the token `.warn-hint` uses (`:254`); the sentence follows it after the
         // design's four dip gap, in the same ten dip face the quality row's hint uses (`:262`).
-        if self.warn_hint {
-            if let Some(hint_format) = self.hint {
-                let icon = crate::panel::warn_hint_icon_rect(self.metrics, self.rects, self.scale);
-                Self::draw_glyph(
-                    painter,
-                    crate::panel::icons::Glyph::InfoCircle,
-                    icon,
-                    crate::panel::WARNING_RGBA,
-                )?;
-                painter.draw_text(
-                    crate::panel::WARN_HINT_TEXT,
-                    hint_format,
-                    crate::panel::warn_hint_text_rect(self.metrics, self.rects, self.scale),
-                    &self.brushes.warning_text,
-                );
-            }
+        if self.warn_hint
+            && let Some(hint_format) = self.hint
+        {
+            let icon = crate::panel::warn_hint_icon_rect(self.metrics, self.rects, self.scale);
+            Self::draw_glyph(
+                painter,
+                crate::panel::icons::Glyph::InfoCircle,
+                icon,
+                crate::panel::WARNING_RGBA,
+            )?;
+            painter.draw_text(
+                crate::panel::WARN_HINT_TEXT,
+                hint_format,
+                crate::panel::warn_hint_text_rect(self.metrics, self.rects, self.scale),
+                &self.brushes.warning_text,
+            );
         }
 
         // The quality row's segmented control: a track with a block marking the chosen option
@@ -944,50 +944,50 @@ impl Frame<'_> {
         // The size limit's switch (`:631`) sits at the right end of the quality row's label line,
         // on or off: turning it on is the whole point of it, so it cannot hide while it is off.
         // The track is `.switch-track` (`:297`), the knob its `::after` (`:298`, `:300`).
-        if let Some(limit) = self.limit {
-            if let Some(format) = self.row_label {
-                let switch = crate::panel::limit_switch_rect(
-                    self.metrics,
-                    self.rects,
-                    self.scale,
-                    limit.switch_word_px,
-                );
-                let track = crate::panel::limit_track_rect(switch, self.scale);
-                let track_radius = track.height() / 2;
-                if limit.on {
-                    painter.fill_round(track, track_radius, &self.brushes.accent);
-                } else {
-                    painter.fill_round(track, track_radius, &self.brushes.field_fill);
-                    let edge = self.scale.max(1.0);
-                    painter.stroke_round(track, track_radius, &self.brushes.line, edge);
-                }
-                let knob = crate::panel::limit_knob_rect(track, self.scale, limit.on);
-                let centre = (
-                    (knob.left + knob.right) as f32 / 2.0,
-                    (knob.top + knob.bottom) as f32 / 2.0,
-                );
-                let knob_radius = knob.width() as f32 / 2.0;
-                let knob_brush = if limit.on {
-                    &self.brushes.text
-                } else {
-                    &self.brushes.muted
-                };
-                painter.fill_circle(centre, knob_radius, knob_brush);
-                let gap =
-                    (crate::panel::field::LIMIT_SWITCH_GAP_DIP as f32 * self.scale).round() as i32;
-                let word = Rect::new(track.right + gap, switch.top, switch.right, switch.bottom);
-                let word_brush = if limit.on {
-                    &self.brushes.text
-                } else {
-                    &self.brushes.muted
-                };
-                painter.draw_text(
-                    crate::panel::field::LIMIT_SWITCH_LABEL,
-                    format,
-                    word,
-                    word_brush,
-                );
+        if let Some(limit) = self.limit
+            && let Some(format) = self.row_label
+        {
+            let switch = crate::panel::limit_switch_rect(
+                self.metrics,
+                self.rects,
+                self.scale,
+                limit.switch_word_px,
+            );
+            let track = crate::panel::limit_track_rect(switch, self.scale);
+            let track_radius = track.height() / 2;
+            if limit.on {
+                painter.fill_round(track, track_radius, &self.brushes.accent);
+            } else {
+                painter.fill_round(track, track_radius, &self.brushes.field_fill);
+                let edge = self.scale.max(1.0);
+                painter.stroke_round(track, track_radius, &self.brushes.line, edge);
             }
+            let knob = crate::panel::limit_knob_rect(track, self.scale, limit.on);
+            let centre = (
+                (knob.left + knob.right) as f32 / 2.0,
+                (knob.top + knob.bottom) as f32 / 2.0,
+            );
+            let knob_radius = knob.width() as f32 / 2.0;
+            let knob_brush = if limit.on {
+                &self.brushes.text
+            } else {
+                &self.brushes.muted
+            };
+            painter.fill_circle(centre, knob_radius, knob_brush);
+            let gap =
+                (crate::panel::field::LIMIT_SWITCH_GAP_DIP as f32 * self.scale).round() as i32;
+            let word = Rect::new(track.right + gap, switch.top, switch.right, switch.bottom);
+            let word_brush = if limit.on {
+                &self.brushes.text
+            } else {
+                &self.brushes.muted
+            };
+            painter.draw_text(
+                crate::panel::field::LIMIT_SWITCH_LABEL,
+                format,
+                word,
+                word_brush,
+            );
         }
 
         // The line under the quality label carries one of three things and never two (`:232`): the
@@ -1062,62 +1062,62 @@ impl Frame<'_> {
         // it could not (`:235`). The note's space is reserved in the layout whether or not there is
         // a note, so a limit that starts being exceeded does not move the rows under it.
         if let Some(limit) = self.limit {
-            if let Some(note) = limit.note {
-                if let Some(format) = self.hint {
-                    let rect = crate::panel::limit_note_rect(self.metrics, self.rects, self.scale);
-                    let brush = if limit.note_warn {
-                        &self.brushes.warning_text
-                    } else {
-                        &self.brushes.muted
-                    };
-                    painter.draw_text(note, format, rect, brush);
-                }
+            if let Some(note) = limit.note
+                && let Some(format) = self.hint
+            {
+                let rect = crate::panel::limit_note_rect(self.metrics, self.rects, self.scale);
+                let brush = if limit.note_warn {
+                    &self.brushes.warning_text
+                } else {
+                    &self.brushes.muted
+                };
+                painter.draw_text(note, format, rect, brush);
             }
-            if limit.auto_shrink_px > 0 {
-                if let Some(format) = self.hint {
-                    let rect = crate::panel::auto_shrink_rect(
-                        self.metrics,
-                        self.rects,
-                        self.scale,
-                        limit.auto_shrink_px,
-                    );
-                    painter.draw_text(
-                        crate::panel::field::AUTO_SHRINK_LABEL,
-                        format,
-                        rect,
-                        &self.brushes.accent_text,
-                    );
-                }
+            if limit.auto_shrink_px > 0
+                && let Some(format) = self.hint
+            {
+                let rect = crate::panel::auto_shrink_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    limit.auto_shrink_px,
+                );
+                painter.draw_text(
+                    crate::panel::field::AUTO_SHRINK_LABEL,
+                    format,
+                    rect,
+                    &self.brushes.accent_text,
+                );
             }
             // The estimate row (`:666`): the number under its label, the state beside it.
             let fill_row = crate::panel::fill_row_shown(self.format);
-            if let Some(estimate) = limit.estimate {
-                if let Some(format) = self.number.or(self.chip) {
-                    let rect = crate::panel::estimate_value_rect(
-                        self.metrics,
-                        self.rects,
-                        self.scale,
-                        fill_row,
-                    );
-                    painter.draw_text(estimate, format, rect, &self.brushes.text);
-                }
+            if let Some(estimate) = limit.estimate
+                && let Some(format) = self.number.or(self.chip)
+            {
+                let rect = crate::panel::estimate_value_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    fill_row,
+                );
+                painter.draw_text(estimate, format, rect, &self.brushes.text);
             }
-            if let Some(state) = limit.encode_state {
-                if let Some(format) = self.hint {
-                    let rect = crate::panel::encode_state_rect(
-                        self.metrics,
-                        self.rects,
-                        self.scale,
-                        limit.encode_state_px,
-                        fill_row,
-                    );
-                    let brush = if limit.encode_done {
-                        &self.brushes.accent_text
-                    } else {
-                        &self.brushes.muted
-                    };
-                    painter.draw_text(state, format, rect, brush);
-                }
+            if let Some(state) = limit.encode_state
+                && let Some(format) = self.hint
+            {
+                let rect = crate::panel::encode_state_rect(
+                    self.metrics,
+                    self.rects,
+                    self.scale,
+                    limit.encode_state_px,
+                    fill_row,
+                );
+                let brush = if limit.encode_done {
+                    &self.brushes.accent_text
+                } else {
+                    &self.brushes.muted
+                };
+                painter.draw_text(state, format, rect, brush);
             }
         }
 
@@ -1222,23 +1222,19 @@ impl Frame<'_> {
         }
         // The options' words belong to the control, so they are shown exactly when it is: PNG draws
         // the hint instead and has no options to name (`:639`, `:1097`).
-        if crate::panel::quality_segment_shown(self.format) {
-            if let Some(format) = self.chip {
-                for (index, word) in crate::panel::field::QUALITY_OPTION_WORDS.iter().enumerate() {
-                    let rect = crate::panel::quality_option_rect(
-                        self.metrics,
-                        self.rects,
-                        self.scale,
-                        index,
-                    );
-                    // `:266` the options are `--muted`; `:267` the chosen one is `--text`.
-                    let brush = if index == self.quality {
-                        &self.brushes.text
-                    } else {
-                        &self.brushes.muted
-                    };
-                    painter.draw_text(word, format, rect, brush);
-                }
+        if crate::panel::quality_segment_shown(self.format)
+            && let Some(format) = self.chip
+        {
+            for (index, word) in crate::panel::field::QUALITY_OPTION_WORDS.iter().enumerate() {
+                let rect =
+                    crate::panel::quality_option_rect(self.metrics, self.rects, self.scale, index);
+                // `:266` the options are `--muted`; `:267` the chosen one is `--text`.
+                let brush = if index == self.quality {
+                    &self.brushes.text
+                } else {
+                    &self.brushes.muted
+                };
+                painter.draw_text(word, format, rect, brush);
             }
         }
 
@@ -1551,22 +1547,18 @@ impl Frame<'_> {
                 .conflict
                 .zip(self.conflict_widths)
                 .map(|(link, measured)| measured[link.index()]);
-            if let (Some((level, text)), Some(format)) = (self.status, self.status_format) {
-                if !text.is_empty() {
-                    let rect = crate::panel::footer_status_rect(
-                        self.metrics,
-                        self.scale,
-                        widths,
-                        link_width,
-                    );
-                    let colour = match level {
-                        crate::copy::Level::Error => &self.brushes.danger,
-                        // `--warning` (`:23`), not the field border's yellow: `.status.is-warning`
-                        // is the token the design uses for a warning *sentence*.
-                        crate::copy::Level::Warn => &self.brushes.warning_text,
-                    };
-                    painter.draw_text(text, format, rect, colour);
-                }
+            if let (Some((level, text)), Some(format)) = (self.status, self.status_format)
+                && !text.is_empty()
+            {
+                let rect =
+                    crate::panel::footer_status_rect(self.metrics, self.scale, widths, link_width);
+                let colour = match level {
+                    crate::copy::Level::Error => &self.brushes.danger,
+                    // `--warning` (`:23`), not the field border's yellow: `.status.is-warning`
+                    // is the token the design uses for a warning *sentence*.
+                    crate::copy::Level::Warn => &self.brushes.warning_text,
+                };
+                painter.draw_text(text, format, rect, colour);
             }
 
             // `:676` the conflict link, when the name about to be written is already a file. It is
@@ -1707,16 +1699,16 @@ impl Frame<'_> {
             // format is leading aligned — it is the size shortcuts' format — so the value's left
             // edge is computed from its measured width instead of changing that format's alignment,
             // which would move the shortcuts' words.
-            if let (Some(values), Some(value_format)) = (self.var_values, self.preset_label) {
-                if let Some(value) = values.get(index) {
-                    let width = painter.measure_text_width(value, value_format)? as i32;
-                    painter.draw_text(
-                        value,
-                        value_format,
-                        Rect::new(text.right - width, item.top, text.right, item.bottom),
-                        &self.brushes.muted,
-                    );
-                }
+            if let (Some(values), Some(value_format)) = (self.var_values, self.preset_label)
+                && let Some(value) = values.get(index)
+            {
+                let width = painter.measure_text_width(value, value_format)? as i32;
+                painter.draw_text(
+                    value,
+                    value_format,
+                    Rect::new(text.right - width, item.top, text.right, item.bottom),
+                    &self.brushes.muted,
+                );
             }
         }
         Ok(())

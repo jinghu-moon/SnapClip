@@ -109,12 +109,10 @@ impl Thumb {
         let dirty_to = (top + i64::from(to) + k - 1).div_euclid(k);
         // Borrow the two scratch buffers once for the whole dirty range: the column spans and the
         // channel sums are the same for every row, and a frame usually refreshes dozens of them.
-        let mut sums = std::mem::take(&mut self.sums);
         let spans = std::mem::take(&mut self.spans);
         for t in dirty_from..dirty_to {
-            self.compute(t, canvas, first, canvas_rows, top, &spans, &mut sums);
+            self.compute(t, canvas, first, canvas_rows, top, &spans);
         }
-        self.sums = sums;
         self.spans = spans;
     }
 
@@ -154,8 +152,8 @@ impl Thumb {
         canvas_rows: u32,
         top: i64,
         spans: &[(usize, usize)],
-        sums: &mut [u32],
     ) {
+        let sums = &mut self.sums;
         let k = i64::from(self.k);
         let src_row = (self.src_width * 4) as usize;
         let lo = (t * k - top).max(0);
@@ -229,10 +227,11 @@ mod tests {
         // Timing numbers are only meaningful in release. A debug build of the AVIF encoder is about
         // thirty times slower, which is how a four kilobyte per second reading became eighty seven
         // seconds for one frame and nearly led to the format being dropped.
-        assert!(
-            !cfg!(debug_assertions),
-            "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
-        );
+        if cfg!(debug_assertions) {
+            panic!(
+                "this measurement must run with --release: cargo test --release ... -- --ignored --nocapture"
+            );
+        }
         use std::time::Instant;
         const W: usize = 240;
         const K: usize = 6;
@@ -254,26 +253,21 @@ mod tests {
         // it cannot be dropped as dead code, which is what makes the two numbers compare fairly.
         static SINK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let scale = 1.0 / per_pixel as f64;
-        let variants: [(&str, fn(&mut [u8], &[u64], u64, f64)); 3] = [
+        type Writeback = fn(&mut [u8], &[u64], u64, f64);
+        let variants: [(&str, Writeback); 3] = [
             ("integer-div", |out, sums, d, _| {
                 for (value, &sum) in out.as_chunks_mut::<4>().0.iter_mut().zip(sums) {
-                    for c in 0..4 {
-                        value[c] = ((sum + d / 2) / d) as u8;
-                    }
+                    value.fill(((sum + d / 2) / d) as u8);
                 }
             }),
             ("f64-scale", |out, sums, _, scale| {
                 for (value, &sum) in out.as_chunks_mut::<4>().0.iter_mut().zip(sums) {
-                    for c in 0..4 {
-                        value[c] = (sum as f64 * scale).round() as u8;
-                    }
+                    value.fill((sum as f64 * scale).round() as u8);
                 }
             }),
             ("f64-div", |out, sums, d, _| {
                 for (value, &sum) in out.as_chunks_mut::<4>().0.iter_mut().zip(sums) {
-                    for c in 0..4 {
-                        value[c] = (sum as f64 / d as f64).round() as u8;
-                    }
+                    value.fill((sum as f64 / d as f64).round() as u8);
                 }
             }),
         ];

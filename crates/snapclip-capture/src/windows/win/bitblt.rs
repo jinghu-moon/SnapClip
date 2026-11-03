@@ -167,7 +167,14 @@ mod tests {
                     (captured.width * captured.height * 4) as usize
                 );
                 // A real desktop is not uniformly transparent.
-                assert!(captured.pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+                assert!(
+                    captured
+                        .pixels
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|pixel| pixel[3] != 0)
+                );
             }
             // A locked or disconnected desktop refuses BitBlt (`0x80070005`, R-20). Running the
             // test with `--ignored` is asking for a live desktop, so a refusal means the

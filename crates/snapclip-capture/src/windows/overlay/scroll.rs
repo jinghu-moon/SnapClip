@@ -88,10 +88,8 @@ fn trace_preview(preview: &crate::scroll::Preview, layout: &Layout) {
     if worth_it {
         DUMPS.fetch_add(1, Ordering::Relaxed);
     }
-    if worth_it {
-        if let Some(path) = write_preview_bmp(preview, image_row) {
-            eprintln!("[snapclip][scroll] thumb_dump={path}");
-        }
+    if worth_it && let Some(path) = write_preview_bmp(preview, image_row) {
+        eprintln!("[snapclip][scroll] thumb_dump={path}");
     }
 }
 
@@ -278,13 +276,12 @@ impl OverlayController {
             selection.height().max(1) as u32,
         );
         self.scroll_save_format = effective;
-        match lowered {
-            Some(reason) => eprintln!(
+        if let Some(reason) = lowered {
+            eprintln!(
                 "[snapclip][scroll] format={} lowered to {} before scrolling: {reason}",
                 preferred.label(),
                 effective.label()
-            ),
-            None => {}
+            )
         }
         eprintln!(
             "[snapclip][scroll] save format={} (chosen {})",
@@ -663,8 +660,9 @@ mod tests {
         }
 
         /// Records what reached the clipboard: the size, where the pixels lived, and the PNG.
+        type CopiedImage = (u32, u32, usize, usize, Option<PathBuf>);
         #[derive(Default)]
-        struct Recorder(Mutex<Vec<(u32, u32, usize, usize, Option<PathBuf>)>>);
+        struct Recorder(Mutex<Vec<CopiedImage>>);
 
         impl ClipboardWriter for Recorder {
             fn copy_text(&self, _text: &str) {}

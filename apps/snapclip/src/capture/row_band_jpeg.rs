@@ -177,7 +177,7 @@ impl JpgRowBandWriter {
     pub fn write_rows(&mut self, first_row: u64, rows: &[u8]) -> Result<(), ExportError> {
         let row_bytes = self.meta.width * 4;
         let got = rows.len() as u64;
-        if row_bytes == 0 || got % row_bytes != 0 {
+        if row_bytes == 0 || !got.is_multiple_of(row_bytes) {
             return Err(ExportError::RowLength {
                 expected: row_bytes,
                 got,

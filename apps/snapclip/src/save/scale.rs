@@ -166,7 +166,7 @@ fn share_percent(part: u32, whole: u32) -> u32 {
 /// anything else; pixels that were already opaque come back unchanged.
 pub fn over_fill(bgra: &[u8], fill: [u8; 3]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bgra.len());
-    for pixel in bgra.chunks_exact(4) {
+    for pixel in bgra.as_chunks::<4>().0.iter() {
         let alpha = u32::from(pixel[3]);
         if alpha == 255 {
             out.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);

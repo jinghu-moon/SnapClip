@@ -59,7 +59,7 @@ pub fn register_number_font() {
             NUMBER_SUBSET.as_ptr().cast(),
             NUMBER_SUBSET.len() as u32,
             None,
-            &mut installed,
+            &raw mut installed,
         );
     });
 }

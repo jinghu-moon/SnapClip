@@ -170,13 +170,13 @@ impl Drop for Tiles {
     fn drop(&mut self) {
         // The file is the store's own; losing it with the store is the contract (docs/35 §5.3).
         self.file.take();
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "[snapclip][scroll] the tile file {} was left behind: {error}",
-                    self.path.display()
-                );
-            }
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "[snapclip][scroll] the tile file {} was left behind: {error}",
+                self.path.display()
+            );
         }
     }
 }
@@ -1016,8 +1016,7 @@ mod tests {
             64 * VIEW,
             snapclip_model::PixelFormat::Bgra8Unorm,
         );
-        let mut value = 2u8;
-        for step in 0..8u32 {
+        for (step, value) in (2u8..).take(8).enumerate() {
             let growth = 90;
             let band = (VIEW / 2).max(growth + VIEW / 4).min(VIEW);
             let src = band_src(value, band);
@@ -1040,7 +1039,6 @@ mod tests {
                     bad.map(|r| b[r * row])
                 );
             }
-            value += 1;
         }
     }
 }

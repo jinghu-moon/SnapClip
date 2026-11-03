@@ -95,7 +95,7 @@ mod tests {
     /// Presence is the trigger, and it is read without the process environment.
     #[test]
     fn the_presence_of_the_variable_is_what_asks_for_the_panel() {
-        assert!(StartupOptions::from_presence(None).open_save_panel == false);
+        assert!(!StartupOptions::from_presence(None).open_save_panel);
         assert!(StartupOptions::from_presence(Some(OsString::from("1"))).open_save_panel);
         assert!(StartupOptions::from_presence(Some(OsString::from(""))).open_save_panel);
         assert!(
