@@ -578,16 +578,14 @@ cargo test --release -p snapclip-pin --lib paint_pin_cost -- --ignored --nocaptu
 |---|---|---|---|
 | `PinManager` | `PinManager` | `crates/snapclip-pin/src/manager.rs` | 已实现（F3/F6 生命周期协调） |
 | `PinCommand` | `PinCommand` | `crates/snapclip-pin/src/manager.rs` | 已实现（复制命令由应用执行） |
-| `PinEvent` | `PinEvent` | `crates/snapclip-pin/src/host.rs` | 已实现 |
+| 准备完成回执 | `screenshot_ready` | `crates/snapclip-pin/src/manager.rs` | 已实现（首次上传/绘制后确认，取代 native PinEvent） |
 | `PinSource` | `PinSource` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（转发句柄，形态与原计划不同，见 §3.4） |
 | `SelectionProvider` | `SelectionProvider` | `apps/snapclip/src/capture/pin_source.rs` | 已实现（共享源与创建成功后的条件消费） |
 | — | `OverlayShared::selection` | `crates/snapclip-capture/src/windows/overlay.rs` | 已实现（像素真正待的地方，`publish_selection` 写入） |
 | — | `PinSelection` | `crates/snapclip-pin/src/lib.rs` | 已实现 |
-| `ImageSource` | `ImageSource` | `crates/snapclip-pin/src/source.rs` | 已实现 |
-| native 宿主句柄 | `NativeImages` | `crates/snapclip-pin/src/host.rs` | 已实现（当前 F6 SDR 宿主，迁移后删除） |
-| `PinWindowState` | `PinWindowState` | `crates/snapclip-pin/src/host.rs` | 已实现 |
-| — | `PinRequest` | `crates/snapclip-pin/src/host.rs` | 已实现（原计划的 `PinCommand` 位） |
-| — | `PinHandle` | `crates/snapclip-pin/src/host.rs` | 已实现 |
+| F6 图片画布 | `ScreenshotView` | `crates/snapclip-pin/src/screenshot.rs` | 已实现（共用 Yue GPU 资源，旧 native 宿主已删除） |
+| 来源像素 | `PinImage` | `crates/snapclip-model/src/pin.rs` | 已实现（共享 PixelBuffer，取代 DIB ImageSource） |
+| — | `PinHandle` | `crates/snapclip-pin/src/manager.rs` | 已实现（统一编号与注册表） |
 | `PixelFormat` | `PixelFormat` | `crates/snapclip-model/src/capture.rs` | 已有 |
 | `PayloadRef` | `PayloadRef` | `crates/snapclip-model/src/payload.rs` | 已有 |
 | `ClipboardBlobStore` | `ClipboardBlobStore` | `crates/snapclip-history/src/blob_store.rs` | 已有 |
