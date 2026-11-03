@@ -1,6 +1,6 @@
 # 53 · HDR 捕获、母版、保存面板与贴图接入方案
 
-初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源与有界导出已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§22。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；workspace 两种模式的 all-targets strict Clippy 已通过。AVIF 门禁关闭，真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
+初次设计：2026-11-03；更新：2026-11-04。状态：**源像素与母版、WGC/D2D 内部高精度链路、输出能力快照、生产滚动来源合同、HDR PNG16、保存面板策略、F3/F6 共用 GPUI/Yue、SDR/HDR 复制、历史保真源、有界导出与登记失败恢复已分批实现。** F6 旧 GDI 宿主已删除，Pin 保留 FP16/scRGB 原始 Arc；当前证据和边界见 §12～§25。Release 4K/45MP CPU 归档／导出及 20 次原生窗口释放／空闲渲染已验证；workspace 两种模式的 all-targets strict Clippy 已通过。AVIF 已补独立 CPU 探针，候选 Identity/RGB 解码数值失败，尚未生产接线；真实 HDR/双屏/DPI/设备恢复、VRAM 及端到端性能仍未验收；**生产 HDR 捕获门禁保持关闭，不代表完整支持 HDR。**
 
 通用像素、色彩、GPUI／Windows输出、依赖选择及官方资料统一见相邻Yue仓库的 [27 · Windows HDR图片与显示管线](../../GPUI-Yue-Component/docs/27-hdr-pipeline.md)。本文只定义SnapClip的业务和迁移，不复制第二套HDR框架。
 
@@ -572,7 +572,7 @@ CaptureArtifactStore 校验 owned 目录、尺寸/编码、完整文件 hash 和
 
 日志为 `target/hdr-history-{red,png-red,db-final,new-tests,replay-tests,save-ui,workspace,headless,check,clippy-final,ui-final,integration}.log` 和 `hdr-history-app-clippy.jsonl`。依赖隔离沿用 §12.3 本机快照，未混入 Yue 并行虚拟列表重构；快照/临时脚本/测试产物不提交。F6 Release probe 的新增成功证据为 `target/hdr-f6-native-release.log`。
 
-尚未验证的真实 HDR/双屏/DPI、系统剪贴板接收方行为、设备恢复、RSS/VRAM/20 次替换/空闲重绘仍保持未验收；注册失败可能留下未注册母版（明确报错并保留源，暂不自动扫除）。生产 HDR 捕获门禁继续关闭。
+尚未验证的真实 HDR/双屏/DPI、系统剪贴板接收方行为、设备恢复、RSS/VRAM/20 次替换/空闲重绘仍保持未验收；本节完成时注册失败仍可能留下未注册母版（明确报错并保留源，后续恢复已补于 §23）。生产 HDR 捕获门禁继续关闭。
 
 ## 18. 扩展回归暴露的既有问题（2026-11-04）
 
@@ -736,3 +736,79 @@ Release 资源测量也重新构建、逐项独立进程执行，各 **1 passed*
 | 端到端与 GPU 预算 | Release 的 4K／滚动长图／45MP／多贴图，冻结到可见与交互 P50／P95、VRAM／进程私有字节、20 次替换后 GPU 残留；CPU 行带测量和小窗生命周期不构成这些指标 |
 
 验收前记录 Windows build、GPU／驱动、显示器／HDR 状态、DPI、文件 hash、构建提交及每条命令结果；缺少硬件条件的格子明确写未测。只有矩阵满足后，才另行决定是否开放生产 HDR 捕获。
+
+## 23. 无需实屏的历史登记失败恢复（2026-11-04）
+
+### 23.1 问题与所有权
+
+§17 的已知缺口是两个持久存储之间没有交接记录：PNG／SCPX 已发布，SQLite 登记失败后只有错误，后续无法发现该母版。SQLite 内部事务已经正确，删除原图或再造一套垃圾回收策略不能解决这个问题。
+
+`snapclip-history::store::capture_recovery` 在既有单数据库写线程中增加有界的待登记记录：
+
+1. 先按原合同校验源文件归属、fingerprint、尺寸／位深／元数据及真实 SDR 缩略图。
+2. 在第一次 SQLite 查询前，把 `version/id/source/thumbnail` 写到 `artifacts/pending-captures/<blake3(id)>.json`；临时文件 `create_new`、写完 `sync_all` 后 rename。记录不包含完整源像素，读取上限为 5 MiB，检查文件类型、版本及文件名身份。
+3. 登记事务失败或首次查询失败，保留母版和待登记记录并报错；App 的错误包含保留原图的实际路径。
+4. 下次 `Store::open` 逐份校验后重试；仍失败或损坏／越界／冲突的记录保留并记录错误，不阻止其他有效记录恢复。相同 id+不可变源幂等，不能替换已存在的其他源或普通 publication。
+5. 只有提交成功后清理对应记录；提交后崩溃留下的记录与已存在的相同 source 对账后清理，不新增重复行。显式删除历史前也必须清理匹配记录；清理失败则拒绝删除，避免下次启动把用户删掉的条目恢复出来。
+
+不自动扫描或删除没有有效交接记录的旧母版，不推导新的 LRU／保留天数，也不清理别的写入者的 `.tmp`。该合同覆盖**完成验证且成功写入交接记录后的登记失败**；源发布与交接落盘之间被强制终止、交接目录本身不可写、验证失败或未完成的 `.tmp`，仍只保留源并明确报错，不能宣称跨文件系统／SQLite 的完整断电原子事务。旧开发期的孤立文件也不会擅自导入或删除。
+
+### 23.2 修改前后验证
+
+修改前 History lib／capture_history／pixel_master 为 **46／6／5 passed**。先增加恢复测试，真实得到 **1 passed、4 failed**；继续审查发现 SQLite 首次查询失败仍可能先于记录写入，先补测试再次真实失败，再把交接提前到第一条 SQL 前。
+
+最终 `capture_recovery` integration **9 passed**，覆盖 SDR＋HDR 失败后重开、持续失败不丢记录、提交后崩溃对账、删除不复活、清理失败拒绝删除、相同请求幂等、重复 id 不替换原图、外部／篡改来源、损坏／超限／错名记录、临时文件所有权，以及首次数据库查询失败。原 **46／6／5** 继续全部通过，合计 **66 passed**。App writer **9 passed**（新增 1 项），实际读取错误中指明的母版，确认 metadata／FP16 原始 bits 保留。
+
+```powershell
+cargo test -p snapclip-history --lib --tests --locked --offline --config target/hdr-isolated.toml -- --test-threads=1
+cargo test -p snapclip-app --lib capture::artifact_writer::tests --locked --offline --config target/hdr-isolated.toml -- --test-threads=1
+```
+
+证据 `target/hdr-recovery-{baseline,red,read-red,final-history,app}.log`。没有删除既有测试、放宽断言、新增 allow／ignore 或操作真实显示／剪贴板。
+
+## 24. AVIF 的软件资格验证及确定的数值阻塞（2026-11-04）
+
+§20 的“尚无候选证据”已继续推进，范围仅为 CPU 探针，**不是 AVIF 生产功能完成**。详细固定版本、feature、官方包 hash／许可证声明、输入、数值门禁、来源与复现步骤见 [HDR-AVIF.md](../tools/codec-bench/HDR-AVIF.md)。
+
+- 仅 `codec-bench` 的 opt-in `hdr-avif-probe` feature 增加 `zenavif =0.1.6`。App 的实际 normal 依赖图没有候选包，Yue／Pin／Capture 不增加 codec 接线。更新 lock 时保留原包版本，没有夹带 GPUI 或其他已有依赖升级。
+- 自行生成 32×16、10 位 Rec.2020/PQ Identity/RGB、straight Alpha 码值阶梯；标签、ICC 回读、编码／解码开始及第三次检查处取消、损坏／截断／像素上限均按探针预期执行。
+- **数值失败**：黑色 `[0,0,0,32800]` 被候选解码为 `[0,34721,0,32800]`；最大通道误差约 **541.994/1023**，超出事先设定的 **2/1023**。同一文件通过 FFmpeg 8.1.1 独立解码，RGB 与辅助 Alpha 的误差都为 **0**。
+- 已核对固定发布源码：managed 16 位解码把 Identity 平面交给 YUV 转换；矩阵映射对 Identity 落入 BT.601 默认值，缺少 GBR 直读路径。不能因为 HDR 标签正确就判定颜色正确，也不能把屏幕调参当成此问题的修复。
+- 探针主命令和独立验证脚本**明确退出 1**，失败证据保留；探针自身两个参考／结构单元测试及 opt-in strict Clippy 通过。没有通过改变阈值、改用八位结果或静默忽略失败获得“通过”。
+
+当前 serializer 发出 ICC 时替换容器 nclx，本轮 ICC fixture 不构成 ICC+nclx 双属性冲突测试；完整 12 位、彩色／Alpha 边界、YUV 矩阵／范围组合、运行中取消延迟及 4K／45MP AVIF 占用仍待验证。它们属于软件工作，不能混入缺少显示器的实机矩阵。先解决或更换这个已确认失败的解码路径，再谈生产接线与 AVIF 大图性能；当前不修改系统 HDR，也不开放 AVIF。
+
+## 25. 本批普通／无头回归与 CPU 资源复测（2026-11-04）
+
+### 25.1 实际执行结果
+
+继续使用 §12.3 的冻结 Yue 快照隔离依赖，不混入并行虚拟列表工作。本批没有修改底座绘制、系统 HDR 设置或 GPU 策略，也没有运行真实窗口／设备恢复／剪贴板接收方测试。
+
+| 验证 | 本批结果 |
+| --- | --- |
+| workspace ordinary lib | **1226 passed**；App 288、Capture 568、Clipboard 13、History 46、Model 31、Pin 59、UI 221；子进程重复项不另计 |
+| App／Pin headless lib | **311／71 passed**，另 5／2 ignored；相对 §22 App 新增 1 项母版登记失败路径回读 |
+| App UI／regression_baseline | **10／2 passed**；是无头交互，不是实屏外观证据 |
+| History lib／capture_history／capture_recovery／pixel_master | **46／6／9／5 passed**，合计 66 |
+| codec-bench／icon-bake 默认工具 | **28／7 passed**，原 2／0 ignored 保留 |
+| AVIF 探针单元／显式 feature strict Clippy | **2 passed**／通过；主资格验证仍因真实数值超预算**失败** |
+| workspace all-targets check | 通过，0 warnings |
+| 普通／headless workspace all-targets strict Clippy | 两组均通过，使用 `--no-deps -- -D warnings` |
+| 格式／空白 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
+
+没有删除现有测试或新增 allow／ignore。日志 `target/hdr-recovery-final-{ordinary,headless,ui,history,tools,check,strict,strict-headless,fmt,diff}.log`；AVIF 日志与失败定义见 §24 和工具报告，不能把它与通过的生产回归合并宣称全部绿色。
+
+### 25.2 恢复交接后的有界性能
+
+使用 §21.1 相同的生产 `HistoryArtifactWriter.with_history` → 源母版／SDR thumbnail／DB → 原图验证／PQ PNG16／原子提交；包含本批交接文件写入和同步。两种尺寸分别在独立 Release 进程执行：
+
+| 路径 | 本批耗时 | Rust 堆增量峰值 | 最大单次分配 | 采样 working-set peak |
+| --- | ---: | ---: | ---: | ---: |
+| 4K 归档＋缩略图＋DB | 422.222ms | 6,996,428 B | 4,177,920 B | 21,340,160 B |
+| 4K 验证母版＋PNG16＋原子提交 | 2465.993ms | 14,117,959 B | 4,177,920 B | 24,236,032 B |
+| 45MP 归档＋缩略图＋DB | 2206.614ms | 7,046,092 B | 4,161,024 B | 21,331,968 B |
+| 45MP 验证母版＋PNG16＋原子提交 | 11026.975ms | 14,151,353 B | 4,161,024 B | 28,266,496 B |
+
+四条路径完整整图分配均为 **0**，两项用例各 **1 passed**；原 32 MiB 堆增量和 16 MiB 最大单次分配断言保持。Rust 堆数值与 §22 相同；四项单次耗时相对 §22 变化约 -1.14%～+1.52%，不足以据此宣称吞吐改善或退化。日志 `target/hdr-recovery-{4k,45mp}.log`，命令同 §21.1。
+
+这是合成行带的 CPU 归档／导出结果，working set 为 5ms 采样，仍不代表应用总内存、VRAM、真实照片吞吐、HDR 显示或端到端首帧。剩余软件工作是 §24 的 AVIF 解码数值／格式与资源资格验证；剩余实机工作仍按 §22.4 的矩阵推进，生产 HDR 捕获门禁继续关闭。
