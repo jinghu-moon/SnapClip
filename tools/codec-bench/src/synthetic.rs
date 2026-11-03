@@ -101,16 +101,8 @@ fn vertical(pixels: &mut [u8], width: usize, x: i32, y0: i32, y1: i32, bgra: [u8
 
 /// A rounded rectangle: the corner pixels outside the arc are left alone, which is exactly the
 /// geometry the product's frame and mask share.
-fn rounded_rect(
-    pixels: &mut [u8],
-    width: usize,
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-    radius: i32,
-    bgra: [u8; 4],
-) {
+fn rounded_rect(pixels: &mut [u8], width: usize, bounds: [i32; 4], radius: i32, bgra: [u8; 4]) {
+    let [x0, y0, x1, y1] = bounds;
     for y in y0..y1 {
         for x in x0..x1 {
             let dx = if x - x0 < x1 - 1 - x {
@@ -141,14 +133,14 @@ fn rounded_rect(
 /// metrics to those boxes.
 fn glyph_rows(
     pixels: &mut [u8],
-    width: usize,
-    height: usize,
+    size: [usize; 2],
     rng: &mut Rng,
     top: i32,
     lines: i32,
     cell: i32,
     text_regions: &mut Vec<TextRegion>,
 ) {
+    let [width, height] = size;
     const INK: [[u8; 4]; 5] = [
         [40, 40, 40, 255],
         [160, 60, 40, 255],
@@ -206,9 +198,9 @@ fn ui(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
     }
     let panels = 4;
     for panel in 0..panels {
-        let x0 = 40 + panel as i32 * (width as i32 / panels as i32);
+        let x0 = 40 + panel * (width as i32 / panels);
         let y0 = 60;
-        let x1 = x0 + width as i32 / panels as i32 - 80;
+        let x1 = x0 + width as i32 / panels - 80;
         let y1 = height as i32 - 120;
         let fill = [
             200 + rng.range(0, 20) as u8,
@@ -216,14 +208,11 @@ fn ui(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
             205,
             255,
         ];
-        rounded_rect(&mut pixels, width, x0, y0, x1, y1, 10, fill);
+        rounded_rect(&mut pixels, width, [x0, y0, x1, y1], 10, fill);
         rounded_rect(
             &mut pixels,
             width,
-            x0,
-            y0,
-            x1,
-            y0 + 34,
+            [x0, y0, x1, y0 + 34],
             10,
             [90, 120, 160, 255],
         );
@@ -231,8 +220,7 @@ fn ui(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
         horizontal(&mut pixels, width, x0, x1, y1 - 1, [150, 150, 150, 255]);
         glyph_rows(
             &mut pixels,
-            width,
-            height,
+            [width, height],
             &mut rng,
             y0 + 60,
             6,
@@ -242,8 +230,7 @@ fn ui(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
     }
     glyph_rows(
         &mut pixels,
-        width,
-        height,
+        [width, height],
         &mut rng,
         24,
         2,
@@ -286,8 +273,7 @@ fn scroll(name: &'static str, width: usize, height: usize, seed: u64) -> Asset {
         );
         glyph_rows(
             &mut pixels,
-            width,
-            height,
+            [width, height],
             &mut rng,
             y as i32 + 16,
             4,
@@ -327,27 +313,20 @@ fn translucent(name: &'static str, width: usize, height: usize, seed: u64) -> As
         rounded_rect(
             &mut pixels,
             width,
-            x0,
-            y0,
-            x0 + 460,
-            y0 + 300,
+            [x0, y0, x0 + 460, y0 + 300],
             16,
             [250, 250, 250, 190],
         );
         rounded_rect(
             &mut pixels,
             width,
-            x0,
-            y0,
-            x0 + 460,
-            y0 + 36,
+            [x0, y0, x0 + 460, y0 + 36],
             16,
             [40, 90, 140, 210],
         );
         glyph_rows(
             &mut pixels,
-            width,
-            height,
+            [width, height],
             &mut rng,
             y0 + 60,
             3,
@@ -399,7 +378,12 @@ mod tests {
             // Not a blank canvas: at least one pixel differs from the first.
             let first = &asset.pixels[0..4];
             assert!(
-                asset.pixels.chunks_exact(4).any(|pixel| pixel != first),
+                asset
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|pixel| pixel != first),
                 "{} looks blank",
                 asset.name
             );
@@ -409,7 +393,7 @@ mod tests {
     #[test]
     fn a_rounded_corner_leaves_the_outside_of_the_arc_alone() {
         let mut pixels = vec![0u8; 21 * 21 * 4];
-        rounded_rect(&mut pixels, 21, 0, 0, 21, 21, 10, [255, 0, 0, 255]);
+        rounded_rect(&mut pixels, 21, [0, 0, 21, 21], 10, [255, 0, 0, 255]);
         // The very corner sits outside the arc and stays untouched.
         assert_eq!(&pixels[0..4], &[0, 0, 0, 0]);
         // The centre is filled.

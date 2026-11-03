@@ -66,7 +66,12 @@ pub fn png_row_band(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>,
     let mut row = vec![0u8; width * 4];
     for y in 0..height {
         let source = &bgra[y * width * 4..(y + 1) * width * 4];
-        for (pixel, out) in source.chunks_exact(4).zip(row.chunks_exact_mut(4)) {
+        for (pixel, out) in source
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(row.as_chunks_mut::<4>().0.iter_mut())
+        {
             out[0] = pixel[2];
             out[1] = pixel[1];
             out[2] = pixel[0];
@@ -171,8 +176,10 @@ pub fn mozjpeg(
         for row in 0..rows {
             let source = &bgra[(y + row) * width * 4..(y + row + 1) * width * 4];
             for (pixel, out) in source
-                .chunks_exact(4)
-                .zip(rgb[row * width * 3..].chunks_exact_mut(3))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(rgb[row * width * 3..].as_chunks_mut::<3>().0.iter_mut())
             {
                 out[0] = pixel[2];
                 out[1] = pixel[1];
@@ -200,12 +207,15 @@ pub fn zenjpeg_knobs(
     bgra: &[u8],
     width: usize,
     height: usize,
-    quality: u8,
-    subsample_444: bool,
-    trellis: bool,
-    optimize_huffman: bool,
-    band_rows: usize,
+    options: JpegOptions,
 ) -> Result<Vec<u8>, String> {
+    let JpegOptions {
+        quality,
+        subsample_444,
+        trellis,
+        optimize_huffman,
+        band_rows,
+    } = options;
     use zenjpeg::encoder::{
         ChromaSubsampling, EncoderConfig, OptimizationPreset, PixelLayout, Unstoppable,
     };
@@ -285,7 +295,12 @@ pub fn decode_png(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
 pub fn zenwebp_lossless(bgra: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
     use zenwebp::{EncodeRequest, LosslessConfig, PixelLayout};
     let mut rgba = vec![0u8; width * height * 4];
-    for (source, out) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+    for (source, out) in bgra
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(rgba.as_chunks_mut::<4>().0.iter_mut())
+    {
         out[0] = source[2];
         out[1] = source[1];
         out[2] = source[0];
@@ -312,7 +327,7 @@ mod tests {
 
     fn small_bgra(width: usize, height: usize) -> Vec<u8> {
         let mut pixels = vec![0u8; width * height * 4];
-        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+        for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = index % width;
             let y = index / width;
             pixel[0] = (x * 7 % 256) as u8;

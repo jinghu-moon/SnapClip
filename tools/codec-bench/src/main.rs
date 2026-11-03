@@ -18,6 +18,8 @@ mod scroll;
 mod synthetic;
 mod transcode;
 
+type EncodeCandidate<'a> = (&'a str, Box<dyn Fn() -> Result<usize, String> + 'a>);
+
 use std::time::Instant;
 
 use codecs::{JpegOptions, Outcome};
@@ -185,7 +187,7 @@ fn run_report() {
         };
 
         let (width, height, pixels) = (asset.width, asset.height, &asset.pixels);
-        let candidates: Vec<(&str, Box<dyn Fn() -> Result<usize, String> + '_>)> = vec![
+        let candidates: Vec<EncodeCandidate<'_>> = vec![
             (
                 "png row-band",
                 Box::new(move || {
@@ -229,7 +231,7 @@ fn run_report() {
         }
 
         for (label, encode) in candidates {
-            match measure(iterations, || encode()) {
+            match measure(iterations, encode) {
                 Ok(outcome) => {
                     if asset.name == "scroll-tall" && label.starts_with("zenjpeg") {
                         verdict.push((label.to_string(), outcome.clone()));
@@ -360,11 +362,13 @@ fn run_quality() {
                 &asset.pixels,
                 asset.width,
                 asset.height,
-                variant.quality,
-                variant.subsample_444,
-                variant.trellis,
-                variant.optimize_huffman,
-                QUALITY_BAND_ROWS,
+                codecs::JpegOptions {
+                    quality: variant.quality,
+                    subsample_444: variant.subsample_444,
+                    trellis: variant.trellis,
+                    optimize_huffman: variant.optimize_huffman,
+                    band_rows: QUALITY_BAND_ROWS,
+                },
             ) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -413,17 +417,17 @@ fn run_quality() {
         // The clean A/B this section exists for: plain and huffman-only use the same quantisation
         // tables, so their decoded pixels must match exactly. Anything else means the entropy coder
         // changed the picture, which it must not.
-        if let Some(plain) = plain_444.as_ref() {
-            if let Some(huffman) = huffman_only(&asset, &reference) {
-                let identical = plain.pixels == huffman.pixels;
-                println!(
-                    "  {:<8} plain vs huffman-only: {} bytes vs {} bytes, pixels {}",
-                    asset.name,
-                    plain.bytes,
-                    huffman.bytes,
-                    if identical { "IDENTICAL" } else { "DIFFER" }
-                );
-            }
+        if let Some(plain) = plain_444.as_ref()
+            && let Some(huffman) = huffman_only(&asset, &reference)
+        {
+            let identical = plain.pixels == huffman.pixels;
+            println!(
+                "  {:<8} plain vs huffman-only: {} bytes vs {} bytes, pixels {}",
+                asset.name,
+                plain.bytes,
+                huffman.bytes,
+                if identical { "IDENTICAL" } else { "DIFFER" }
+            );
         }
     }
 
@@ -437,11 +441,13 @@ fn huffman_only(asset: &synthetic::Asset, reference: &[u8]) -> Option<Decoded> {
         &asset.pixels,
         asset.width,
         asset.height,
-        92,
-        true,
-        false,
-        true,
-        QUALITY_BAND_ROWS,
+        codecs::JpegOptions {
+            quality: 92,
+            subsample_444: true,
+            trellis: false,
+            optimize_huffman: true,
+            band_rows: QUALITY_BAND_ROWS,
+        },
     )
     .ok()?;
     let (_, _, pixels) = codecs::decode_jpeg(&encoded).ok()?;
@@ -483,11 +489,13 @@ fn write_text_crop() {
             &asset.pixels,
             asset.width,
             asset.height,
-            92,
-            subsample_444,
-            false,
-            false,
-            QUALITY_BAND_ROWS,
+            codecs::JpegOptions {
+                quality: 92,
+                subsample_444,
+                trellis: false,
+                optimize_huffman: false,
+                band_rows: QUALITY_BAND_ROWS,
+            },
         )
         .ok()?;
         let (_, _, pixels) = codecs::decode_jpeg(&encoded).ok()?;
@@ -580,7 +588,7 @@ fn measure(
         // An encoder that panics must show up as a row, not take the whole run down: one of the
         // candidates (mozjpeg-rs 0.9.2) does exactly that on this material.
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            alloc_probe::peak_extra(|| encode())
+            alloc_probe::peak_extra(&mut encode)
         }));
         let elapsed = started.elapsed();
         let (result, extra) = caught.map_err(|_| "panicked".to_string())?;

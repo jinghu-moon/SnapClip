@@ -29,7 +29,7 @@ pub fn page(width: usize, rows: usize) -> Vec<u8> {
         let tag = (y as u32).wrapping_mul(2_654_435_761);
         let band = if y % 97 < 6 { 200 } else { 0 };
         let row = &mut pixels[y * width * 4..(y + 1) * width * 4];
-        for (x, pixel) in row.chunks_exact_mut(4).enumerate() {
+        for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let value = ((x as u32).wrapping_mul(31) ^ tag) as u8;
             let gradient = ((x * 255) / width.max(1)) as u8;
             pixel[0] = value;
@@ -111,9 +111,9 @@ pub fn run(view: usize, step: usize) -> Stitched {
     // The review of docs/37 is right that a seal is not a band: report what was actually
     // sealed, and what deflating one of those actually costs on this machine (docs/35 §17.1).
     if let Some((seals, max_rows, sealed_bytes, writes, mut per_seal_us)) = seal_stats {
-        let avg = if seals > 0 { sealed_bytes / seals } else { 0 };
+        let avg = sealed_bytes.checked_div(seals).unwrap_or(0);
         let row = (width as u64) * 4;
-        let rows_avg = if row > 0 { avg / row } else { 0 };
+        let rows_avg = avg.checked_div(row).unwrap_or(0);
         println!(
             "seals={seals} largest={max_rows} rows avg={rows_avg} rows bytes={sealed_bytes} ({:.1} MB)",
             sealed_bytes as f64 / (1024.0 * 1024.0)
@@ -144,7 +144,7 @@ pub fn run(view: usize, step: usize) -> Stitched {
                 let t = std::time::Instant::now();
                 let out = miniz_oxide::deflate::compress_to_vec(payload, 1);
                 let us = t.elapsed().as_micros();
-                if best.map_or(true, |(b, _)| us < b) {
+                if best.is_none_or(|(b, _)| us < b) {
                     best = Some((us, out.len()));
                 }
             }

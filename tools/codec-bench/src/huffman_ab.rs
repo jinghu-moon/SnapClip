@@ -70,7 +70,7 @@ fn segments(bytes: &[u8]) -> Vec<Segment> {
 
 fn marker_name(marker: u8) -> String {
     match marker {
-        0xC0 | 0xC1 | 0xC2 => format!("SOF{}({:02X})", marker - 0xC0, marker),
+        0xC0..=0xC2 => format!("SOF{}({:02X})", marker - 0xC0, marker),
         0xDB => format!("DQT({marker:02X})"),
         0xC4 => format!("DHT({marker:02X})"),
         0xDA => format!("SOS({marker:02X})"),
@@ -124,7 +124,7 @@ fn decode_with_image(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
 fn decode_with_zenjpeg(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
     let (width, height, rgba) = codecs::decode_jpeg(bytes)?;
     let mut rgb = Vec::with_capacity(width * height * 3);
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0.iter() {
         rgb.extend_from_slice(&pixel[..3]);
     }
     Ok((width, height, rgb))
@@ -158,11 +158,13 @@ fn encode(asset: &synthetic::Asset, optimize_huffman: bool) -> Result<Vec<u8>, S
         &asset.pixels,
         asset.width,
         asset.height,
-        92,
-        true,
-        false,
-        optimize_huffman,
-        BAND_ROWS,
+        codecs::JpegOptions {
+            quality: 92,
+            subsample_444: true,
+            trellis: false,
+            optimize_huffman,
+            band_rows: BAND_ROWS,
+        },
     )
 }
 
@@ -178,11 +180,13 @@ fn encode_whole_frame(asset: &synthetic::Asset, optimize_huffman: bool) -> Resul
         &asset.pixels,
         asset.width,
         asset.height,
-        92,
-        true,
-        false,
-        optimize_huffman,
-        0,
+        codecs::JpegOptions {
+            quality: 92,
+            subsample_444: true,
+            trellis: false,
+            optimize_huffman,
+            band_rows: 0,
+        },
     )
 }
 
@@ -308,10 +312,7 @@ mod tests {
             .unwrap();
         let bytes = encode(&asset, false).unwrap();
         let found = segments(&bytes);
-        assert!(
-            found.iter().any(|s| matches!(s.marker, 0xC0 | 0xC1 | 0xC2)),
-            "SOF"
-        );
+        assert!(found.iter().any(|s| matches!(s.marker, 0xC0..=0xC2)), "SOF");
         assert!(found.iter().any(|s| s.marker == 0xDB), "DQT");
         assert!(found.iter().any(|s| s.marker == 0xC4), "DHT");
         assert_eq!(found.last().map(|s| s.marker), Some(0xDA), "SOS last");

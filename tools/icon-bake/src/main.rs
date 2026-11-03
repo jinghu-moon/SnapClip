@@ -135,7 +135,7 @@ pub fn bake_all() -> Result<Vec<PathBuf>, String> {
 /// over premultiplied, so each channel is divided back out by its alpha here.
 pub fn render_rgba(svg: &Path) -> Result<Vec<u8>, String> {
     let mut pixmap = render_pixmap(svg)?;
-    for pixel in pixmap.data_mut().chunks_exact_mut(4) {
+    for pixel in pixmap.data_mut().as_chunks_mut::<4>().0.iter_mut() {
         let alpha = u32::from(pixel[3]);
         if alpha == 0 {
             pixel.copy_from_slice(&[0, 0, 0, 0]);
@@ -169,7 +169,7 @@ fn render_pixmap(svg: &Path) -> Result<resvg::tiny_skia::Pixmap, String> {
     // as a 24-unit one. A non-square file is scaled by its longer edge and centred on the shorter.
     let size = tree.size();
     let unit = size.width().max(size.height());
-    if !(unit > 0.0) {
+    if unit.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return Err(format!(
             "{}: the SVG has no size ({}×{})",
             svg.display(),
@@ -221,10 +221,10 @@ fn preflight(source: &str) -> Result<(), String> {
         if node.attribute("filter").is_some() {
             complaints.push("filter is implemented differently across renderers".to_string());
         }
-        if let Some(style) = node.attribute("style") {
-            if style.contains("filter") {
-                complaints.push("an inline filter is implemented differently".to_string());
-            }
+        if let Some(style) = node.attribute("style")
+            && style.contains("filter")
+        {
+            complaints.push("an inline filter is implemented differently".to_string());
         }
         for href in [
             node.attribute("href"),
@@ -330,7 +330,9 @@ mod tests {
     fn raw_pixels_are_white_where_there_is_ink() {
         let pixels = render_rgba(&svg_paths().unwrap().remove(0)).unwrap();
         let opaque = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .find(|pixel| pixel[3] == 255)
             .expect("an icon has some fully opaque ink");
         assert_eq!(
@@ -339,7 +341,7 @@ mod tests {
             "ink is white before tinting"
         );
         assert!(
-            pixels.chunks_exact(4).any(|pixel| pixel[3] == 0),
+            pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[3] == 0),
             "an icon has transparent surroundings"
         );
     }
@@ -370,7 +372,14 @@ mod tests {
         let twenty_four = render_rgba(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        let ink = |pixels: &[u8]| pixels.chunks_exact(4).filter(|p| p[3] > 0).count();
+        let ink = |pixels: &[u8]| {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] > 0)
+                .count()
+        };
         assert_eq!(
             ink(&sixteen),
             ink(&twenty_four),

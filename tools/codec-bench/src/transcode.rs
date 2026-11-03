@@ -160,7 +160,13 @@ fn transcode_to_jpeg(master: &[u8], streamed: bool, huffman: bool) -> Result<Vec
             .map_err(|error| format!("png row: {error}"))?;
         let Some(source) = next else { break };
         let mut row = vec![0u8; stride];
-        for (source, target) in source.data().chunks_exact(4).zip(row.chunks_exact_mut(4)) {
+        for (source, target) in source
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(row.as_chunks_mut::<4>().0.iter_mut())
+        {
             target[0] = source[2];
             target[1] = source[1];
             target[2] = source[0];
@@ -169,7 +175,7 @@ fn transcode_to_jpeg(master: &[u8], streamed: bool, huffman: bool) -> Result<Vec
         if streamed {
             band.extend_from_slice(&row);
             rows += 1;
-            if rows % TRANSCODE_BAND_ROWS == 0 || rows == height {
+            if rows.is_multiple_of(TRANSCODE_BAND_ROWS) || rows == height {
                 let count = band.len() / stride;
                 encoder
                     .push(&band, count, stride, Unstoppable)
@@ -219,7 +225,7 @@ fn fits_webp(width: usize, height: usize) -> bool {
 
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0.iter() {
         out.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
     }
     out
@@ -362,7 +368,9 @@ mod tests {
         // One decoder, both files: this is the comparison the old test trusted.
         let zenjpeg = |bytes: &[u8]| -> Vec<u8> {
             let rgba = codecs::decode_jpeg(bytes).expect("zenjpeg decodes").2;
-            rgba.chunks_exact(4)
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| [p[0], p[1], p[2]])
                 .collect()
         };
@@ -394,7 +402,9 @@ mod tests {
         // optimised file. The encoder is exonerated by `independent == 0`, so this belongs to the
         // decoder and must not be allowed to condemn the optimiser.
         let source_rgb: Vec<u8> = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[2], p[1], p[0]])
             .collect();
         let against = |decoded_rgb: &[u8]| -> f64 {
@@ -468,7 +478,9 @@ mod tests {
         );
         // Which arm is the truthful one? Compare both against the source pixels.
         let source_rgb: Vec<u8> = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[2], p[1], p[0]])
             .collect();
         let against = |decoded: &[u8]| -> (f64, u8) {
@@ -519,12 +531,23 @@ mod tests {
         for height in [16usize, 64, 65, 128, 960] {
             let pixels = scroll::page(PAGE_WIDTH, height);
             let source: Vec<u8> = pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| [p[2], p[1], p[0]])
                 .collect();
             let arm = |huffman: bool| -> f64 {
                 let jpeg = codecs::zenjpeg_knobs(
-                    &pixels, PAGE_WIDTH, height, 92, true, false, huffman, 64,
+                    &pixels,
+                    PAGE_WIDTH,
+                    height,
+                    codecs::JpegOptions {
+                        quality: 92,
+                        subsample_444: true,
+                        trellis: false,
+                        optimize_huffman: huffman,
+                        band_rows: 64,
+                    },
                 )
                 .expect("encodes");
                 error(&source, &rgb(&jpeg))
@@ -543,7 +566,9 @@ mod tests {
             .expect("the corpus has ui-1080");
         let source: Vec<u8> = asset
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[2], p[1], p[0]])
             .collect();
         let arm = |huffman: bool| -> f64 {
@@ -551,11 +576,13 @@ mod tests {
                 &asset.pixels,
                 asset.width,
                 asset.height,
-                92,
-                true,
-                false,
-                huffman,
-                64,
+                codecs::JpegOptions {
+                    quality: 92,
+                    subsample_444: true,
+                    trellis: false,
+                    optimize_huffman: huffman,
+                    band_rows: 64,
+                },
             )
             .expect("encodes");
             error(&source, &rgb(&jpeg))
